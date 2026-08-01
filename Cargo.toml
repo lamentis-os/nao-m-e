@@ -13,3 +13,7 @@ name = "nao_m_e"
 path = "src/lib.rs"
 
 [dependencies]
+
+[workspace]
+members = ["crates/nao-m-e-sqlite"]
+resolver = "3"

@@ -25,8 +25,9 @@ ordered, caller-owned term identifiers. An episode contains occurrence and
 recording timestamps, context statements, one observation, an optional action,
 an optional outcome, and a caller-owned provenance source identifier.
 
-Insertion sorts and deduplicates the context list. It does not reorder a
-statement's arguments or otherwise interpret caller-owned identifiers.
+Insertion sorts and deduplicates the context list by predicate identifier and
+then lexicographically by the ordered argument identifiers. It does not reorder
+a statement's arguments or otherwise interpret caller-owned identifiers.
 Timestamps are signed milliseconds on a caller-defined timeline and do not
 drive state transitions.
 
@@ -111,4 +112,6 @@ Resetting activation leaves atoms and relevance edges unchanged.
 The V0 kernel stores atoms, activation, and relevance only in a `MemoryV0`
 instance. It performs no persistence, loading, synchronization, or multi-writer
 coordination. It also performs no free-text processing, embedding or LLM calls,
-or automatic relevance learning.
+or automatic relevance learning. Persistence adapters remain outside the
+kernel; the format and lifecycle of the optional SQLite adapter are specified
+separately in the [SQLite V1 contract](sqlite-v1-contract.md).
