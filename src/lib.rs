@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-//! Deterministic in-memory kernel for immutable, symbolic episode atoms.
+//! Deterministic in-memory kernel for immutable symbolic episode atoms.
 //!
-//! [`MemoryV0`] keeps atom content separate from mutable activation and directed
-//! relevance. Fixed-point arithmetic and ordered storage make state transitions
-//! reproducible. The repository README defines the full V0 contract and usage.
+//! Episode content is immutable; activation and directed relevance are mutable.
+//! Fixed-point arithmetic and ordered storage make transitions reproducible.
+//! Cross-cutting V0 semantics are specified in `docs/v0-contract.md`.
 
 mod memory;
 mod model;
