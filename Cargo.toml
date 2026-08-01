@@ -1,0 +1,15 @@
+[package]
+name = "nao-m-e"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.95"
+description = "A deterministic in-memory memory-atom kernel"
+license = "Apache-2.0"
+repository = "https://github.com/lamentis-os/nao-m-e"
+publish = false
+
+[lib]
+name = "nao_m_e"
+path = "src/lib.rs"
+
+[dependencies]
