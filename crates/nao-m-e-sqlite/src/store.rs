@@ -2,7 +2,7 @@ use std::io::Write;
 use std::path::Path;
 
 use nao_m_e::{
-    Activation, AtomId, EpisodeAtom, EpisodeDraft, InfluenceWeight, MemoryId, MemoryV0,
+    Activation, AtomId, EpisodeAtom, EpisodeDraft, GraphError, InfluenceWeight, MemoryId, MemoryV0,
     PredicateId, SCALE, SourceId, Statement, TermId, TimestampMs,
 };
 use rusqlite::types::ValueRef;
@@ -39,7 +39,8 @@ impl SqliteStore {
     pub fn create(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
         let memory_id = random_memory_id()?;
-        let database = build_initial_database(memory_id)?;
+        let connection = build_initial_database(memory_id)?;
+        let database = connection.serialize(MAIN_DB)?;
         publish_database(path, &database)?;
         Self::open(path)
     }
@@ -177,10 +178,10 @@ fn random_memory_id() -> Result<MemoryId, StoreError> {
     }
 }
 
-fn build_initial_database(memory_id: MemoryId) -> Result<Vec<u8>, StoreError> {
-    let connection = Connection::open_in_memory()?;
+fn build_initial_database(memory_id: MemoryId) -> Result<Connection, StoreError> {
+    let mut connection = Connection::open_in_memory()?;
     schema::configure_session(&connection)?;
-    schema::create_schema(&connection, memory_id)?;
+    schema::create_schema(&mut connection, memory_id)?;
     verify_application_id(&connection)?;
     verify_schema(&connection)?;
     verify_quick_check(&connection)?;
@@ -192,7 +193,7 @@ fn build_initial_database(memory_id: MemoryId) -> Result<Vec<u8>, StoreError> {
         }
         .into());
     }
-    Ok(connection.serialize(MAIN_DB)?.to_vec())
+    Ok(connection)
 }
 
 fn publish_database(path: &Path, database: &[u8]) -> Result<(), StoreError> {
@@ -224,30 +225,10 @@ fn load_memory(connection: &mut Connection) -> Result<(MemoryV0, usize, i64), St
     let episode_rows = read_episodes(&transaction)?;
     let mut statement_rows = read_statements(&transaction)?;
     attach_terms(&transaction, &mut statement_rows)?;
-    let drafts = assemble_drafts(episode_rows, statement_rows)?;
-
-    let mut memory = MemoryV0::new(memory_id);
-    let mut ids = Vec::with_capacity(drafts.len());
-    for (sequence, draft) in drafts {
-        let id = memory
-            .insert_episode(draft)
-            .map_err(|_| StoreIntegrityError::InvalidEpisode {
-                sequence,
-                detail: "episode sequence cannot be reconstructed",
-            })?;
-        if id != AtomId::from_parts(memory_id, sequence) {
-            return Err(StoreIntegrityError::InvalidEpisode {
-                sequence,
-                detail: "core assigned a different atom ID",
-            }
-            .into());
-        }
-        ids.push(id);
-    }
-
-    restore_activations(&transaction, &mut memory, &ids)?;
-    restore_relevance(&transaction, &mut memory, &ids)?;
-    let episode_count = ids.len();
+    let mut memory = reconstruct_memory(memory_id, episode_rows, statement_rows)?;
+    restore_activations(&transaction, &mut memory)?;
+    restore_relevance(&transaction, &mut memory)?;
+    let episode_count = memory.episodes().len();
     transaction.commit()?;
     Ok((memory, episode_count, revision))
 }
@@ -540,12 +521,13 @@ fn attach_terms(
     Ok(())
 }
 
-fn assemble_drafts(
+fn reconstruct_memory(
+    memory_id: MemoryId,
     episodes: Vec<EpisodeRow>,
     statements: Vec<StoredStatement>,
-) -> Result<Vec<(u64, EpisodeDraft)>, StoreError> {
+) -> Result<MemoryV0, StoreError> {
     let mut statements = statements.into_iter().peekable();
-    let mut drafts = Vec::with_capacity(episodes.len());
+    let mut memory = MemoryV0::new(memory_id);
     for episode in episodes {
         let mut context = Vec::new();
         let mut observation = None;
@@ -603,18 +585,29 @@ fn assemble_drafts(
             sequence: episode.sequence,
             detail: "observation is missing",
         })?;
-        drafts.push((
-            episode.sequence,
-            EpisodeDraft {
-                occurred_at: episode.occurred_at,
-                recorded_at: episode.recorded_at,
-                context,
-                observation,
-                action,
-                outcome,
-                source: episode.source,
-            },
-        ));
+        let sequence = episode.sequence;
+        let draft = EpisodeDraft {
+            occurred_at: episode.occurred_at,
+            recorded_at: episode.recorded_at,
+            context,
+            observation,
+            action,
+            outcome,
+            source: episode.source,
+        };
+        let id = memory
+            .insert_episode(draft)
+            .map_err(|_| StoreIntegrityError::InvalidEpisode {
+                sequence,
+                detail: "episode sequence cannot be reconstructed",
+            })?;
+        if id != AtomId::from_parts(memory_id, sequence) {
+            return Err(StoreIntegrityError::InvalidEpisode {
+                sequence,
+                detail: "core assigned a different atom ID",
+            }
+            .into());
+        }
     }
     if let Some(statement) = statements.next() {
         return Err(StoreIntegrityError::InvalidEpisode {
@@ -623,7 +616,7 @@ fn assemble_drafts(
         }
         .into());
     }
-    Ok(drafts)
+    Ok(memory)
 }
 
 fn set_singleton(
@@ -639,17 +632,14 @@ fn set_singleton(
     }
 }
 
-fn restore_activations(
-    connection: &Connection,
-    memory: &mut MemoryV0,
-    ids: &[AtomId],
-) -> Result<(), StoreError> {
+fn restore_activations(connection: &Connection, memory: &mut MemoryV0) -> Result<(), StoreError> {
     let mut statement = connection.prepare(
         "SELECT episode_sequence, activation_ppm
          FROM activations
          ORDER BY episode_sequence",
     )?;
     let mut rows = statement.query([])?;
+    let episode_count = memory.episodes().len();
     let mut expected = 0_usize;
     while let Some(row) = rows.next()? {
         let sequence = read_u64(row, 0, "activations", "episode_sequence")?;
@@ -672,13 +662,14 @@ fn restore_activations(
                 sequence,
                 detail: "activation is outside the fixed-point range",
             })?;
-        let Some(&id) = ids.get(expected) else {
+        if expected >= episode_count {
             return Err(StoreIntegrityError::InvalidActivation {
                 sequence,
                 detail: "activation references an absent episode",
             }
             .into());
-        };
+        }
+        let id = AtomId::from_parts(memory.memory_id(), sequence);
         if ppm != 0 {
             let activation =
                 Activation::from_ppm(ppm).map_err(|_| StoreIntegrityError::InvalidActivation {
@@ -694,7 +685,7 @@ fn restore_activations(
         }
         expected += 1;
     }
-    if expected != ids.len() {
+    if expected != episode_count {
         return Err(StoreIntegrityError::InvalidActivation {
             sequence: u64::try_from(expected).unwrap_or(u64::MAX),
             detail: "activation row is missing",
@@ -704,11 +695,7 @@ fn restore_activations(
     Ok(())
 }
 
-fn restore_relevance(
-    connection: &Connection,
-    memory: &mut MemoryV0,
-    ids: &[AtomId],
-) -> Result<(), StoreError> {
+fn restore_relevance(connection: &Connection, memory: &mut MemoryV0) -> Result<(), StoreError> {
     let mut statement = connection.prepare(
         "SELECT from_sequence, to_sequence, weight_ppm
          FROM relevance_edges
@@ -716,8 +703,6 @@ fn restore_relevance(
     )?;
     let mut rows = statement.query([])?;
     let mut previous = None;
-    let mut budget_source = None;
-    let mut outgoing_total = 0_u64;
     while let Some(row) = rows.next()? {
         let from = read_u64(row, 0, "relevance_edges", "from_sequence")?;
         let to = read_u64(row, 1, "relevance_edges", "to_sequence")?;
@@ -748,52 +733,27 @@ fn restore_relevance(
                 detail: "weight is outside the fixed-point range",
             })?;
 
-        if budget_source != Some(from) {
-            budget_source = Some(from);
-            outgoing_total = 0;
-        }
-        outgoing_total = outgoing_total.checked_add(u64::from(ppm)).ok_or(
-            StoreIntegrityError::InvalidRelevance {
-                from,
-                to,
-                detail: "outgoing weight sum overflowed",
-            },
-        )?;
-        if outgoing_total > u64::from(SCALE) {
-            return Err(StoreIntegrityError::InvalidRelevance {
-                from,
-                to,
-                detail: "outgoing weight budget is exceeded",
-            }
-            .into());
-        }
-
-        let from_index = usize::try_from(from).ok();
-        let to_index = usize::try_from(to).ok();
-        let Some((&from_id, &to_id)) = from_index
-            .and_then(|from_index| ids.get(from_index))
-            .zip(to_index.and_then(|to_index| ids.get(to_index)))
-        else {
-            return Err(StoreIntegrityError::InvalidRelevance {
-                from,
-                to,
-                detail: "edge endpoint is absent",
-            }
-            .into());
-        };
+        let from_id = AtomId::from_parts(memory.memory_id(), from);
+        let to_id = AtomId::from_parts(memory.memory_id(), to);
         let weight =
             InfluenceWeight::from_ppm(ppm).map_err(|_| StoreIntegrityError::InvalidRelevance {
                 from,
                 to,
                 detail: "weight is outside the fixed-point range",
             })?;
-        memory.set_relevance(from_id, to_id, weight).map_err(|_| {
-            StoreIntegrityError::InvalidRelevance {
+        memory
+            .set_relevance(from_id, to_id, weight)
+            .map_err(|error| StoreIntegrityError::InvalidRelevance {
                 from,
                 to,
-                detail: "core rejected the edge",
-            }
-        })?;
+                detail: match error {
+                    GraphError::UnknownAtom(_) => "edge endpoint is absent",
+                    GraphError::SelfEdge(_) => "self-edge",
+                    GraphError::OutgoingWeightBudgetExceeded { .. } => {
+                        "outgoing weight budget is exceeded"
+                    }
+                },
+            })?;
     }
     Ok(())
 }
@@ -873,36 +833,22 @@ fn append_episodes(
                 episode,
             )?;
         }
-        insert_statement_value(
-            &mut insert_statement,
-            &mut insert_term,
-            &sequence,
-            ROLE_OBSERVATION,
-            0,
-            episode.observation(),
-            episode,
-        )?;
-        if let Some(statement) = episode.action() {
-            insert_statement_value(
-                &mut insert_statement,
-                &mut insert_term,
-                &sequence,
-                ROLE_ACTION,
-                0,
-                statement,
-                episode,
-            )?;
-        }
-        if let Some(statement) = episode.outcome() {
-            insert_statement_value(
-                &mut insert_statement,
-                &mut insert_term,
-                &sequence,
-                ROLE_OUTCOME,
-                0,
-                statement,
-                episode,
-            )?;
+        for (role, statement) in [
+            (ROLE_OBSERVATION, Some(episode.observation())),
+            (ROLE_ACTION, episode.action()),
+            (ROLE_OUTCOME, episode.outcome()),
+        ] {
+            if let Some(statement) = statement {
+                insert_statement_value(
+                    &mut insert_statement,
+                    &mut insert_term,
+                    &sequence,
+                    role,
+                    0,
+                    statement,
+                    episode,
+                )?;
+            }
         }
     }
     Ok(())
@@ -1474,6 +1420,37 @@ mod tests {
                 "unexpected error for {corruption:?}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn late_episode_corruption_discards_local_reconstruction() {
+        let directory = tempdir().expect("temporary directory is available");
+        let path = saved_store(&directory, 3);
+        let two = codec::encode_u64(2);
+        let connection = Connection::open(&path).expect("fixture database opens");
+        connection
+            .execute(
+                "DELETE FROM statement_terms
+                 WHERE episode_sequence = ?1 AND role = 1",
+                [two.as_slice()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM episode_statements
+                 WHERE episode_sequence = ?1 AND role = 1",
+                [two.as_slice()],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            integrity_error(&path),
+            StoreIntegrityError::InvalidEpisode {
+                sequence: 2,
+                detail: "observation is missing"
+            }
+        ));
     }
 
     #[test]

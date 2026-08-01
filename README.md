@@ -94,7 +94,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 Install the private workspace binary from a checkout:
 
 ```sh
-cargo install --path crates/nao-m-e-cli
+cargo install --locked --path crates/nao-m-e-cli
 ```
 
 The CLI has three commands:
@@ -152,10 +152,8 @@ activation once:
 `{ "sequence": 0 }`; labels exist only within the batch that defines them. A
 successful batch is saved once as a complete snapshot. If parsing, an
 operation, validation, or saving fails, none of that batch is persisted.
-If writing the success response fails after the commit, reopen the store before
-retrying: insert batches are not idempotent and may already be durable.
 
-The remaining mutation shapes are deliberately small:
+The remaining `operations` entry shapes are deliberately small:
 
 ```json
 [
@@ -181,8 +179,11 @@ Successful `init`, `run`, and `recall` commands write one JSON document to
 standard output; help and version output are plain text. `run` reports the
 memory ID, applied-operation and episode counts, and every inserted label and
 sequence. Before response output begins, errors leave standard output empty and
-write diagnostics to standard error. An output failure can leave a partial JSON
-document. Exit code `2` denotes invalid CLI syntax, while input, model, graph,
+write diagnostics to standard error. A standard-output failure can leave a
+partial JSON document and does not roll back a completed side effect: `init`
+may already have created the store, and `run` may already have committed its
+batch. Inspect or reopen the store before retrying; insert batches are not
+idempotent. Exit code `2` denotes invalid CLI syntax, while input, model, graph,
 store, and output errors use exit code `1`.
 
 Recall ranked active episodes, or inspect one episode including zero

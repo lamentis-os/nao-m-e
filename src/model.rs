@@ -167,7 +167,7 @@ impl From<i64> for TimestampMs {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Statement {
     predicate: PredicateId,
-    arguments: Vec<TermId>,
+    arguments: Box<[TermId]>,
 }
 
 impl Statement {
@@ -179,7 +179,7 @@ impl Statement {
 
         Ok(Self {
             predicate,
-            arguments,
+            arguments: arguments.into_boxed_slice(),
         })
     }
 
@@ -221,7 +221,7 @@ pub struct EpisodeAtom {
     id: AtomId,
     occurred_at: TimestampMs,
     recorded_at: TimestampMs,
-    context: Vec<Statement>,
+    context: Box<[Statement]>,
     observation: Statement,
     action: Option<Statement>,
     outcome: Option<Statement>,
@@ -237,7 +237,7 @@ impl EpisodeAtom {
             id,
             occurred_at: draft.occurred_at,
             recorded_at: draft.recorded_at,
-            context: draft.context,
+            context: draft.context.into_boxed_slice(),
             observation: draft.observation,
             action: draft.action,
             outcome: draft.outcome,

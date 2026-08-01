@@ -283,9 +283,10 @@ performs these checks:
 9. Relevance endpoints exist, edges are unique and non-reflexive, and each
    source's total outgoing weight is at most `SCALE`.
 
-The adapter reads each table in ordered, set-based passes and assembles episodes
-with linear cursors; it does not issue one query per episode. Only after all
-storage-level checks pass does it reconstruct `MemoryV0`:
+The adapter reads each table in ordered, set-based passes and reconstructs
+episodes with linear cursors; it does not issue one query per episode. Episode
+rows and statement structure are validated as they are consumed into a local
+`MemoryV0`:
 
 1. Create it with the stored `MemoryId`.
 2. Insert episodes in sequence order and verify every returned `AtomId`.
@@ -293,8 +294,10 @@ storage-level checks pass does it reconstruct `MemoryV0`:
 4. Install relevance edges in source and target order through the core API.
 
 Any rejection by the core during reconstruction is invalid stored data. The
-adapter returns no partial memory. The transition scratch buffer is not stored
-because every logical `step()` overwrites it before use.
+local reconstruction is not exposed until every storage-level and core
+validation succeeds; any later activation or relevance error discards it, so
+the adapter returns no partial memory. The transition scratch buffer is not
+stored because every logical `step()` overwrites it before use.
 
 ## Saving and writer exclusion
 
