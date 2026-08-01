@@ -145,36 +145,21 @@ impl MemoryV0 {
             return Err(GraphError::SelfEdge(from));
         }
 
-        match self.outgoing.entry(from_index) {
-            Entry::Vacant(entry) => {
-                let mut outgoing = OutgoingRelevance {
-                    total_ppm: weight.as_ppm(),
-                    ..OutgoingRelevance::default()
-                };
-                outgoing.targets.insert(to_index, weight);
-                entry.insert(outgoing);
-                Ok(None)
-            }
-            Entry::Occupied(mut entry) => {
-                let outgoing = entry.get_mut();
-                let existing = outgoing.targets.get(&to_index).copied();
-                let attempted_total = u64::from(outgoing.total_ppm)
-                    - existing.map_or(0, |value| u64::from(value.as_ppm()))
-                    + u64::from(weight.as_ppm());
+        let outgoing = self.outgoing.entry(from_index).or_default();
+        let existing = outgoing.targets.get(&to_index).copied();
+        let attempted_total =
+            outgoing.total_ppm - existing.map_or(0, InfluenceWeight::as_ppm) + weight.as_ppm();
 
-                if attempted_total > u64::from(SCALE) {
-                    return Err(GraphError::OutgoingWeightBudgetExceeded {
-                        from,
-                        attempted_ppm: attempted_total,
-                    });
-                }
-
-                outgoing.targets.insert(to_index, weight);
-                outgoing.total_ppm =
-                    u32::try_from(attempted_total).expect("validated outgoing total fits u32");
-                Ok(existing)
-            }
+        if attempted_total > SCALE {
+            return Err(GraphError::OutgoingWeightBudgetExceeded {
+                from,
+                attempted_ppm: u64::from(attempted_total),
+            });
         }
+
+        outgoing.targets.insert(to_index, weight);
+        outgoing.total_ppm = attempted_total;
+        Ok(existing)
     }
 
     /// Removes an edge between known, distinct endpoints if it exists.
@@ -299,7 +284,7 @@ impl MemoryV0 {
             return hits;
         }
 
-        let mut best = BinaryHeap::new();
+        let mut best = BinaryHeap::with_capacity(limit);
         for hit in self.active_hits() {
             let ranked = RankedRecallHit(hit);
             if best.len() < limit {
@@ -338,12 +323,7 @@ impl MemoryV0 {
     }
 
     fn sort_hits(hits: &mut [RecallHit]) {
-        hits.sort_unstable_by(|left, right| {
-            right
-                .activation
-                .cmp(&left.activation)
-                .then_with(|| left.atom_id.cmp(&right.atom_id))
-        });
+        hits.sort_unstable_by_key(|hit| Reverse(RankedRecallHit(*hit)));
     }
 
     fn local_index(&self, id: AtomId) -> Option<usize> {
