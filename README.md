@@ -147,10 +147,10 @@ activation once:
 ```
 
 `run` supports `insert_episode`, `set_relevance`, `remove_relevance`,
-`stimulate`, `step`, and `reset_activations`, and accepts standard input with
-`--input -`. Later batches can refer to already persisted atoms as
-`{ "sequence": 0 }`; labels exist only within the batch that defines them. A
-successful batch is saved once as a complete snapshot. If parsing, an
+`stimulate`, `apply_feedback`, `step`, and `reset_activations`, and accepts
+standard input with `--input -`. Later batches can refer to already persisted
+atoms as `{ "sequence": 0 }`; labels exist only within the batch that defines
+them. A successful batch is saved once as a complete snapshot. If parsing, an
 operation, validation, or saving fails, none of that batch is persisted.
 
 The remaining `operations` entry shapes are deliberately small:
@@ -168,12 +168,23 @@ The remaining `operations` entry shapes are deliberately small:
     "from": { "sequence": 0 },
     "to": { "sequence": 1 }
   },
+  {
+    "op": "apply_feedback",
+    "source": { "sequence": 0 },
+    "targets": [{ "sequence": 1 }, { "sequence": 2 }],
+    "feedback": 1
+  },
   { "op": "reset_activations" }
 ]
 ```
 
 Relevance weights use `1..=1_000_000` ppm, stimulation uses
-`0..=1_000_000` ppm, and `step.count` must be positive.
+`0..=1_000_000` ppm, and `step.count` must be positive. Feedback is binary:
+`1` is helpful and `0` is unhelpful. The supplied target list is authoritative;
+the CLI does not recompute recall or a top-k set. The core removes source
+self-hits and duplicate targets, then applies the deterministic feedback rule
+documented in the V0 contract. The snapshot stores only the resulting relevance
+graph, not a feedback receipt or provenance record.
 
 Successful `init`, `run`, and `recall` commands write one JSON document to
 standard output; help and version output are plain text. `run` reports the
@@ -182,8 +193,9 @@ sequence. Before response output begins, errors leave standard output empty and
 write diagnostics to standard error. A standard-output failure can leave a
 partial JSON document and does not roll back a completed side effect: `init`
 may already have created the store, and `run` may already have committed its
-batch. Inspect or reopen the store before retrying; insert batches are not
-idempotent. Exit code `2` denotes invalid CLI syntax, while input, model, graph,
+batch. Inspect or reopen the store before retrying; batches containing inserts
+or feedback are not idempotent, and replaying feedback applies another
+mutation. Exit code `2` denotes invalid CLI syntax, while input, model, graph,
 store, and output errors use exit code `1`.
 
 Recall ranked active episodes, or inspect one episode including zero

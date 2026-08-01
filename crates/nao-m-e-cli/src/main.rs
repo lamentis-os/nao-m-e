@@ -385,6 +385,25 @@ fn apply_operation(
                 .stimulate(atom, amount)
                 .map_err(|error| error.to_string())?;
         }
+        OperationInput::ApplyFeedback {
+            source,
+            targets,
+            feedback,
+        } => {
+            let helpful = match feedback {
+                0 => false,
+                1 => true,
+                _ => return Err("feedback must be 0 or 1".to_owned()),
+            };
+            let source = resolve_atom(source, memory, baseline_episode_count, labels)?;
+            let targets = targets
+                .into_iter()
+                .map(|target| resolve_atom(target, memory, baseline_episode_count, labels))
+                .collect::<CliResult<Vec<_>>>()?;
+            memory
+                .apply_feedback(source, &targets, helpful)
+                .map_err(|error| error.to_string())?;
+        }
         OperationInput::Step { count } => {
             if count == 0 {
                 return Err("step count must be positive".to_owned());
@@ -474,6 +493,11 @@ enum OperationInput {
         atom: AtomReferenceInput,
         amount_ppm: u32,
     },
+    ApplyFeedback {
+        source: AtomReferenceInput,
+        targets: Vec<AtomReferenceInput>,
+        feedback: u8,
+    },
     Step {
         count: u32,
     },
@@ -487,6 +511,7 @@ impl OperationInput {
             Self::SetRelevance { .. } => "set_relevance",
             Self::RemoveRelevance { .. } => "remove_relevance",
             Self::Stimulate { .. } => "stimulate",
+            Self::ApplyFeedback { .. } => "apply_feedback",
             Self::Step { .. } => "step",
             Self::ResetActivations {} => "reset_activations",
         }

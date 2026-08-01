@@ -327,6 +327,275 @@ fn batch_dynamics_round_trip_through_ranked_recall() {
 }
 
 #[test]
+fn feedback_uses_the_explicit_target_list_and_persists_exact_updates() {
+    let directory = TempDir::new().expect("temporary directory");
+    let database = directory.path().join("memory.sqlite3");
+    let memory_id = init(&database)["memory_id"].clone();
+
+    let setup = json!({
+        "schema_version": 1,
+        "operations": [
+            insert(Some("source"), 1),
+            insert(Some("first"), 2),
+            insert(Some("second"), 3),
+            insert(Some("existing"), 4),
+            {
+                "op": "set_relevance",
+                "from": {"label": "source"},
+                "to": {"label": "existing"},
+                "weight_ppm": 1000000
+            }
+        ]
+    });
+    assert_success(run_stdin(&database, &setup));
+    assert!(
+        recall_limit(&database, 10)["hits"]
+            .as_array()
+            .expect("recall hits are an array")
+            .is_empty(),
+        "feedback targets need not be current top-k hits"
+    );
+
+    let positive = json!({
+        "schema_version": 1,
+        "operations": [{
+            "op": "apply_feedback",
+            "source": {"sequence": 0},
+            "targets": [
+                {"sequence": 0},
+                {"sequence": 1},
+                {"sequence": 2},
+                {"sequence": 2}
+            ],
+            "feedback": 1
+        }]
+    });
+    assert_eq!(
+        assert_success(run_stdin(&database, &positive)),
+        json!({
+            "schema_version": 1,
+            "memory_id": memory_id.clone(),
+            "operations_applied": 1,
+            "episode_count": 4,
+            "inserted": []
+        })
+    );
+
+    let store = SqliteStore::open(&database).expect("positive feedback snapshot reopens");
+    let source = AtomId::from_parts(store.memory_id(), 0);
+    let first = AtomId::from_parts(store.memory_id(), 1);
+    let second = AtomId::from_parts(store.memory_id(), 2);
+    let existing = AtomId::from_parts(store.memory_id(), 3);
+    assert_eq!(store.memory().relevance(source, source), None);
+    assert_eq!(
+        store
+            .memory()
+            .relevance(source, first)
+            .map(|weight| weight.as_ppm()),
+        Some(50_000)
+    );
+    assert_eq!(
+        store
+            .memory()
+            .relevance(source, second)
+            .map(|weight| weight.as_ppm()),
+        Some(50_000)
+    );
+    assert_eq!(
+        store
+            .memory()
+            .relevance(source, existing)
+            .map(|weight| weight.as_ppm()),
+        Some(900_000)
+    );
+    drop(store);
+
+    let mut negative = positive;
+    negative["operations"][0]["feedback"] = json!(0);
+    assert_eq!(
+        assert_success(run_stdin(&database, &negative)),
+        json!({
+            "schema_version": 1,
+            "memory_id": memory_id,
+            "operations_applied": 1,
+            "episode_count": 4,
+            "inserted": []
+        })
+    );
+
+    let store = SqliteStore::open(&database).expect("negative feedback snapshot reopens");
+    assert_eq!(store.memory().relevance(source, first), None);
+    assert_eq!(store.memory().relevance(source, second), None);
+    assert_eq!(
+        store
+            .memory()
+            .relevance(source, existing)
+            .map(|weight| weight.as_ppm()),
+        Some(900_000)
+    );
+    assert_eq!(store.memory().episodes().len(), 4);
+}
+
+#[test]
+fn feedback_target_order_produces_the_same_persisted_snapshot() {
+    let directory = TempDir::new().expect("temporary directory");
+    let base = directory.path().join("base.sqlite3");
+    let forward = directory.path().join("forward.sqlite3");
+    let reversed = directory.path().join("reversed.sqlite3");
+    init(&base);
+    assert_success(run_stdin(
+        &base,
+        &json!({
+            "schema_version": 1,
+            "operations": [
+                insert(Some("source"), 1),
+                insert(Some("first"), 2),
+                insert(Some("second"), 3),
+                insert(Some("existing"), 4),
+                {
+                    "op": "set_relevance",
+                    "from": {"label": "source"},
+                    "to": {"label": "existing"},
+                    "weight_ppm": 1000000
+                }
+            ]
+        }),
+    ));
+    fs::copy(&base, &forward).expect("forward store copy");
+    fs::copy(&base, &reversed).expect("reversed store copy");
+
+    let feedback = |targets: [u64; 2]| {
+        json!({
+            "schema_version": 1,
+            "operations": [{
+                "op": "apply_feedback",
+                "source": {"sequence": 0},
+                "targets": [
+                    {"sequence": targets[0]},
+                    {"sequence": targets[1]}
+                ],
+                "feedback": 1
+            }]
+        })
+    };
+    assert_success(run_stdin(&forward, &feedback([1, 2])));
+    assert_success(run_stdin(&reversed, &feedback([2, 1])));
+
+    assert_eq!(
+        fs::read(&forward).expect("forward snapshot is readable"),
+        fs::read(&reversed).expect("reversed snapshot is readable")
+    );
+}
+
+#[test]
+fn feedback_validation_is_strict_and_batch_failures_roll_back() {
+    let directory = TempDir::new().expect("temporary directory");
+    let database = directory.path().join("memory.sqlite3");
+    init(&database);
+    assert_success(run_stdin(
+        &database,
+        &json!({
+            "schema_version": 1,
+            "operations": [insert(None, 1), insert(None, 2)]
+        }),
+    ));
+
+    let invalid_feedback = json!({
+        "schema_version": 1,
+        "operations": [{
+            "op": "apply_feedback",
+            "source": {"sequence": 99},
+            "targets": [{"sequence": 98}],
+            "feedback": 2
+        }]
+    });
+    let stderr = assert_runtime_failure(run_stdin(&database, &invalid_feedback));
+    assert!(stderr.contains("operations[0] (apply_feedback) failed: feedback must be 0 or 1"));
+
+    for (scenario, expected) in [
+        (
+            json!({
+                "schema_version": 1,
+                "operations": [{
+                    "op": "apply_feedback",
+                    "source": {"sequence": 99},
+                    "targets": [{"sequence": 1}],
+                    "feedback": 1
+                }]
+            }),
+            "episode sequence 99 was not persisted before this batch",
+        ),
+        (
+            json!({
+                "schema_version": 1,
+                "operations": [{
+                    "op": "apply_feedback",
+                    "source": {"sequence": 0},
+                    "targets": [{"sequence": 99}],
+                    "feedback": 1
+                }]
+            }),
+            "episode sequence 99 was not persisted before this batch",
+        ),
+    ] {
+        let stderr = assert_runtime_failure(run_stdin(&database, &scenario));
+        assert!(stderr.contains(expected), "unexpected diagnostic: {stderr}");
+    }
+
+    for operation in [
+        json!({
+            "op": "apply_feedback",
+            "source": {"sequence": 0},
+            "targets": [{"sequence": 1}],
+            "feedback": 1,
+            "extra": true
+        }),
+        json!({
+            "op": "apply_feedback",
+            "source": {"sequence": 0, "label": "ambiguous"},
+            "targets": [{"sequence": 1}],
+            "feedback": 1
+        }),
+        json!({
+            "op": "apply_feedback",
+            "source": {"sequence": 0},
+            "targets": [{"sequence": 1, "extra": true}],
+            "feedback": 1
+        }),
+    ] {
+        let scenario = json!({"schema_version": 1, "operations": [operation]});
+        let stderr = assert_runtime_failure(run_stdin(&database, &scenario));
+        assert!(stderr.contains("operations[0] is invalid"));
+    }
+
+    let rollback = json!({
+        "schema_version": 1,
+        "operations": [
+            {
+                "op": "apply_feedback",
+                "source": {"sequence": 0},
+                "targets": [{"sequence": 1}],
+                "feedback": 1
+            },
+            {
+                "op": "set_relevance",
+                "from": {"sequence": 0},
+                "to": {"sequence": 0},
+                "weight_ppm": 123456
+            }
+        ]
+    });
+    let stderr = assert_runtime_failure(run_stdin(&database, &rollback));
+    assert!(stderr.contains("operations[1] (set_relevance) failed"));
+
+    let store = SqliteStore::open(&database).expect("failed feedback batch leaves store valid");
+    let source = AtomId::from_parts(store.memory_id(), 0);
+    let target = AtomId::from_parts(store.memory_id(), 1);
+    assert_eq!(store.memory().relevance(source, target), None);
+    assert_eq!(store.memory().episodes().len(), 2);
+}
+
+#[test]
 fn persisted_sequences_support_edge_removal_reset_and_inactive_lookup() {
     let directory = TempDir::new().expect("temporary directory");
     let database = directory.path().join("memory.sqlite3");
