@@ -89,6 +89,117 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 ```
 
+## Command-line interface
+
+Install the private workspace binary from a checkout:
+
+```sh
+cargo install --path crates/nao-m-e-cli
+```
+
+The CLI has three commands:
+
+```text
+nao-m-e init <DATABASE>
+nao-m-e run <DATABASE> --input <FILE|->
+nao-m-e recall <DATABASE> [--limit <N>]
+nao-m-e recall <DATABASE> --sequence <N>
+```
+
+Create a store, then apply a versioned JSON batch:
+
+```sh
+nao-m-e init incident-memory.sqlite3
+nao-m-e run incident-memory.sqlite3 --input incident.json
+```
+
+For example, `incident.json` can append an incident, stimulate it, and advance
+activation once:
+
+```json
+{
+  "schema_version": 1,
+  "operations": [
+    {
+      "op": "insert_episode",
+      "label": "failure",
+      "episode": {
+        "occurred_at_ms": 1785596400000,
+        "recorded_at_ms": 1785596405000,
+        "source_id": 7,
+        "context": [
+          { "predicate_id": 10, "term_ids": [1001] }
+        ],
+        "observation": {
+          "predicate_id": 20,
+          "term_ids": [1001, 3001]
+        }
+      }
+    },
+    {
+      "op": "stimulate",
+      "atom": { "label": "failure" },
+      "amount_ppm": 1000000
+    },
+    { "op": "step", "count": 1 }
+  ]
+}
+```
+
+`run` supports `insert_episode`, `set_relevance`, `remove_relevance`,
+`stimulate`, `step`, and `reset_activations`, and accepts standard input with
+`--input -`. Later batches can refer to already persisted atoms as
+`{ "sequence": 0 }`; labels exist only within the batch that defines them. A
+successful batch is saved once as a complete snapshot. If parsing, an
+operation, validation, or saving fails, none of that batch is persisted.
+If writing the success response fails after the commit, reopen the store before
+retrying: insert batches are not idempotent and may already be durable.
+
+The remaining mutation shapes are deliberately small:
+
+```json
+[
+  {
+    "op": "set_relevance",
+    "from": { "sequence": 0 },
+    "to": { "sequence": 1 },
+    "weight_ppm": 250000
+  },
+  {
+    "op": "remove_relevance",
+    "from": { "sequence": 0 },
+    "to": { "sequence": 1 }
+  },
+  { "op": "reset_activations" }
+]
+```
+
+Relevance weights use `1..=1_000_000` ppm, stimulation uses
+`0..=1_000_000` ppm, and `step.count` must be positive.
+
+Successful `init`, `run`, and `recall` commands write one JSON document to
+standard output; help and version output are plain text. `run` reports the
+memory ID, applied-operation and episode counts, and every inserted label and
+sequence. Before response output begins, errors leave standard output empty and
+write diagnostics to standard error. An output failure can leave a partial JSON
+document. Exit code `2` denotes invalid CLI syntax, while input, model, graph,
+store, and output errors use exit code `1`.
+
+Recall ranked active episodes, or inspect one episode including zero
+activation:
+
+```sh
+nao-m-e recall incident-memory.sqlite3 --limit 10
+nao-m-e recall incident-memory.sqlite3 --sequence 0
+```
+
+Scenario input and data-command responses are strict, versioned JSON.
+Predicate, term, source, and time values are caller-owned numeric symbols; the
+CLI does not interpret text, assign symbols, deduplicate episodes, or provide
+embeddings. `run` and `recall` each load the complete snapshot. The current
+adapter opens that snapshot read-write, so `recall` requires write access even
+though it never saves. Simultaneous writers are rejected rather than merged.
+
 ## Boundaries
 
 The core performs no I/O, synchronization, or multi-writer coordination. The
