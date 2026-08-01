@@ -2,7 +2,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use nao_m_e::MemoryId;
-use rusqlite::{Connection, Error, Result, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, Error, Result, TransactionBehavior, params};
 
 use crate::codec::encode_memory_id;
 
@@ -183,8 +183,8 @@ pub(crate) fn read_application_id(connection: &Connection) -> Result<i64> {
     connection.pragma_query_value(None, "application_id", |row| row.get(0))
 }
 
-pub(crate) fn create_schema(connection: &Connection, memory_id: MemoryId) -> Result<()> {
-    let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
+pub(crate) fn create_schema(connection: &mut Connection, memory_id: MemoryId) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
     transaction.execute_batch(SCHEMA)?;
     transaction.execute(
@@ -400,13 +400,13 @@ mod tests {
 
     #[test]
     fn schema_creation_commits_identity_metadata_and_canonical_shape() {
-        let (_directory, connection) = open_temporary_database();
+        let (_directory, mut connection) = open_temporary_database();
         let memory_id = MemoryId::new(u128::MAX).unwrap();
         configure(&connection);
 
         assert_eq!(read_application_id(&connection).unwrap(), 0);
 
-        create_schema(&connection, memory_id).expect("schema creation succeeds");
+        create_schema(&mut connection, memory_id).expect("schema creation succeeds");
 
         assert_eq!(read_application_id(&connection).unwrap(), APPLICATION_ID);
         assert!(validate_schema(&connection).unwrap());
@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn failed_schema_creation_rolls_back_application_identity_and_ddl() {
-        let (_directory, connection) = open_temporary_database();
+        let (_directory, mut connection) = open_temporary_database();
         configure(&connection);
         connection
             .execute_batch(
@@ -436,7 +436,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(create_schema(&connection, MemoryId::new(1).unwrap()).is_err());
+        assert!(create_schema(&mut connection, MemoryId::new(1).unwrap()).is_err());
         assert_eq!(read_application_id(&connection).unwrap(), 0);
         let metadata_tables: i64 = connection
             .query_row(
@@ -534,10 +534,10 @@ mod tests {
 
     #[test]
     fn database_constraints_reject_noncanonical_storage_values() {
-        let (_directory, connection) = open_temporary_database();
+        let (_directory, mut connection) = open_temporary_database();
         let memory_id = MemoryId::new(1).unwrap();
         configure(&connection);
-        create_schema(&connection, memory_id).unwrap();
+        create_schema(&mut connection, memory_id).unwrap();
 
         assert!(
             connection
