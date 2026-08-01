@@ -11,7 +11,5 @@ publish = false
 [dependencies]
 getrandom = "0.4.3"
 nao-m-e = { path = "../.." }
-rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
-
-[dev-dependencies]
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled", "serialize"] }
 tempfile = "3.27.0"

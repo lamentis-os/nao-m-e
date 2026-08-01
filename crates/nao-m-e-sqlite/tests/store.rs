@@ -1,4 +1,6 @@
 use std::fs;
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 use nao_m_e::{
     Activation, AtomId, EpisodeAtom, EpisodeDraft, InfluenceWeight, MemoryId, MemoryV0,
@@ -105,6 +107,44 @@ fn create_and_open_preserve_identity_and_respect_path_lifecycle() {
     let missing = directory.path().join("missing.sqlite3");
     assert!(SqliteStore::open(&missing).is_err());
     assert!(!missing.exists());
+}
+
+#[test]
+fn concurrent_creators_publish_exactly_one_complete_store() {
+    const CREATOR_COUNT: usize = 8;
+
+    let directory = tempdir().expect("temporary directory is available");
+    let path = Arc::new(database_path(&directory));
+    let barrier = Arc::new(Barrier::new(CREATOR_COUNT));
+    let handles: Vec<_> = (0..CREATOR_COUNT)
+        .map(|_| {
+            let path = Arc::clone(&path);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                SqliteStore::create(path.as_ref())
+                    .map(|store| store.memory_id())
+                    .map_err(|error| error.to_string())
+            })
+        })
+        .collect();
+
+    let outcomes: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("creator thread does not panic"))
+        .collect();
+    let successful_ids: Vec<_> = outcomes.into_iter().filter_map(Result::ok).collect();
+    assert_eq!(successful_ids.len(), 1);
+
+    let reopened = SqliteStore::open(path.as_ref()).expect("published store is complete");
+    assert_eq!(reopened.memory_id(), successful_ids[0]);
+    drop(reopened);
+
+    let entries: Vec<_> = fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, [path.file_name().unwrap()]);
 }
 
 #[test]

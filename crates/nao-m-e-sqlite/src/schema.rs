@@ -1,3 +1,4 @@
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use nao_m_e::MemoryId;
@@ -105,14 +106,77 @@ CREATE TABLE relevance_edges (
 ) STRICT, WITHOUT ROWID;
 "#;
 
-pub(crate) fn configure_new_connection(connection: &Connection) -> Result<()> {
-    configure_connection(connection)?;
-    connection.pragma_update(None, "application_id", APPLICATION_ID)?;
-    verify_integer_pragma(connection, "application_id", APPLICATION_ID)
+static CANONICAL_SCHEMA: OnceLock<SchemaShape> = OnceLock::new();
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SchemaShape {
+    objects: Vec<SchemaObject>,
+    tables: Vec<TableShape>,
 }
 
-pub(crate) fn configure_existing_connection(connection: &Connection) -> Result<()> {
-    configure_connection(connection)
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SchemaObject {
+    object_type: String,
+    name: String,
+    table_name: String,
+    normalized_sql: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TableShape {
+    name: String,
+    table_type: String,
+    column_count: i64,
+    without_rowid: i64,
+    strict: i64,
+    columns: Vec<ColumnShape>,
+    foreign_keys: Vec<ForeignKeyShape>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ColumnShape {
+    cid: i64,
+    name: String,
+    declared_type: String,
+    not_null: i64,
+    default_value: Option<String>,
+    primary_key_ordinal: i64,
+    hidden: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ForeignKeyShape {
+    id: i64,
+    sequence: i64,
+    parent_table: String,
+    child_column: String,
+    parent_column: String,
+    on_update: String,
+    on_delete: String,
+    match_clause: String,
+}
+
+pub(crate) fn configure_session(connection: &Connection) -> Result<()> {
+    connection.busy_timeout(Duration::ZERO)?;
+    connection.pragma_update(None, "foreign_keys", true)?;
+    connection.pragma_update(None, "trusted_schema", false)?;
+    connection.pragma_update(None, "ignore_check_constraints", false)?;
+
+    verify_integer_pragma(connection, "foreign_keys", 1)?;
+    verify_integer_pragma(connection, "trusted_schema", 0)?;
+    verify_integer_pragma(connection, "ignore_check_constraints", 0)?;
+    verify_integer_pragma(connection, "busy_timeout", 0)
+}
+
+pub(crate) fn configure_durability(connection: &Connection) -> Result<()> {
+    let journal_mode: String =
+        connection.query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
+    if !journal_mode.eq_ignore_ascii_case("delete") {
+        return Err(Error::InvalidQuery);
+    }
+
+    connection.pragma_update(None, "synchronous", "EXTRA")?;
+    verify_integer_pragma(connection, "synchronous", 3)
 }
 
 pub(crate) fn read_application_id(connection: &Connection) -> Result<i64> {
@@ -121,6 +185,7 @@ pub(crate) fn read_application_id(connection: &Connection) -> Result<i64> {
 
 pub(crate) fn create_schema(connection: &Connection, memory_id: MemoryId) -> Result<()> {
     let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
+    transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
     transaction.execute_batch(SCHEMA)?;
     transaction.execute(
         "INSERT INTO memory_meta (
@@ -131,28 +196,108 @@ pub(crate) fn create_schema(connection: &Connection, memory_id: MemoryId) -> Res
         ) VALUES (1, ?1, ?2, 0)",
         params![FORMAT_VERSION, encode_memory_id(memory_id).as_slice()],
     )?;
-    transaction.commit()
+    transaction.commit()?;
+    verify_integer_pragma(connection, "application_id", APPLICATION_ID)
 }
 
-fn configure_connection(connection: &Connection) -> Result<()> {
-    connection.busy_timeout(Duration::ZERO)?;
-    connection.pragma_update(None, "foreign_keys", true)?;
-    connection.pragma_update(None, "trusted_schema", false)?;
-    connection.pragma_update(None, "ignore_check_constraints", false)?;
+pub(crate) fn validate_schema(connection: &Connection) -> Result<bool> {
+    Ok(read_schema_shape(connection)? == *canonical_schema_shape()?)
+}
 
-    let journal_mode: String =
-        connection.query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
-    if !journal_mode.eq_ignore_ascii_case("delete") {
-        return Err(Error::InvalidQuery);
+fn canonical_schema_shape() -> Result<&'static SchemaShape> {
+    if let Some(schema) = CANONICAL_SCHEMA.get() {
+        return Ok(schema);
     }
+    let connection = Connection::open_in_memory()?;
+    connection.execute_batch(SCHEMA)?;
+    let schema = read_schema_shape(&connection)?;
+    Ok(CANONICAL_SCHEMA.get_or_init(|| schema))
+}
 
-    connection.pragma_update(None, "synchronous", "EXTRA")?;
+fn read_schema_shape(connection: &Connection) -> Result<SchemaShape> {
+    let mut statement = connection.prepare(
+        "SELECT type, name, tbl_name, sql
+         FROM main.sqlite_schema
+         ORDER BY type, name",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut objects = Vec::new();
+    while let Some(row) = rows.next()? {
+        objects.push(SchemaObject {
+            object_type: row.get(0)?,
+            name: row.get(1)?,
+            table_name: row.get(2)?,
+            normalized_sql: row
+                .get::<_, Option<String>>(3)?
+                .map(|sql| normalize_sql(&sql)),
+        });
+    }
+    let tables = objects
+        .iter()
+        .filter(|object| object.object_type == "table")
+        .map(|object| read_table_shape(connection, &object.name))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(SchemaShape { objects, tables })
+}
 
-    verify_integer_pragma(connection, "foreign_keys", 1)?;
-    verify_integer_pragma(connection, "trusted_schema", 0)?;
-    verify_integer_pragma(connection, "ignore_check_constraints", 0)?;
-    verify_integer_pragma(connection, "busy_timeout", 0)?;
-    verify_integer_pragma(connection, "synchronous", 3)
+fn normalize_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn read_table_shape(connection: &Connection, table_name: &str) -> Result<TableShape> {
+    let (table_type, column_count, without_rowid, strict) = connection.query_row(
+        "SELECT type, ncol, wr, strict
+         FROM pragma_table_list
+         WHERE schema = 'main' AND name = ?1",
+        [table_name],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden
+         FROM pragma_table_xinfo(?1)
+         ORDER BY cid",
+    )?;
+    let columns = statement
+        .query_map([table_name], |row| {
+            Ok(ColumnShape {
+                cid: row.get(0)?,
+                name: row.get(1)?,
+                declared_type: row.get(2)?,
+                not_null: row.get(3)?,
+                default_value: row.get(4)?,
+                primary_key_ordinal: row.get(5)?,
+                hidden: row.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>>>()?;
+    let mut statement = connection.prepare(
+        "SELECT id, seq, \"table\", \"from\", \"to\", on_update, on_delete, \"match\"
+         FROM pragma_foreign_key_list(?1)
+         ORDER BY id, seq",
+    )?;
+    let foreign_keys = statement
+        .query_map([table_name], |row| {
+            Ok(ForeignKeyShape {
+                id: row.get(0)?,
+                sequence: row.get(1)?,
+                parent_table: row.get(2)?,
+                child_column: row.get(3)?,
+                parent_column: row.get(4)?,
+                on_update: row.get(5)?,
+                on_delete: row.get(6)?,
+                match_clause: row.get(7)?,
+            })
+        })?
+        .collect::<Result<Vec<_>>>()?;
+    Ok(TableShape {
+        name: table_name.to_owned(),
+        table_type,
+        column_count,
+        without_rowid,
+        strict,
+        columns,
+        foreign_keys,
+    })
 }
 
 fn verify_integer_pragma(connection: &Connection, name: &str, expected: i64) -> Result<()> {
@@ -175,13 +320,29 @@ mod tests {
         (directory, connection)
     }
 
+    fn configure(connection: &Connection) {
+        configure_session(connection).expect("session configuration succeeds");
+        configure_durability(connection).expect("durability configuration succeeds");
+    }
+
     #[test]
-    fn connection_configuration_is_applied_and_verified() {
+    fn session_and_durability_configuration_are_independent() {
         let (_directory, connection) = open_temporary_database();
+        connection
+            .pragma_update(None, "journal_mode", "MEMORY")
+            .unwrap();
+        connection
+            .pragma_update(None, "synchronous", "NORMAL")
+            .unwrap();
+        connection
+            .pragma_update(None, "trusted_schema", true)
+            .unwrap();
+        connection
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
 
-        configure_new_connection(&connection).expect("configuration succeeds");
+        configure_session(&connection).expect("session configuration succeeds");
 
-        assert_eq!(read_application_id(&connection).unwrap(), APPLICATION_ID);
         assert_eq!(
             connection
                 .pragma_query_value(None, "busy_timeout", |row| row.get::<_, i64>(0))
@@ -212,6 +373,21 @@ mod tests {
             connection
                 .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
                 .unwrap(),
+            "memory"
+        );
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+
+        configure_durability(&connection).expect("durability configuration succeeds");
+
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+                .unwrap(),
             "delete"
         );
         assert_eq!(
@@ -223,13 +399,17 @@ mod tests {
     }
 
     #[test]
-    fn schema_records_memory_metadata_and_uses_strict_tables() {
+    fn schema_creation_commits_identity_metadata_and_canonical_shape() {
         let (_directory, connection) = open_temporary_database();
         let memory_id = MemoryId::new(u128::MAX).unwrap();
-        configure_new_connection(&connection).unwrap();
+        configure(&connection);
+
+        assert_eq!(read_application_id(&connection).unwrap(), 0);
 
         create_schema(&connection, memory_id).expect("schema creation succeeds");
 
+        assert_eq!(read_application_id(&connection).unwrap(), APPLICATION_ID);
+        assert!(validate_schema(&connection).unwrap());
         let (version, stored_id, revision): (i64, Vec<u8>, i64) = connection
             .query_row(
                 "SELECT format_version, memory_id, snapshot_revision
@@ -242,42 +422,113 @@ mod tests {
         assert_eq!(version, FORMAT_VERSION);
         assert_eq!(stored_id, memory_id.to_be_bytes());
         assert_eq!(revision, 0);
+    }
 
-        let mut statement = connection
-            .prepare(
-                "SELECT name, wr, strict
-                 FROM pragma_table_list
-                 WHERE name IN (
-                    'memory_meta',
-                    'episodes',
-                    'episode_statements',
-                    'statement_terms',
-                    'activations',
-                    'relevance_edges'
-                 )
-                 ORDER BY name",
+    #[test]
+    fn failed_schema_creation_rolls_back_application_identity_and_ddl() {
+        let (_directory, connection) = open_temporary_database();
+        configure(&connection);
+        connection
+            .execute_batch(
+                "CREATE TABLE episodes (
+                    sequence BLOB PRIMARY KEY
+                 ) STRICT, WITHOUT ROWID;",
             )
             .unwrap();
-        let properties = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
 
-        assert_eq!(properties.len(), 6);
-        for (name, without_rowid, strict) in properties {
-            assert_eq!(strict, 1, "{name} must be STRICT");
-            assert_eq!(
-                without_rowid,
-                i64::from(name != "memory_meta"),
-                "unexpected rowid policy for {name}"
+        assert!(create_schema(&connection, MemoryId::new(1).unwrap()).is_err());
+        assert_eq!(read_application_id(&connection).unwrap(), 0);
+        let metadata_tables: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'memory_meta'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(metadata_tables, 0);
+    }
+
+    #[test]
+    fn validation_accepts_whitespace_only_ddl_variation() {
+        let (_directory, connection) = open_temporary_database();
+        let reformatted = SCHEMA
+            .replace("CREATE TABLE", "CREATE    TABLE")
+            .replace('\n', "\n    ");
+
+        connection.execute_batch(&reformatted).unwrap();
+
+        assert!(validate_schema(&connection).unwrap());
+    }
+
+    #[test]
+    fn validation_rejects_structural_and_check_constraint_drift() {
+        let mutations = [
+            ("STRICT", SCHEMA.replacen(") STRICT;", ");", 1)),
+            (
+                "WITHOUT ROWID",
+                SCHEMA.replacen(") STRICT, WITHOUT ROWID;", ") STRICT;", 1),
+            ),
+            (
+                "column type",
+                SCHEMA.replacen(
+                    "occurred_at_ms INTEGER NOT NULL",
+                    "occurred_at_ms TEXT NOT NULL",
+                    1,
+                ),
+            ),
+            (
+                "primary key",
+                SCHEMA.replacen(
+                    "PRIMARY KEY (from_sequence, to_sequence)",
+                    "PRIMARY KEY (to_sequence, from_sequence)",
+                    1,
+                ),
+            ),
+            (
+                "foreign key action",
+                SCHEMA.replacen(
+                    "ON UPDATE RESTRICT ON DELETE RESTRICT",
+                    "ON UPDATE RESTRICT ON DELETE CASCADE",
+                    1,
+                ),
+            ),
+            (
+                "check constraint",
+                SCHEMA.replacen(
+                    "CHECK (activation_ppm BETWEEN 0 AND 1000000)",
+                    "CHECK (activation_ppm BETWEEN 0 AND 999999)",
+                    1,
+                ),
+            ),
+        ];
+
+        for (name, schema) in mutations {
+            let (_directory, connection) = open_temporary_database();
+            connection
+                .execute_batch(&schema)
+                .unwrap_or_else(|error| panic!("{name} fixture must be valid SQLite: {error}"));
+            assert!(
+                !validate_schema(&connection).unwrap(),
+                "{name} drift must be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn validation_rejects_persisted_user_schema_objects() {
+        let objects = [
+            "CREATE TABLE extra (value INTEGER) STRICT",
+            "CREATE INDEX extra_index ON activations(activation_ppm)",
+            "CREATE VIEW extra_view AS SELECT * FROM memory_meta",
+            "CREATE TRIGGER extra_trigger AFTER UPDATE ON memory_meta
+             BEGIN SELECT 1; END",
+        ];
+
+        for object in objects {
+            let (_directory, connection) = open_temporary_database();
+            connection.execute_batch(SCHEMA).unwrap();
+            connection.execute_batch(object).unwrap();
+            assert!(!validate_schema(&connection).unwrap(), "accepted {object}");
         }
     }
 
@@ -285,7 +536,7 @@ mod tests {
     fn database_constraints_reject_noncanonical_storage_values() {
         let (_directory, connection) = open_temporary_database();
         let memory_id = MemoryId::new(1).unwrap();
-        configure_new_connection(&connection).unwrap();
+        configure(&connection);
         create_schema(&connection, memory_id).unwrap();
 
         assert!(

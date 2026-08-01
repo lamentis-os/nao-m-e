@@ -37,21 +37,35 @@ V1 uses SQLite application ID `0x4E414F4D` (`NAOM`, decimal `1312902989`) and
 format version `1`. A different application ID or format version is rejected;
 V1 performs no migration.
 
-Every connection applies and verifies these settings before reading or writing
-memory state:
+Immediately after opening a connection, and before reading or creating schema
+or memory state, the adapter applies and verifies these connection-local safety
+settings:
 
 ```text
+busy_timeout = 0
 foreign_keys = ON
 trusted_schema = OFF
 ignore_check_constraints = OFF
-journal_mode = DELETE
-synchronous = EXTRA
-busy_timeout = 0
 ```
 
-The adapter disables rusqlite's connection-level default busy wait and performs
-no retries. SQLite locking failures therefore remain immediately visible to
-the caller as database errors.
+For a file-backed target, the adapter then reads the SQLite header's application
+ID. Only after accepting that ID as `NAOM` does it apply and verify the settings
+that affect persistent journaling behavior:
+
+```text
+journal_mode = DELETE
+synchronous = EXTRA
+```
+
+This ordering prevents an attempted open of an unrelated SQLite database from
+changing its journaling mode. A zero busy timeout means the adapter neither
+waits nor retries on its own; SQLite locking failures remain immediately
+visible to the caller as database errors.
+
+The new-store builder is an in-memory SQLite connection. It receives the safety
+settings but deliberately does not receive the file durability settings:
+in-memory SQLite uses `journal_mode=MEMORY`, and durability is configured only
+when the published target is opened as a file-backed store.
 
 ## Canonical encoding
 
@@ -73,6 +87,8 @@ The schema below is the complete V1 storage shape. All foreign-key actions are
 restrictive because episode rows are append-only.
 
 ```sql
+BEGIN IMMEDIATE;
+
 PRAGMA application_id = 1312902989;
 
 CREATE TABLE memory_meta (
@@ -169,11 +185,22 @@ CREATE TABLE relevance_edges (
         ON UPDATE RESTRICT ON DELETE RESTRICT,
     CHECK (from_sequence != to_sequence)
 ) STRICT, WITHOUT ROWID;
+
+INSERT INTO memory_meta (
+    singleton,
+    format_version,
+    memory_id,
+    snapshot_revision
+) VALUES (1, 1, :memory_id, 0);
+
+COMMIT;
 ```
 
 `memory_meta` contains exactly one row with `singleton = 1`. Creation inserts
 format version `1`, a randomly generated non-zero memory ID, and snapshot
-revision `0`.
+revision `0`. `:memory_id` denotes the bound canonical 16-byte BLOB. The
+application ID, all six table definitions, and this singleton row are committed
+together or not at all.
 
 Statement roles are:
 
@@ -195,34 +222,65 @@ self-edges, and missing endpoints. The adapter additionally validates the
 cross-row invariants that SQL does not enforce efficiently. In particular, no
 trigger sums outgoing relevance weights for each inserted edge.
 
+The persisted V1 application schema is closed. It contains exactly the six
+user tables above and no additional persistent user table, view, trigger, or
+user-defined index. SQLite-owned internal objects and automatic indexes are not
+user extensions. On `open()` and before every `save()`, the adapter validates
+the schema through SQLite PRAGMA and `main.sqlite_schema` introspection. It
+compares whitespace-normalized `CREATE TABLE` SQL with the canonical statements
+derived from the same internal `SCHEMA` constant, so whitespace-only formatting
+changes are accepted but token or CHECK-constraint drift is rejected. It also
+verifies the table inventory, `STRICT` and `WITHOUT ROWID` properties, column
+names, declared types, nullability, default and hidden-column absence,
+primary-key positions, and complete foreign-key definitions.
+
 ## Create and open
 
-`SqliteStore::create` requires an absent target path and reserves it
-exclusively. It generates a `MemoryId` from operating-system entropy, retrying
-only if the all-zero value is returned. Schema, metadata, and the initial empty
-snapshot are initialized transactionally. If initialization fails, the adapter
-closes the connection and attempts to remove only the file it created; a
-cleanup failure is returned as an I/O error. An existing target is never
-replaced or truncated.
+`SqliteStore::create` requires an absent target path but never initializes that
+path in place. It generates a `MemoryId` from operating-system entropy,
+retrying only if the all-zero value is returned, and builds the canonical empty
+database in `Connection::open_in_memory()`. The in-memory connection receives
+the safety settings; one transaction commits the application ID, schema,
+metadata, and initial empty snapshot. The adapter then verifies identity,
+canonical schema, quick check, foreign keys, and revision zero before
+serializing SQLite's main database image.
+
+The serialized bytes are written through a privately held `NamedTempFile` in
+the target directory. The adapter flushes the stream and calls `sync_all()` on
+that file before `persist_noclobber` publishes it at the requested path without
+replacing an existing entry. A pre-existing target, or one created
+concurrently, is never replaced or truncated. After publication, the returned
+file handle is dropped and `SqliteStore::open(target)` performs the normal
+file-backed validation and applies the durability settings.
+
+The adapter never deletes the requested target on an error path, including an
+error from the final `open()`. Before publication, ordinary failures clean up
+only the private staging file. The directory containing the target is a
+caller-controlled trust boundary; another actor able to mutate that directory
+can alter the path after publication.
 
 `SqliteStore::open` requires an existing target and never creates a missing
 database. It opens the file read-write because every returned store supports
-`save()`; V1 has no read-only mode. It then opens a consistent read transaction
-and performs these checks:
+`save()`; V1 has no read-only mode. Before the first schema or state read, it
+applies the safety settings. It reads and accepts the application ID before
+applying the durability settings, then opens a consistent read transaction and
+performs these checks:
 
-1. The application ID is `NAOM`, the schema is present, and `memory_meta`
-   contains exactly one supported metadata row with a non-zero 16-byte ID.
-2. `PRAGMA quick_check` returns only `ok` and `PRAGMA foreign_key_check`
+1. The persisted application schema is canonical V1 and contains no additional
+   persistent user object, including a trigger or view.
+2. `memory_meta` contains exactly one supported metadata row with a non-zero
+   16-byte ID.
+3. `PRAGMA quick_check` returns only `ok` and `PRAGMA foreign_key_check`
    returns no violations.
-3. Episode sequences are exactly `0..N-1` without gaps.
-4. Every episode has exactly one observation, at most one action and outcome,
+4. Episode sequences are exactly `0..N-1` without gaps.
+5. Every episode has exactly one observation, at most one action and outcome,
    and contiguous context ordinals.
-5. Every statement has contiguous term ordinals and at least one term.
-6. Stored context is already strictly increasing and duplicate-free under the
+6. Every statement has contiguous term ordinals and at least one term.
+7. Stored context is already strictly increasing and duplicate-free under the
    statement order defined by the V0 core contract. Corrupt context is rejected
    rather than silently repaired by insertion canonicalization.
-7. Every episode has exactly one activation row.
-8. Relevance endpoints exist, edges are unique and non-reflexive, and each
+8. Every episode has exactly one activation row.
+9. Relevance endpoints exist, edges are unique and non-reflexive, and each
    source's total outgoing weight is at most `SCALE`.
 
 The adapter reads each table in ordered, set-based passes and assembles episodes
@@ -243,18 +301,24 @@ because every logical `step()` overwrites it before use.
 Each opened store remembers its loaded `snapshot_revision` and immutable
 episode count. `save()` starts `BEGIN IMMEDIATE` and performs one transaction:
 
-1. Revalidate the application ID and format version, then read the current
-   revision. A changed revision is a stale writer and fails with
-   `StoreError::ConcurrentModification`.
-2. Reject `i64::MAX` with `StoreError::RevisionExhausted`.
-3. Read only the greatest stored episode sequence and compare it with the
+1. Revalidate the application ID, canonical V1 schema, and format version. Any
+   additional persistent trigger or view rejects the save before state is
+   changed.
+2. Read the persisted memory ID and current revision. A memory ID different
+   from the owned `MemoryV0` is invalid metadata; a changed revision is a stale
+   writer and fails with `StoreError::ConcurrentModification`.
+3. Reject `i64::MAX` with `StoreError::RevisionExhausted`.
+4. Read only the greatest stored episode sequence and compare it with the
    remembered episode count. A changed append boundary is invalid stored data.
-4. Compare-and-swap the expected revision to its successor.
-5. Append only episodes at or beyond the remembered count, including their
+5. Compare-and-swap the expected revision to its successor with both the
+   expected revision and owned canonical memory-ID bytes in the SQL predicate.
+   Zero changed rows are re-read and classified as identity corruption or a
+   concurrent revision change.
+6. Append only episodes at or beyond the remembered count, including their
    statements and terms, through reused prepared statements.
-6. Replace the complete dense activation table.
-7. Replace the complete sparse relevance table.
-8. Commit, then update the store's remembered revision and episode count.
+7. Replace the complete dense activation table.
+8. Replace the complete sparse relevance table.
+9. Commit, then update the store's remembered revision and episode count.
 
 The append-boundary query uses the ordered episode primary key and does not
 count or scan the immutable prefix. It protects the supported writer path in
@@ -288,14 +352,15 @@ available through `std::error::Error::source`.
 unsupported format version, failed quick check, foreign-key violations,
 invalid fixed-width encoding, invalid memory ID, invalid metadata,
 non-contiguous episode sequences, invalid episodes, invalid activations, or
-invalid relevance. Both error enums are non-exhaustive so that future releases
-can report corruption more precisely without making callers treat the variants
-as a closed format definition.
+invalid relevance. A non-canonical schema is classified as invalid metadata.
+Both error enums are non-exhaustive so that future releases can report
+corruption more precisely without making callers treat the variants as a
+closed format definition.
 
-The adapter fails closed: it does not renumber episodes, canonicalize malformed
-stored context, drop invalid rows, infer missing activation, reduce relevance
-weights, or expose a partially reconstructed memory. Direct SQL modification is
-not a supported API.
+The adapter fails closed: it does not accept a non-canonical persisted schema,
+renumber episodes, canonicalize malformed stored context, drop invalid rows,
+infer missing activation, reduce relevance weights, or expose a partially
+reconstructed memory. Direct SQL modification is not a supported API.
 
 ## Worked snapshot
 
@@ -373,3 +438,15 @@ rollback-journal synchronization behavior, including additional directory
 synchronization after journal removal. It does not make unsaved mutations
 durable and is not evidence of behavior for every storage device, filesystem,
 operating system, or sudden-power-loss scenario.
+
+Creation does not apply these file durability PRAGMAs to the in-memory builder.
+Instead, it serializes a validated database image, writes it into the private
+staging file, flushes it, and calls `sync_all()` before target-no-clobber
+publication. A successful publication therefore exposes the complete staged
+image rather than an incrementally initialized target.
+
+The adapter does not `fsync` the parent directory. On a platform or filesystem
+where `persist_noclobber` uses a hard-link fallback, a temporary hard link can
+remain after a cleanup failure or process crash. These publication mechanics do
+not establish survival of the target directory entry under physical power loss.
+The caller is responsible for the trust and lifecycle of the parent directory.

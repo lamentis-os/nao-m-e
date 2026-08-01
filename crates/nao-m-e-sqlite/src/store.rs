@@ -1,13 +1,14 @@
-use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::Path;
-use std::time::Duration;
 
 use nao_m_e::{
     Activation, AtomId, EpisodeAtom, EpisodeDraft, InfluenceWeight, MemoryId, MemoryV0,
     PredicateId, SCALE, SourceId, Statement, TermId, TimestampMs,
 };
 use rusqlite::types::ValueRef;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior};
+use rusqlite::{
+    Connection, MAIN_DB, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior,
+};
 
 use crate::codec;
 use crate::error::{StoreError, StoreIntegrityError};
@@ -38,28 +39,9 @@ impl SqliteStore {
     pub fn create(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
         let memory_id = random_memory_id()?;
-        let reservation = OpenOptions::new().write(true).create_new(true).open(path)?;
-        let connection = match Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-        {
-            Ok(connection) => connection,
-            Err(error) => {
-                drop(reservation);
-                return Err(clean_up_new_file(path, error.into()));
-            }
-        };
-        drop(reservation);
-
-        if let Err(error) = initialize_new_store(&connection, memory_id) {
-            drop(connection);
-            return Err(clean_up_new_file(path, error));
-        }
-
-        Ok(Self {
-            connection,
-            memory: MemoryV0::new(memory_id),
-            persisted_episode_count: 0,
-            expected_revision: 0,
-        })
+        let database = build_initial_database(memory_id)?;
+        publish_database(path, &database)?;
+        Self::open(path)
     }
 
     /// Opens and validates an existing SQLite V1 memory store.
@@ -69,7 +51,7 @@ impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE;
         let mut connection = Connection::open_with_flags(path, flags)?;
-        connection.busy_timeout(Duration::ZERO)?;
+        schema::configure_session(&connection)?;
         let application_id = schema::read_application_id(&connection)?;
         if application_id != schema::APPLICATION_ID {
             return Err(StoreIntegrityError::ApplicationMismatch {
@@ -77,8 +59,7 @@ impl SqliteStore {
             }
             .into());
         }
-        read_metadata(&connection)?;
-        schema::configure_existing_connection(&connection)?;
+        schema::configure_durability(&connection)?;
 
         let (memory, persisted_episode_count, expected_revision) = load_memory(&mut connection)?;
         Ok(Self {
@@ -132,7 +113,14 @@ impl SqliteStore {
 
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         verify_application_id(&transaction)?;
-        let actual_revision = read_revision(&transaction)?;
+        verify_schema(&transaction)?;
+        let (actual_memory_id, actual_revision) = read_metadata(&transaction)?;
+        if actual_memory_id != memory.memory_id() {
+            return Err(StoreIntegrityError::InvalidMetadata {
+                detail: "persisted memory ID differs from the owned memory",
+            }
+            .into());
+        }
         if actual_revision != *expected_revision {
             return Err(StoreError::ConcurrentModification {
                 expected_revision: *expected_revision,
@@ -145,17 +133,26 @@ impl SqliteStore {
         verify_persisted_tail(&transaction, *persisted_episode_count)?;
 
         let next_revision = actual_revision + 1;
+        let memory_id = codec::encode_memory_id(memory.memory_id());
         let changed = transaction.execute(
             "UPDATE memory_meta
              SET snapshot_revision = ?1
-             WHERE singleton = 1 AND snapshot_revision = ?2",
-            (next_revision, actual_revision),
+             WHERE singleton = 1
+               AND snapshot_revision = ?2
+               AND memory_id = ?3",
+            rusqlite::params![next_revision, actual_revision, memory_id.as_slice()],
         )?;
         if changed != 1 {
-            let found = read_revision(&transaction)?;
+            let (found_memory_id, found_revision) = read_metadata(&transaction)?;
+            if found_memory_id != memory.memory_id() {
+                return Err(StoreIntegrityError::InvalidMetadata {
+                    detail: "persisted memory ID differs from the owned memory",
+                }
+                .into());
+            }
             return Err(StoreError::ConcurrentModification {
                 expected_revision: actual_revision,
-                actual_revision: found,
+                actual_revision: found_revision,
             });
         }
 
@@ -180,23 +177,47 @@ fn random_memory_id() -> Result<MemoryId, StoreError> {
     }
 }
 
-fn clean_up_new_file(path: &Path, original: StoreError) -> StoreError {
-    match fs::remove_file(path) {
-        Ok(()) => original,
-        Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => original,
-        Err(cleanup) => StoreError::Io(cleanup),
+fn build_initial_database(memory_id: MemoryId) -> Result<Vec<u8>, StoreError> {
+    let connection = Connection::open_in_memory()?;
+    schema::configure_session(&connection)?;
+    schema::create_schema(&connection, memory_id)?;
+    verify_application_id(&connection)?;
+    verify_schema(&connection)?;
+    verify_quick_check(&connection)?;
+    verify_foreign_keys(&connection)?;
+    let (stored_memory_id, revision) = read_metadata(&connection)?;
+    if stored_memory_id != memory_id || revision != 0 {
+        return Err(StoreIntegrityError::InvalidMetadata {
+            detail: "new store metadata differs from its initialized identity",
+        }
+        .into());
     }
+    Ok(connection.serialize(MAIN_DB)?.to_vec())
 }
 
-fn initialize_new_store(connection: &Connection, memory_id: MemoryId) -> Result<(), StoreError> {
-    schema::configure_new_connection(connection)?;
-    schema::create_schema(connection, memory_id)?;
+fn publish_database(path: &Path, database: &[u8]) -> Result<(), StoreError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut staging = tempfile::Builder::new()
+        .prefix(".nao-m-e-")
+        .suffix(".sqlite.tmp")
+        .tempfile_in(parent)?;
+    staging.write_all(database)?;
+    staging.flush()?;
+    staging.as_file().sync_all()?;
+    let published = staging
+        .persist_noclobber(path)
+        .map_err(|error| StoreError::Io(error.error))?;
+    drop(published);
     Ok(())
 }
 
 fn load_memory(connection: &mut Connection) -> Result<(MemoryV0, usize, i64), StoreError> {
     let transaction = connection.transaction()?;
     verify_application_id(&transaction)?;
+    verify_schema(&transaction)?;
     let (memory_id, revision) = read_metadata(&transaction)?;
     verify_quick_check(&transaction)?;
     verify_foreign_keys(&transaction)?;
@@ -240,6 +261,17 @@ fn verify_application_id(connection: &Connection) -> Result<(), StoreError> {
     }
 }
 
+fn verify_schema(connection: &Connection) -> Result<(), StoreError> {
+    if schema::validate_schema(connection)? {
+        Ok(())
+    } else {
+        Err(StoreIntegrityError::InvalidMetadata {
+            detail: "database schema differs from the SQLite V1 contract",
+        }
+        .into())
+    }
+}
+
 fn verify_quick_check(connection: &Connection) -> Result<(), StoreError> {
     let mut statement = connection.prepare("PRAGMA quick_check")?;
     let mut rows = statement.query([])?;
@@ -274,22 +306,29 @@ fn verify_foreign_keys(connection: &Connection) -> Result<(), StoreError> {
 
 fn read_metadata(connection: &Connection) -> Result<(MemoryId, i64), StoreError> {
     let mut statement = connection.prepare(
-        "SELECT format_version, memory_id, snapshot_revision
+        "SELECT singleton, format_version, memory_id, snapshot_revision
          FROM memory_meta",
     )?;
     let mut rows = statement.query([])?;
     let Some(row) = rows.next()? else {
         return Err(StoreIntegrityError::MissingMetadata.into());
     };
-    let format_version = read_integer(row, 0, "memory_meta", "format_version")?;
+    let singleton = read_integer(row, 0, "memory_meta", "singleton")?;
+    if singleton != 1 {
+        return Err(StoreIntegrityError::InvalidMetadata {
+            detail: "metadata singleton key is not one",
+        }
+        .into());
+    }
+    let format_version = read_integer(row, 1, "memory_meta", "format_version")?;
     if format_version != schema::FORMAT_VERSION {
         return Err(StoreIntegrityError::UnsupportedFormatVersion {
             found: format_version,
         }
         .into());
     }
-    let memory_id = read_memory_id(row, 1, "memory_meta", "memory_id")?;
-    let revision = read_integer(row, 2, "memory_meta", "snapshot_revision")?;
+    let memory_id = read_memory_id(row, 2, "memory_meta", "memory_id")?;
+    let revision = read_integer(row, 3, "memory_meta", "snapshot_revision")?;
     if rows.next()?.is_some() {
         return Err(StoreIntegrityError::InvalidMetadata {
             detail: "multiple metadata rows",
@@ -303,33 +342,6 @@ fn read_metadata(connection: &Connection) -> Result<(MemoryId, i64), StoreError>
         .into());
     }
     Ok((memory_id, revision))
-}
-
-fn read_revision(connection: &Connection) -> Result<i64, StoreError> {
-    let mut statement = connection.prepare(
-        "SELECT format_version, snapshot_revision
-         FROM memory_meta
-         WHERE singleton = 1",
-    )?;
-    let mut rows = statement.query([])?;
-    let Some(row) = rows.next()? else {
-        return Err(StoreIntegrityError::MissingMetadata.into());
-    };
-    let format_version = read_integer(row, 0, "memory_meta", "format_version")?;
-    if format_version != schema::FORMAT_VERSION {
-        return Err(StoreIntegrityError::UnsupportedFormatVersion {
-            found: format_version,
-        }
-        .into());
-    }
-    let revision = read_integer(row, 1, "memory_meta", "snapshot_revision")?;
-    if revision < 0 {
-        return Err(StoreIntegrityError::InvalidMetadata {
-            detail: "negative snapshot revision",
-        }
-        .into());
-    }
-    Ok(revision)
 }
 
 #[derive(Debug)]
@@ -446,6 +458,32 @@ impl TermRow {
     }
 }
 
+fn read_next_term(rows: &mut rusqlite::Rows<'_>) -> Result<Option<TermRow>, StoreError> {
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let episode_sequence = read_u64(row, 0, "statement_terms", "episode_sequence")?;
+    Ok(Some(TermRow {
+        episode_sequence,
+        role: read_integer(row, 1, "statement_terms", "role")?,
+        statement_ordinal: read_non_negative_u64(
+            row,
+            2,
+            "statement_terms",
+            "statement_ordinal",
+            episode_sequence,
+        )?,
+        term_ordinal: read_non_negative_u64(
+            row,
+            3,
+            "statement_terms",
+            "term_ordinal",
+            episode_sequence,
+        )?,
+        term: TermId::new(read_u64(row, 4, "statement_terms", "term_id")?),
+    }))
+}
+
 fn attach_terms(
     connection: &Connection,
     statements: &mut [StoredStatement],
@@ -456,37 +494,17 @@ fn attach_terms(
          ORDER BY episode_sequence, role, statement_ordinal, term_ordinal",
     )?;
     let mut rows = query.query([])?;
-    let mut terms = Vec::new();
-    while let Some(row) = rows.next()? {
-        let episode_sequence = read_u64(row, 0, "statement_terms", "episode_sequence")?;
-        terms.push(TermRow {
-            episode_sequence,
-            role: read_integer(row, 1, "statement_terms", "role")?,
-            statement_ordinal: read_non_negative_u64(
-                row,
-                2,
-                "statement_terms",
-                "statement_ordinal",
-                episode_sequence,
-            )?,
-            term_ordinal: read_non_negative_u64(
-                row,
-                3,
-                "statement_terms",
-                "term_ordinal",
-                episode_sequence,
-            )?,
-            term: TermId::new(read_u64(row, 4, "statement_terms", "term_id")?),
-        });
-    }
+    let mut next_term = read_next_term(&mut rows)?;
 
-    let mut term_index = 0;
     for statement in statements {
         let mut expected_ordinal = 0_u64;
-        while let Some(term) = terms.get(term_index) {
-            if term.statement_key() != statement.key() {
-                break;
-            }
+        while next_term
+            .as_ref()
+            .is_some_and(|term| term.statement_key() == statement.key())
+        {
+            let term = next_term
+                .take()
+                .expect("a matching term was checked before extraction");
             if term.term_ordinal != expected_ordinal {
                 return Err(StoreIntegrityError::InvalidEpisode {
                     sequence: statement.episode_sequence,
@@ -502,7 +520,7 @@ fn attach_terms(
                         sequence: statement.episode_sequence,
                         detail: "term ordinal space is exhausted",
                     })?;
-            term_index += 1;
+            next_term = read_next_term(&mut rows)?;
         }
         if statement.arguments.is_empty() {
             return Err(StoreIntegrityError::InvalidEpisode {
@@ -512,7 +530,7 @@ fn attach_terms(
             .into());
         }
     }
-    if let Some(term) = terms.get(term_index) {
+    if let Some(term) = next_term {
         return Err(StoreIntegrityError::InvalidEpisode {
             sequence: term.episode_sequence,
             detail: "term references an absent statement",
@@ -1160,10 +1178,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rejecting_an_unrelated_database_does_not_change_its_journal_mode() {
+        let directory = tempdir().expect("temporary directory is available");
+        let path = directory.path().join("unrelated.sqlite3");
+        let raw = Connection::open(&path).expect("unrelated database opens");
+        raw.execute("CREATE TABLE unrelated (value INTEGER)", [])
+            .expect("unrelated schema is created");
+        let journal_mode: String = raw
+            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+            .expect("WAL mode can be selected for the fixture");
+        assert_eq!(journal_mode, "wal");
+        drop(raw);
+
+        assert!(matches!(
+            SqliteStore::open(&path),
+            Err(StoreError::InvalidStore(
+                StoreIntegrityError::ApplicationMismatch { found: 0 }
+            ))
+        ));
+
+        let raw = Connection::open(&path).expect("unrelated database reopens");
+        let journal_mode: String = raw
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("journal mode remains readable");
+        assert_eq!(journal_mode, "wal");
+        raw.pragma_update(None, "journal_mode", "DELETE")
+            .expect("fixture leaves no WAL sidecars");
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum StateCorruption {
         SequenceGap,
         MissingObservation,
+        EmptyStatement,
         TermGap,
         NonCanonicalContext,
         MissingActivation,
@@ -1177,6 +1225,7 @@ mod tests {
         for corruption in [
             StateCorruption::SequenceGap,
             StateCorruption::MissingObservation,
+            StateCorruption::EmptyStatement,
             StateCorruption::TermGap,
             StateCorruption::NonCanonicalContext,
             StateCorruption::MissingActivation,
@@ -1229,6 +1278,15 @@ mod tests {
                     connection
                         .execute(
                             "DELETE FROM episode_statements
+                             WHERE episode_sequence = ?1 AND role = 1",
+                            [zero.as_slice()],
+                        )
+                        .unwrap();
+                }
+                StateCorruption::EmptyStatement => {
+                    connection
+                        .execute(
+                            "DELETE FROM statement_terms
                              WHERE episode_sequence = ?1 AND role = 1",
                             [zero.as_slice()],
                         )
@@ -1323,6 +1381,13 @@ mod tests {
                     error,
                     StoreIntegrityError::NonContiguousEpisodeSequence { .. }
                 ),
+                StateCorruption::EmptyStatement => matches!(
+                    error,
+                    StoreIntegrityError::InvalidEpisode {
+                        sequence: 0,
+                        detail: "statement has no terms"
+                    }
+                ),
                 StateCorruption::MissingObservation
                 | StateCorruption::TermGap
                 | StateCorruption::NonCanonicalContext => {
@@ -1349,6 +1414,146 @@ mod tests {
     }
 
     #[test]
+    fn save_rejects_a_changed_persisted_memory_identity() {
+        let directory = tempdir().expect("temporary directory is available");
+        let path = saved_store(&directory, 1);
+        let mut store = SqliteStore::open(&path).expect("base store opens");
+        let original_memory_id = store.memory_id();
+        let replacement_memory_id = if original_memory_id.get() == 1 {
+            MemoryId::new(2).unwrap()
+        } else {
+            MemoryId::new(1).unwrap()
+        };
+
+        let raw = Connection::open(&path).expect("fixture database opens");
+        raw.execute(
+            "UPDATE memory_meta SET memory_id = ?1 WHERE singleton = 1",
+            [replacement_memory_id.to_be_bytes().as_slice()],
+        )
+        .expect("persisted identity can be changed out of band");
+        drop(raw);
+
+        store
+            .memory_mut()
+            .insert_episode(draft(10))
+            .expect("unsaved episode inserts");
+        assert!(matches!(
+            store.save(),
+            Err(StoreError::InvalidStore(
+                StoreIntegrityError::InvalidMetadata { .. }
+            ))
+        ));
+        assert_eq!(store.memory().episodes().len(), 2);
+
+        let raw = Connection::open(&path).expect("fixture database reopens");
+        raw.execute(
+            "UPDATE memory_meta SET memory_id = ?1 WHERE singleton = 1",
+            [original_memory_id.to_be_bytes().as_slice()],
+        )
+        .expect("fixture identity can be restored");
+        drop(raw);
+
+        store
+            .save()
+            .expect("unchanged in-memory state can be retried after restoring identity");
+        drop(store);
+
+        let reopened = SqliteStore::open(&path).expect("retried snapshot reopens");
+        assert_eq!(reopened.memory_id(), original_memory_id);
+        assert_eq!(reopened.memory().episodes().len(), 2);
+    }
+
+    #[test]
+    fn save_rejects_a_noncanonical_metadata_singleton() {
+        let directory = tempdir().expect("temporary directory is available");
+        let path = saved_store(&directory, 1);
+        let mut store = SqliteStore::open(&path).expect("base store opens");
+        let raw = Connection::open(&path).expect("fixture database opens");
+        raw.pragma_update(None, "ignore_check_constraints", true)
+            .expect("fixture can bypass the singleton check");
+        raw.execute("UPDATE memory_meta SET singleton = 2", [])
+            .expect("singleton key can be changed out of band");
+        drop(raw);
+
+        store
+            .memory_mut()
+            .insert_episode(draft(10))
+            .expect("unsaved episode inserts");
+        assert!(matches!(
+            store.save(),
+            Err(StoreError::InvalidStore(
+                StoreIntegrityError::InvalidMetadata { .. }
+            ))
+        ));
+        assert_eq!(store.memory().episodes().len(), 2);
+
+        let raw = Connection::open(&path).expect("fixture database reopens");
+        raw.execute("UPDATE memory_meta SET singleton = 1", [])
+            .expect("fixture singleton can be restored");
+        drop(raw);
+        store
+            .save()
+            .expect("same in-memory changes can be retried after metadata repair");
+    }
+
+    #[test]
+    fn persistent_trigger_is_rejected_before_open_or_save() {
+        const TRIGGER: &str = "CREATE TRIGGER erase_inserted_activation
+            AFTER INSERT ON activations
+            BEGIN
+                DELETE FROM activations
+                WHERE episode_sequence = NEW.episode_sequence;
+            END;";
+
+        let directory = tempdir().expect("temporary directory is available");
+        let path = saved_store(&directory, 1);
+        let raw = Connection::open(&path).expect("fixture database opens");
+        raw.execute_batch(TRIGGER)
+            .expect("persistent trigger installs");
+        drop(raw);
+
+        assert!(matches!(
+            integrity_error(&path),
+            StoreIntegrityError::InvalidMetadata { .. }
+        ));
+
+        let raw = Connection::open(&path).expect("fixture database reopens");
+        raw.execute("DROP TRIGGER erase_inserted_activation", [])
+            .expect("fixture trigger can be removed");
+        drop(raw);
+
+        let mut store = SqliteStore::open(&path).expect("canonical store opens");
+        store
+            .memory_mut()
+            .insert_episode(draft(10))
+            .expect("unsaved episode inserts");
+        let raw = Connection::open(&path).expect("fixture database reopens");
+        raw.execute_batch(TRIGGER)
+            .expect("persistent trigger reinstalls after open");
+        drop(raw);
+
+        assert!(matches!(
+            store.save(),
+            Err(StoreError::InvalidStore(
+                StoreIntegrityError::InvalidMetadata { .. }
+            ))
+        ));
+        assert_eq!(store.memory().episodes().len(), 2);
+
+        let raw = Connection::open(&path).expect("fixture database reopens");
+        raw.execute("DROP TRIGGER erase_inserted_activation", [])
+            .expect("fixture trigger can be removed");
+        drop(raw);
+        store
+            .save()
+            .expect("same in-memory changes can be retried after schema repair");
+        drop(store);
+
+        let reopened = SqliteStore::open(&path).expect("retried snapshot reopens");
+        assert_eq!(reopened.memory().episodes().len(), 2);
+    }
+
+    #[test]
     fn failed_save_rolls_back_revision_atoms_and_mutable_state() {
         let directory = tempdir().expect("temporary directory is available");
         let path = saved_store(&directory, 1);
@@ -1368,18 +1573,18 @@ mod tests {
             initial.save().expect("base activation saves");
         }
 
-        let raw = Connection::open(&path).expect("fixture database opens");
-        raw.execute_batch(
-            "CREATE TRIGGER abort_activation_insert
-             BEFORE INSERT ON activations
+        let mut store = SqliteStore::open(&path).expect("base store reopens");
+        store
+            .connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER abort_activation_insert
+             BEFORE INSERT ON main.activations
              BEGIN
                  SELECT RAISE(ABORT, 'injected save failure');
              END;",
-        )
-        .expect("abort trigger installs");
-        drop(raw);
+            )
+            .expect("connection-local abort trigger installs");
 
-        let mut store = SqliteStore::open(&path).expect("triggered store opens");
         store
             .memory_mut()
             .insert_episode(draft(10))
@@ -1396,8 +1601,8 @@ mod tests {
         );
         drop(reopened);
 
-        let raw = Connection::open(&path).expect("fixture database reopens");
-        let revision: i64 = raw
+        let revision: i64 = store
+            .connection
             .query_row(
                 "SELECT snapshot_revision FROM memory_meta WHERE singleton = 1",
                 [],
@@ -1405,9 +1610,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(revision, 2);
-        raw.execute("DROP TRIGGER abort_activation_insert", [])
-            .expect("fixture failure can be removed");
-        drop(raw);
+        store
+            .connection
+            .execute("DROP TRIGGER temp.abort_activation_insert", [])
+            .expect("connection-local failure can be removed");
 
         store
             .save()
