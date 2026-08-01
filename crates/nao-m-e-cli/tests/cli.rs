@@ -151,7 +151,10 @@ fn init_creates_a_valid_store_and_never_clobbers_it() {
     let response = init(&database);
     assert_eq!(response["schema_version"], 1);
     assert_eq!(response["episode_count"], 0);
-    let memory_id = response["memory_id"].as_str().expect("memory ID is text");
+    let memory_id = response["memory_id"]
+        .as_str()
+        .expect("memory ID is text")
+        .to_owned();
     assert_eq!(memory_id.len(), 32);
     assert!(
         memory_id
@@ -164,6 +167,14 @@ fn init_creates_a_valid_store_and_never_clobbers_it() {
             .memory_id()
             .to_string(),
         memory_id
+    );
+    assert_eq!(
+        response,
+        json!({
+            "schema_version": 1,
+            "memory_id": memory_id,
+            "episode_count": 0
+        })
     );
 
     let original = fs::read(&database).expect("database is readable");
@@ -211,7 +222,7 @@ fn separate_file_and_stdin_batches_append_monotonic_sequences() {
 fn batch_dynamics_round_trip_through_ranked_recall() {
     let directory = TempDir::new().expect("temporary directory");
     let database = directory.path().join("memory.sqlite3");
-    init(&database);
+    let memory_id = init(&database)["memory_id"].clone();
 
     let failure = json!({
         "op": "insert_episode",
@@ -259,25 +270,67 @@ fn batch_dynamics_round_trip_through_ranked_recall() {
             {"op": "step", "count": 1}
         ]
     });
-    assert_success(run_stdin(&database, &scenario));
+    let run = assert_success(run_stdin(&database, &scenario));
+    assert_eq!(
+        run,
+        json!({
+            "schema_version": 1,
+            "memory_id": memory_id.clone(),
+            "operations_applied": 5,
+            "episode_count": 2,
+            "inserted": [
+                {"label": "failure", "sequence": 0},
+                {"label": "recovery", "sequence": 1}
+            ]
+        })
+    );
 
     let recall = recall_limit(&database, 10);
-    assert_eq!(recall["hits"].as_array().unwrap().len(), 2);
-    assert_eq!(recall["hits"][0]["sequence"], 0);
-    assert_eq!(recall["hits"][0]["activation_ppm"], 500000);
-    assert_eq!(recall["hits"][1]["sequence"], 1);
-    assert_eq!(recall["hits"][1]["activation_ppm"], 240000);
-    let context = recall["hits"][0]["episode"]["context"].as_array().unwrap();
-    assert_eq!(context.len(), 2);
-    assert_eq!(context[0]["predicate_id"], 10);
-    assert_eq!(context[1]["predicate_id"], 11);
+    assert_eq!(
+        recall,
+        json!({
+            "schema_version": 1,
+            "memory_id": memory_id,
+            "hits": [
+                {
+                    "sequence": 0,
+                    "activation_ppm": 500000,
+                    "episode": {
+                        "occurred_at_ms": 1000,
+                        "recorded_at_ms": 1001,
+                        "source_id": 7,
+                        "context": [
+                            {"predicate_id": 10, "term_ids": [1]},
+                            {"predicate_id": 11, "term_ids": [2]}
+                        ],
+                        "observation": {"predicate_id": 20, "term_ids": [1001, 3001]},
+                        "action": null,
+                        "outcome": null
+                    }
+                },
+                {
+                    "sequence": 1,
+                    "activation_ppm": 240000,
+                    "episode": {
+                        "occurred_at_ms": 2000,
+                        "recorded_at_ms": 2001,
+                        "source_id": 8,
+                        "context": [],
+                        "observation": {"predicate_id": 21, "term_ids": [1001]},
+                        "action": {"predicate_id": 30, "term_ids": [1001]},
+                        "outcome": {"predicate_id": 40, "term_ids": [1001]}
+                    }
+                }
+            ]
+        })
+    );
 }
 
 #[test]
 fn persisted_sequences_support_edge_removal_reset_and_inactive_lookup() {
     let directory = TempDir::new().expect("temporary directory");
     let database = directory.path().join("memory.sqlite3");
-    init(&database);
+    let memory_id = init(&database)["memory_id"].clone();
 
     let setup = json!({
         "schema_version": 1,
@@ -319,8 +372,24 @@ fn persisted_sequences_support_edge_removal_reset_and_inactive_lookup() {
     );
 
     let episode = assert_success(recall_sequence(&database, 0));
-    assert_eq!(episode["activation_ppm"], 0);
-    assert_eq!(episode["sequence"], 0);
+    assert_eq!(
+        episode,
+        json!({
+            "schema_version": 1,
+            "memory_id": memory_id,
+            "sequence": 0,
+            "activation_ppm": 0,
+            "episode": {
+                "occurred_at_ms": 1,
+                "recorded_at_ms": 2,
+                "source_id": 1,
+                "context": [],
+                "observation": {"predicate_id": 11, "term_ids": [101]},
+                "action": null,
+                "outcome": null
+            }
+        })
+    );
 
     let store = SqliteStore::open(&database).unwrap();
     let from = AtomId::from_parts(store.memory_id(), 0);

@@ -177,11 +177,13 @@ The remaining mutation shapes are deliberately small:
 Relevance weights use `1..=1_000_000` ppm, stimulation uses
 `0..=1_000_000` ppm, and `step.count` must be positive.
 
-Successful commands write one JSON document to standard output. `run` reports
-the memory ID, applied-operation and episode counts, and every inserted label
-and sequence. Errors write diagnostics only to standard error: exit code `2`
-denotes invalid CLI syntax, while input, model, graph, store, and output errors
-use exit code `1`.
+Successful `init`, `run`, and `recall` commands write one JSON document to
+standard output; help and version output are plain text. `run` reports the
+memory ID, applied-operation and episode counts, and every inserted label and
+sequence. Before response output begins, errors leave standard output empty and
+write diagnostics to standard error. An output failure can leave a partial JSON
+document. Exit code `2` denotes invalid CLI syntax, while input, model, graph,
+store, and output errors use exit code `1`.
 
 Recall ranked active episodes, or inspect one episode including zero
 activation:
@@ -191,11 +193,12 @@ nao-m-e recall incident-memory.sqlite3 --limit 10
 nao-m-e recall incident-memory.sqlite3 --sequence 0
 ```
 
-Input and output are strict, versioned JSON. Predicate, term, source, and time
-values are caller-owned numeric symbols; the CLI does not interpret text,
-assign symbols, deduplicate episodes, or provide embeddings. Each invocation
-loads the complete snapshot, and simultaneous writers are rejected rather than
-merged.
+Scenario input and data-command responses are strict, versioned JSON.
+Predicate, term, source, and time values are caller-owned numeric symbols; the
+CLI does not interpret text, assign symbols, deduplicate episodes, or provide
+embeddings. `run` and `recall` each load the complete snapshot. The current
+adapter opens that snapshot read-write, so `recall` requires write access even
+though it never saves. Simultaneous writers are rejected rather than merged.
 
 ## Boundaries
 

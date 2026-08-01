@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
-use std::fmt::{self, Write as FmtWrite};
+use std::fmt;
 use std::fs::File;
 use std::io::{self, BufReader, Write as IoWrite};
 use std::path::{Path, PathBuf};
@@ -337,7 +337,7 @@ fn execute_recall(database: &Path, mode: RecallMode) -> CliResult<Vec<u8>> {
                 memory_id,
                 sequence,
                 activation_ppm: activation.as_ppm(),
-                episode: EpisodeOutput::from(episode),
+                episode: EpisodeDocument::from(episode),
             })
         }
     }
@@ -489,11 +489,7 @@ fn write_stdout(output: Vec<u8>) -> CliResult<()> {
 }
 
 fn encode_memory_id(memory_id: MemoryId) -> String {
-    let mut encoded = String::with_capacity(32);
-    for byte in memory_id.to_be_bytes() {
-        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    encoded
+    format!("{:032x}", memory_id.get())
 }
 
 #[derive(Deserialize)]
@@ -509,7 +505,7 @@ enum OperationInput {
     InsertEpisode {
         #[serde(default)]
         label: Option<String>,
-        episode: EpisodeInput,
+        episode: EpisodeDocument,
     },
     SetRelevance {
         from: AtomReferenceInput,
@@ -562,22 +558,22 @@ struct LabelReferenceInput {
     label: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct EpisodeInput {
+struct EpisodeDocument {
     occurred_at_ms: i64,
     recorded_at_ms: i64,
     source_id: u64,
     #[serde(default)]
-    context: Vec<StatementInput>,
-    observation: StatementInput,
+    context: Vec<StatementDocument>,
+    observation: StatementDocument,
     #[serde(default)]
-    action: Option<StatementInput>,
+    action: Option<StatementDocument>,
     #[serde(default)]
-    outcome: Option<StatementInput>,
+    outcome: Option<StatementDocument>,
 }
 
-impl EpisodeInput {
+impl EpisodeDocument {
     fn into_draft(self) -> CliResult<EpisodeDraft> {
         let context = self
             .context
@@ -595,12 +591,12 @@ impl EpisodeInput {
             .map_err(|error| CliError::new(format!("observation: {error}")))?;
         let action = self
             .action
-            .map(StatementInput::into_statement)
+            .map(StatementDocument::into_statement)
             .transpose()
             .map_err(|error| CliError::new(format!("action: {error}")))?;
         let outcome = self
             .outcome
-            .map(StatementInput::into_statement)
+            .map(StatementDocument::into_statement)
             .transpose()
             .map_err(|error| CliError::new(format!("outcome: {error}")))?;
 
@@ -616,14 +612,14 @@ impl EpisodeInput {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct StatementInput {
+struct StatementDocument {
     predicate_id: u64,
     term_ids: Vec<u64>,
 }
 
-impl StatementInput {
+impl StatementDocument {
     fn into_statement(self) -> Result<Statement, nao_m_e::ModelError> {
         Statement::new(
             PredicateId::new(self.predicate_id),
@@ -667,14 +663,14 @@ struct SequenceResponse {
     memory_id: String,
     sequence: u64,
     activation_ppm: u32,
-    episode: EpisodeOutput,
+    episode: EpisodeDocument,
 }
 
 #[derive(Serialize)]
 struct RecallEpisode {
     sequence: u64,
     activation_ppm: u32,
-    episode: EpisodeOutput,
+    episode: EpisodeDocument,
 }
 
 impl RecallEpisode {
@@ -682,43 +678,26 @@ impl RecallEpisode {
         Self {
             sequence: atom.id().sequence(),
             activation_ppm,
-            episode: EpisodeOutput::from(atom),
+            episode: EpisodeDocument::from(atom),
         }
     }
 }
 
-#[derive(Serialize)]
-struct EpisodeOutput {
-    occurred_at_ms: i64,
-    recorded_at_ms: i64,
-    source_id: u64,
-    context: Vec<StatementOutput>,
-    observation: StatementOutput,
-    action: Option<StatementOutput>,
-    outcome: Option<StatementOutput>,
-}
-
-impl From<&EpisodeAtom> for EpisodeOutput {
+impl From<&EpisodeAtom> for EpisodeDocument {
     fn from(atom: &EpisodeAtom) -> Self {
         Self {
             occurred_at_ms: atom.occurred_at().get(),
             recorded_at_ms: atom.recorded_at().get(),
             source_id: atom.source().get(),
-            context: atom.context().iter().map(StatementOutput::from).collect(),
-            observation: StatementOutput::from(atom.observation()),
-            action: atom.action().map(StatementOutput::from),
-            outcome: atom.outcome().map(StatementOutput::from),
+            context: atom.context().iter().map(StatementDocument::from).collect(),
+            observation: StatementDocument::from(atom.observation()),
+            action: atom.action().map(StatementDocument::from),
+            outcome: atom.outcome().map(StatementDocument::from),
         }
     }
 }
 
-#[derive(Serialize)]
-struct StatementOutput {
-    predicate_id: u64,
-    term_ids: Vec<u64>,
-}
-
-impl From<&Statement> for StatementOutput {
+impl From<&Statement> for StatementDocument {
     fn from(statement: &Statement) -> Self {
         Self {
             predicate_id: statement.predicate().get(),
