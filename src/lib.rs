@@ -13,7 +13,7 @@ mod parameters;
 
 pub use memory::{MemoryV0, RecallHit, RelevanceEdge};
 pub use model::{Activation, InfluenceWeight, ValueError};
-pub use model::{AtomId, PredicateId, SourceId, TermId, TimestampMs};
+pub use model::{AtomId, MemoryId, PredicateId, SourceId, TermId, TimestampMs};
 pub use model::{EpisodeAtom, EpisodeDraft, Statement};
-pub use model::{GraphError, MemoryError, ModelError};
+pub use model::{GraphError, MemoryError, MemoryIdError, ModelError};
 pub use parameters::{PROPAGATION_GAIN_PPM, RETENTION_PPM, SCALE};

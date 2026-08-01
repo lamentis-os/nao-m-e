@@ -31,39 +31,106 @@ macro_rules! unsigned_id {
     };
 }
 
-/// Identifies an atom within a process-local memory namespace.
+/// Identifies one logical memory independently of a process lifetime.
 ///
-/// Atom identifiers are not durable or globally unique across process runs.
+/// The caller owns allocation and must persist and reuse this value when the
+/// same logical memory is reopened. The all-zero value is reserved as invalid.
+/// Persist the value through [`MemoryId::to_be_bytes`]. [`fmt::Display`] renders
+/// exactly 32 lowercase hexadecimal digits for diagnostics only.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct AtomId {
-    memory_namespace: u64,
-    local_id: u64,
+pub struct MemoryId {
+    high: u64,
+    low: u64,
 }
 
+impl MemoryId {
+    /// Creates a non-zero memory identifier.
+    pub const fn new(value: u128) -> Result<Self, MemoryIdError> {
+        if value == 0 {
+            return Err(MemoryIdError::Zero);
+        }
+        Ok(Self {
+            high: (value >> 64) as u64,
+            low: value as u64,
+        })
+    }
+
+    /// Reconstructs a memory identifier from its canonical big-endian bytes.
+    pub const fn from_be_bytes(bytes: [u8; 16]) -> Result<Self, MemoryIdError> {
+        Self::new(u128::from_be_bytes(bytes))
+    }
+
+    /// Returns the underlying numeric value.
+    #[must_use]
+    pub const fn get(self) -> u128 {
+        ((self.high as u128) << 64) | self.low as u128
+    }
+
+    /// Returns the canonical 16-byte big-endian representation.
+    #[must_use]
+    pub const fn to_be_bytes(self) -> [u8; 16] {
+        self.get().to_be_bytes()
+    }
+}
+
+impl fmt::Display for MemoryId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:016x}{:016x}", self.high, self.low)
+    }
+}
+
+/// Identifies an atom within one logical memory.
+///
+/// The identifier is a durable reference composed of the owning memory and a
+/// monotonic insertion sequence. Its diagnostic display joins the fixed-width
+/// memory display and decimal sequence with a colon. It is not a permission or
+/// a content hash.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AtomId {
+    memory_id: MemoryId,
+    sequence: u64,
+}
+
+// IDs are stored per atom and copied into recall and edge results. Keep their
+// composite layout free of padding without promising a stable Rust ABI.
+const _: () = {
+    assert!(std::mem::size_of::<MemoryId>() == 2 * std::mem::size_of::<u64>());
+    assert!(std::mem::align_of::<MemoryId>() <= std::mem::align_of::<u64>());
+    assert!(
+        std::mem::size_of::<AtomId>()
+            == std::mem::size_of::<MemoryId>() + std::mem::size_of::<u64>()
+    );
+};
+
 impl AtomId {
-    pub(crate) const fn from_raw(memory_namespace: u64, local_id: u64) -> Self {
+    /// Constructs an atom identifier from its durable components.
+    ///
+    /// Construction does not prove that the referenced atom exists in a
+    /// particular [`crate::MemoryV0`]. Memory accessors validate membership.
+    #[must_use]
+    pub const fn from_parts(memory_id: MemoryId, sequence: u64) -> Self {
         Self {
-            memory_namespace,
-            local_id,
+            memory_id,
+            sequence,
         }
     }
 
-    /// Returns the monotonic local component.
+    /// Returns the owning logical memory identifier.
     #[must_use]
-    pub const fn get(self) -> u64 {
-        self.local_id
+    pub const fn memory_id(self) -> MemoryId {
+        self.memory_id
     }
 
-    /// Returns the owning memory's process-local namespace.
+    /// Returns the monotonic insertion sequence within the memory.
     #[must_use]
-    pub const fn memory_namespace(self) -> u64 {
-        self.memory_namespace
+    pub const fn sequence(self) -> u64 {
+        self.sequence
     }
 }
 
 impl fmt::Display for AtomId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}:{}", self.memory_namespace, self.local_id)
+        write!(formatter, "{}:{}", self.memory_id, self.sequence)
     }
 }
 
@@ -312,6 +379,23 @@ impl fmt::Display for ModelError {
 }
 
 impl Error for ModelError {}
+
+/// Failure while constructing a durable memory identifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemoryIdError {
+    /// The all-zero value is reserved and cannot identify a memory.
+    Zero,
+}
+
+impl fmt::Display for MemoryIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Zero => formatter.write_str("a memory identifier must be non-zero"),
+        }
+    }
+}
+
+impl Error for MemoryIdError {}
 
 /// Failure while constructing a fixed-point value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
