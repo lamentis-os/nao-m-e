@@ -31,7 +31,9 @@ macro_rules! unsigned_id {
     };
 }
 
-/// Stable identifier assigned monotonically within one memory namespace.
+/// Identifies an atom within a process-local memory namespace.
+///
+/// Atom identifiers are not durable or globally unique across process runs.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AtomId {
     memory_namespace: u64,
@@ -46,13 +48,13 @@ impl AtomId {
         }
     }
 
-    /// Returns the memory-local monotonic identifier.
+    /// Returns the monotonic local component.
     #[must_use]
     pub const fn get(self) -> u64 {
         self.local_id
     }
 
-    /// Returns the process-local namespace of the owning memory.
+    /// Returns the owning memory's process-local namespace.
     #[must_use]
     pub const fn memory_namespace(self) -> u64 {
         self.memory_namespace
@@ -78,18 +80,18 @@ unsigned_id!(
     "Caller-owned identifier for the provenance source of an episode."
 );
 
-/// Milliseconds on a caller-defined timeline.
+/// Signed milliseconds on a caller-defined timeline.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TimestampMs(i64);
 
 impl TimestampMs {
-    /// Creates a timestamp from a signed millisecond value.
+    /// Creates a timestamp without imposing clock or ordering semantics.
     #[must_use]
     pub const fn new(value: i64) -> Self {
         Self(value)
     }
 
-    /// Returns the signed millisecond value.
+    /// Returns the underlying millisecond value.
     #[must_use]
     pub const fn get(self) -> i64 {
         self.0
@@ -102,7 +104,7 @@ impl From<i64> for TimestampMs {
     }
 }
 
-/// A symbolic, ordered predicate application.
+/// A symbolic predicate applied to one or more ordered arguments.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Statement {
     predicate: PredicateId,
@@ -110,9 +112,7 @@ pub struct Statement {
 }
 
 impl Statement {
-    /// Constructs a statement.
-    ///
-    /// Argument order is meaningful. At least one argument is required.
+    /// Constructs a statement, rejecting an empty argument list.
     pub fn new(predicate: PredicateId, arguments: Vec<TermId>) -> Result<Self, ModelError> {
         if arguments.is_empty() {
             return Err(ModelError::EmptyArguments);
@@ -137,26 +137,26 @@ impl Statement {
     }
 }
 
-/// Mutable construction input for one immutable episode atom.
+/// Construction data for one episode atom.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EpisodeDraft {
     /// Time at which the represented event occurred.
     pub occurred_at: TimestampMs,
     /// Time at which the event was recorded.
     pub recorded_at: TimestampMs,
-    /// Unordered contextual statements, canonicalized on insertion.
+    /// Context statements, sorted and deduplicated on insertion.
     pub context: Vec<Statement>,
-    /// Required observation that bounds the episode.
+    /// Observation recorded by the episode.
     pub observation: Statement,
-    /// Optional action performed during the episode.
+    /// Action performed during the episode, if any.
     pub action: Option<Statement>,
-    /// Optional observed outcome of the action or event.
+    /// Observed outcome, if any.
     pub outcome: Option<Statement>,
-    /// Provenance source supplied by the caller.
+    /// Caller-defined provenance source.
     pub source: SourceId,
 }
 
-/// Immutable, addressable episode stored by the memory.
+/// An immutable episode stored in a [`crate::MemoryV0`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EpisodeAtom {
     id: AtomId,
@@ -186,7 +186,7 @@ impl EpisodeAtom {
         }
     }
 
-    /// Returns the memory-local identifier.
+    /// Returns the atom identifier.
     #[must_use]
     pub const fn id(&self) -> AtomId {
         self.id
@@ -204,7 +204,7 @@ impl EpisodeAtom {
         self.recorded_at
     }
 
-    /// Returns canonical, sorted, duplicate-free context.
+    /// Returns the sorted, duplicate-free context.
     #[must_use]
     pub fn context(&self) -> &[Statement] {
         &self.context
@@ -235,7 +235,7 @@ impl EpisodeAtom {
     }
 }
 
-/// Fixed-point activation measured in parts per million.
+/// Activation measured in parts per million, from zero through [`crate::SCALE`].
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Activation(u32);
 
@@ -246,7 +246,7 @@ impl Activation {
     /// Full activation.
     pub const ONE: Self = Self(SCALE);
 
-    /// Creates activation in the inclusive range zero through one million.
+    /// Creates activation from zero through [`crate::SCALE`].
     pub const fn from_ppm(value: u32) -> Result<Self, ValueError> {
         if value > SCALE {
             return Err(ValueError::OutOfRange { value });
@@ -270,11 +270,13 @@ impl Activation {
 }
 
 /// Positive relevance influence measured in parts per million.
+///
+/// A weight controls activation flow; it is not a probability or confidence.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct InfluenceWeight(u32);
 
 impl InfluenceWeight {
-    /// Creates a weight in the inclusive range one through one million.
+    /// Creates a weight from one through [`crate::SCALE`].
     pub const fn from_ppm(value: u32) -> Result<Self, ValueError> {
         if value == 0 {
             return Err(ValueError::ZeroWeight);
@@ -314,7 +316,7 @@ impl Error for ModelError {}
 /// Failure while constructing a fixed-point value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValueError {
-    /// A value exceeded the inclusive upper bound of one million.
+    /// A value exceeded [`crate::SCALE`].
     OutOfRange {
         /// Rejected parts-per-million value.
         value: u32,
@@ -336,7 +338,7 @@ impl fmt::Display for ValueError {
 
 impl Error for ValueError {}
 
-/// Failure while changing the atom store.
+/// Failure while inserting an episode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryError {
     /// The monotonic identifier space is exhausted.
@@ -353,14 +355,14 @@ impl fmt::Display for MemoryError {
 
 impl Error for MemoryError {}
 
-/// Failure while changing activation or relevance topology.
+/// Failure while accessing activation or changing relevance topology.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GraphError {
     /// An operation referred to an atom absent from this memory.
     UnknownAtom(AtomId),
     /// A relevance edge attempted to connect an atom to itself.
     SelfEdge(AtomId),
-    /// Updated outgoing weights would exceed one million.
+    /// Updated outgoing weights would exceed [`crate::SCALE`].
     OutgoingWeightBudgetExceeded {
         /// Source whose outgoing budget would be exceeded.
         from: AtomId,

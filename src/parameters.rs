@@ -1,10 +1,10 @@
-/// Fixed-point unit representing one.
+/// Fixed-point denominator representing the unit value.
 pub const SCALE: u32 = 1_000_000;
 
-/// Activation retained by an atom during one logical step.
+/// Fraction of activation retained during one logical step.
 pub const RETENTION_PPM: u32 = 500_000;
 
-/// Activation made available for propagation during one logical step.
+/// Fraction of weighted activation propagated during one logical step.
 pub const PROPAGATION_GAIN_PPM: u32 = 400_000;
 
 /// Squared fixed-point scale used as the propagation denominator.

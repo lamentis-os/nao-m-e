@@ -125,9 +125,9 @@ gates are:
     cargo doc --workspace --no-deps --all-features --locked
 
 Run the documentation command with `RUSTDOCFLAGS` set to `-D warnings`.
-The crate-level minimal example is compiled as a documentation test. The
-stable `Rust CI` check succeeds only after the quality job and every platform
-matrix entry have succeeded.
+Documentation tests are part of the gate when present. The stable `Rust CI`
+check succeeds only after the quality job and every platform matrix entry have
+succeeded.
 
 The tests include exact golden graphs, graph and value invariants, ordering
 checks, and four transitions across 10,000 deterministic generated graphs

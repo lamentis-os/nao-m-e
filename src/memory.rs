@@ -11,7 +11,7 @@ use crate::parameters::{PROPAGATION_GAIN_PPM, RETENTION_PPM, SCALE, SCALE_CUBED,
 
 static NEXT_MEMORY_NAMESPACE: AtomicU64 = AtomicU64::new(0);
 
-/// One directed positive relevance edge.
+/// A directed positive relevance edge between two atoms.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RelevanceEdge {
     from: AtomId,
@@ -20,26 +20,26 @@ pub struct RelevanceEdge {
 }
 
 impl RelevanceEdge {
-    /// Returns the source atom.
+    /// Returns the influencing atom.
     #[must_use]
     pub const fn from(self) -> AtomId {
         self.from
     }
 
-    /// Returns the target atom.
+    /// Returns the influenced atom.
     #[must_use]
     pub const fn to(self) -> AtomId {
         self.to
     }
 
-    /// Returns the positive relevance weight.
+    /// Returns the edge weight.
     #[must_use]
     pub const fn weight(self) -> InfluenceWeight {
         self.weight
     }
 }
 
-/// One ranked active atom.
+/// A non-zero activation returned by recall ranking.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecallHit {
     /// Identifier of the active atom.
@@ -72,7 +72,10 @@ struct OutgoingRelevance {
     targets: BTreeMap<usize, InfluenceWeight>,
 }
 
-/// In-memory V0 atom store and deterministic relevance dynamics.
+/// Append-only atom storage with mutable activation and sparse relevance edges.
+///
+/// Atom identifiers belong to the memory instance that created them. Passing an
+/// identifier from another instance is rejected instead of aliasing a local atom.
 pub struct MemoryV0 {
     memory_namespace: u64,
     atoms: Vec<EpisodeAtom>,
@@ -82,11 +85,11 @@ pub struct MemoryV0 {
 }
 
 impl MemoryV0 {
-    /// Creates an empty memory.
+    /// Creates an empty memory with a new process-local namespace.
     ///
     /// # Panics
     ///
-    /// Panics only if all process-local memory namespaces have been exhausted.
+    /// Panics if the process-local namespace counter is exhausted.
     #[must_use]
     pub fn new() -> Self {
         let memory_namespace = NEXT_MEMORY_NAMESPACE
@@ -104,7 +107,7 @@ impl MemoryV0 {
         }
     }
 
-    /// Inserts one immutable episode and returns its new monotonic identifier.
+    /// Canonicalizes the draft context and appends an immutable episode.
     pub fn insert_episode(&mut self, draft: EpisodeDraft) -> Result<AtomId, MemoryError> {
         self.debug_assert_parallel_storage();
         let local_id = u64::try_from(self.atoms.len()).map_err(|_| MemoryError::IdExhausted)?;
@@ -118,23 +121,23 @@ impl MemoryV0 {
         Ok(id)
     }
 
-    /// Returns an immutable episode by identifier.
+    /// Returns the episode, or `None` if the identifier does not belong here.
     #[must_use]
     pub fn episode(&self, id: AtomId) -> Option<&EpisodeAtom> {
         self.local_index(id).map(|index| &self.atoms[index])
     }
 
-    /// Iterates over all episodes in ascending identifier order.
+    /// Iterates over episodes in ascending local identifier order.
     pub fn episodes(
         &self,
     ) -> impl ExactSizeIterator<Item = &EpisodeAtom> + DoubleEndedIterator + '_ {
         self.atoms.iter()
     }
 
-    /// Sets or replaces one relevance edge.
+    /// Sets or replaces a directed relevance edge.
     ///
-    /// The update is rejected without mutation if either endpoint is unknown,
-    /// the edge is a self-edge, or the source outgoing budget would exceed one.
+    /// The operation is atomic: unknown endpoints, self-edges, and outgoing
+    /// weight totals above [`crate::SCALE`] are rejected without mutation.
     pub fn set_relevance(
         &mut self,
         from: AtomId,
@@ -179,7 +182,7 @@ impl MemoryV0 {
         }
     }
 
-    /// Removes one relevance edge if present.
+    /// Removes an edge between known, distinct endpoints if it exists.
     pub fn remove_relevance(
         &mut self,
         from: AtomId,
@@ -208,7 +211,7 @@ impl MemoryV0 {
         }
     }
 
-    /// Returns one relevance weight, or none when the edge is absent.
+    /// Returns the edge weight, or `None` for an absent edge or unknown endpoint.
     #[must_use]
     pub fn relevance(&self, from: AtomId, to: AtomId) -> Option<InfluenceWeight> {
         let from_index = self.local_index(from)?;
@@ -219,7 +222,7 @@ impl MemoryV0 {
             .copied()
     }
 
-    /// Iterates over relevance edges in ascending source and target order.
+    /// Iterates over edges in ascending source and target identifier order.
     pub fn relevance_edges(&self) -> impl Iterator<Item = RelevanceEdge> + '_ {
         self.outgoing
             .iter()
@@ -236,7 +239,7 @@ impl MemoryV0 {
             })
     }
 
-    /// Adds an external stimulus, saturating at full activation.
+    /// Adds external activation, saturating at [`Activation::ONE`].
     pub fn stimulate(&mut self, id: AtomId, amount: Activation) -> Result<Activation, GraphError> {
         let index = self.require_atom(id)?;
         let current = &mut self.activations[index];
@@ -245,17 +248,15 @@ impl MemoryV0 {
         Ok(*current)
     }
 
-    /// Returns current activation for a known atom.
+    /// Returns activation, or `None` if the identifier does not belong here.
     #[must_use]
     pub fn activation(&self, id: AtomId) -> Option<Activation> {
         self.local_index(id).map(|index| self.activations[index])
     }
 
-    /// Advances the complete activation vector by one synchronous logical step.
+    /// Advances every activation by one synchronous logical step.
     ///
-    /// Retention and all incoming propagation numerators are summed exactly per
-    /// target before one fixed-point division. This prevents edge-count-
-    /// dependent loss from rounding individual contributions separately.
+    /// Retention and incoming influence share one rounding operation per atom.
     pub fn step(&mut self) {
         self.debug_assert_parallel_storage();
         for (index, &activation) in self.activations.iter().enumerate() {
@@ -288,7 +289,9 @@ impl MemoryV0 {
         self.debug_assert_parallel_storage();
     }
 
-    /// Returns up to limit active atoms ordered by activation then identifier.
+    /// Returns at most `limit` non-zero activations, highest first.
+    ///
+    /// Equal activations are ordered by ascending atom identifier.
     #[must_use]
     pub fn top_k(&self, limit: usize) -> Vec<RecallHit> {
         if limit == 0 {
@@ -321,7 +324,7 @@ impl MemoryV0 {
         hits
     }
 
-    /// Resets all activation to zero without changing atoms or edges.
+    /// Resets activation without changing atoms or relevance edges.
     pub fn reset_activations(&mut self) {
         self.activations.fill(Activation::ZERO);
     }
