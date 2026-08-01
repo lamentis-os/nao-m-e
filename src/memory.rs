@@ -2,14 +2,12 @@ use std::cmp::{Ordering as ComparisonOrdering, Reverse};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::model::{
     Activation, AtomId, EpisodeAtom, EpisodeDraft, GraphError, InfluenceWeight, MemoryError,
+    MemoryId,
 };
 use crate::parameters::{PROPAGATION_GAIN_PPM, RETENTION_PPM, SCALE, SCALE_CUBED, SCALE_SQUARED};
-
-static NEXT_MEMORY_NAMESPACE: AtomicU64 = AtomicU64::new(0);
 
 /// A directed positive relevance edge between two atoms.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,10 +72,11 @@ struct OutgoingRelevance {
 
 /// Append-only atom storage with mutable activation and sparse relevance edges.
 ///
-/// Atom identifiers belong to the memory instance that created them. Passing an
-/// identifier from another instance is rejected instead of aliasing a local atom.
+/// A memory identifier denotes exactly one logical, exclusively written memory.
+/// Passing an atom identifier from another logical memory is rejected instead
+/// of aliasing a local atom.
 pub struct MemoryV0 {
-    memory_namespace: u64,
+    memory_id: MemoryId,
     atoms: Vec<EpisodeAtom>,
     activations: Vec<Activation>,
     transition_numerators: Vec<u64>,
@@ -85,21 +84,15 @@ pub struct MemoryV0 {
 }
 
 impl MemoryV0 {
-    /// Creates an empty memory with a new process-local namespace.
+    /// Creates an empty memory with a caller-owned durable identifier.
     ///
-    /// # Panics
-    ///
-    /// Panics if the process-local namespace counter is exhausted.
+    /// The caller must reuse `memory_id` only when reopening the same logical
+    /// memory, reconstruct its complete atom sequence before appending, and
+    /// must not independently write divergent copies under one ID.
     #[must_use]
-    pub fn new() -> Self {
-        let memory_namespace = NEXT_MEMORY_NAMESPACE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .unwrap_or_else(|_| panic!("memory namespace space is exhausted"));
-
+    pub fn new(memory_id: MemoryId) -> Self {
         Self {
-            memory_namespace,
+            memory_id,
             atoms: Vec::new(),
             activations: Vec::new(),
             transition_numerators: Vec::new(),
@@ -107,11 +100,17 @@ impl MemoryV0 {
         }
     }
 
+    /// Returns the durable identifier of this logical memory.
+    #[must_use]
+    pub const fn memory_id(&self) -> MemoryId {
+        self.memory_id
+    }
+
     /// Canonicalizes the draft context and appends an immutable episode.
     pub fn insert_episode(&mut self, draft: EpisodeDraft) -> Result<AtomId, MemoryError> {
         self.debug_assert_parallel_storage();
-        let local_id = u64::try_from(self.atoms.len()).map_err(|_| MemoryError::IdExhausted)?;
-        let id = AtomId::from_raw(self.memory_namespace, local_id);
+        let sequence = u64::try_from(self.atoms.len()).map_err(|_| MemoryError::IdExhausted)?;
+        let id = AtomId::from_parts(self.memory_id, sequence);
         let atom = EpisodeAtom::from_draft(id, draft);
 
         self.atoms.push(atom);
@@ -352,11 +351,11 @@ impl MemoryV0 {
     }
 
     fn local_index(&self, id: AtomId) -> Option<usize> {
-        if id.memory_namespace() != self.memory_namespace {
+        if id.memory_id() != self.memory_id {
             return None;
         }
 
-        let index = usize::try_from(id.get()).ok()?;
+        let index = usize::try_from(id.sequence()).ok()?;
         (index < self.atoms.len()).then_some(index)
     }
 
@@ -374,16 +373,10 @@ impl fmt::Debug for MemoryV0 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("MemoryV0")
-            .field("memory_namespace", &self.memory_namespace)
+            .field("memory_id", &self.memory_id)
             .field("atoms", &self.atoms)
             .field("activations", &self.activations)
             .field("outgoing", &self.outgoing)
             .finish_non_exhaustive()
-    }
-}
-
-impl Default for MemoryV0 {
-    fn default() -> Self {
-        Self::new()
     }
 }

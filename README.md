@@ -12,16 +12,29 @@ The memory state is:
     M(t) = (A, a(t), W)
 
 - A is an append-only set of immutable, structured episode atoms.
-- a(t) is persistent fixed-point activation.
+- a(t) is fixed-point activation retained across logical steps.
 - W is a sparse, directed, non-negative relevance matrix.
 
 Episode content is symbolic. Predicates, terms, and provenance sources are
 caller-owned numeric identifiers; V0 never stores free-form text and does not
 generate those identifiers.
 
-Atom identifiers distinguish memory instances only inside one running process.
-They are not durable or globally unique identities and must not be persisted as
-cross-process references.
+Each logical memory has a caller-allocated, non-zero 128-bit `MemoryId`.
+An `AtomId` combines that memory identifier with a monotonic insertion sequence
+starting at zero. Its canonical persistence components are the 16-byte
+big-endian memory identifier and the unsigned 64-bit sequence. `Display` uses a
+fixed 32-digit lowercase hexadecimal memory ID, a colon, and the decimal
+sequence; that text is diagnostic and is not a storage format.
+
+The caller must assign one `MemoryId` to exactly one logical memory, persist it,
+and reuse it when reopening that memory. Independent or concurrently written
+copies under the same identifier are unsupported because they could allocate
+the same next sequence. IDs are references, not permissions, content hashes,
+or evidence about an episode.
+
+V0 still stores all state only in memory. The durable ID contract makes a later
+storage adapter possible, but IDs and episodes do not survive a process restart
+until that adapter persists and reconstructs them.
 
 An episode contains:
 
@@ -71,8 +84,8 @@ support.
 ## Minimal use
 
     use nao_m_e::{
-        Activation, EpisodeDraft, InfluenceWeight, MemoryV0, PredicateId,
-        SourceId, Statement, TermId, TimestampMs,
+        Activation, EpisodeDraft, InfluenceWeight, MemoryId, MemoryV0,
+        PredicateId, SourceId, Statement, TermId, TimestampMs,
     };
 
     let observation = Statement::new(
@@ -90,7 +103,8 @@ support.
         source: SourceId::new(7),
     };
 
-    let mut memory = MemoryV0::new();
+    let memory_id = MemoryId::new(0x7b4f_6be0_32c2_4be8_96b8_7394_f734_85af)?;
+    let mut memory = MemoryV0::new(memory_id);
     let first = memory.insert_episode(episode.clone())?;
     let second = memory.insert_episode(episode)?;
     memory.set_relevance(
@@ -106,9 +120,9 @@ whose error type can contain the constructor and graph errors.
 
 ## Deliberate exclusions
 
-V0 has no persistence, CLI, network, free text, embeddings, LLM calls,
-negative edges, confidence, semantic consolidation, automatic edge learning,
-authentication, encryption, or FFI.
+V0 has no persistence, migration, synchronization, multi-writer access, CLI,
+network, free text, embeddings, LLM calls, negative edges, confidence, semantic
+consolidation, automatic edge learning, authentication, encryption, or FFI.
 
 ## Verification
 

@@ -1,8 +1,16 @@
 use nao_m_e::{
-    Activation, AtomId, EpisodeDraft, GraphError, InfluenceWeight, MemoryV0, ModelError,
-    PROPAGATION_GAIN_PPM, PredicateId, RETENTION_PPM, SCALE, SourceId, Statement, TermId,
-    TimestampMs, ValueError,
+    Activation, AtomId, EpisodeDraft, GraphError, InfluenceWeight, MemoryId, MemoryIdError,
+    MemoryV0, ModelError, PROPAGATION_GAIN_PPM, PredicateId, RETENTION_PPM, SCALE, SourceId,
+    Statement, TermId, TimestampMs, ValueError,
 };
+
+fn memory_id(value: u128) -> MemoryId {
+    MemoryId::new(value).expect("test memory identifier is non-zero")
+}
+
+fn new_memory(id: u128) -> MemoryV0 {
+    MemoryV0::new(memory_id(id))
+}
 
 fn statement(predicate: u64, arguments: &[u64]) -> Statement {
     Statement::new(
@@ -63,13 +71,76 @@ fn model_constructors_enforce_their_boundaries() {
 }
 
 #[test]
+fn memory_ids_reject_zero_and_round_trip_their_canonical_bytes() {
+    const VALUE: u128 = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210;
+    const BYTES: [u8; 16] = [
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
+        0x10,
+    ];
+
+    assert_eq!(MemoryId::new(0), Err(MemoryIdError::Zero));
+    assert_eq!(MemoryId::from_be_bytes([0; 16]), Err(MemoryIdError::Zero));
+    assert_eq!(
+        MemoryIdError::Zero.to_string(),
+        "a memory identifier must be non-zero"
+    );
+
+    let id = MemoryId::new(VALUE).expect("value is non-zero");
+    assert_eq!(id.get(), VALUE);
+    assert_eq!(id.to_be_bytes(), BYTES);
+    assert_eq!(MemoryId::from_be_bytes(BYTES), Ok(id));
+    assert_eq!(id.to_string(), "0123456789abcdeffedcba9876543210");
+
+    let lower_half_max = memory_id(u128::from(u64::MAX));
+    let upper_half_min = memory_id(1_u128 << 64);
+    assert!(lower_half_max < upper_half_min);
+}
+
+#[test]
+fn atom_ids_round_trip_components_and_have_canonical_ordering() {
+    let first_memory = memory_id(1);
+    let second_memory = memory_id(2);
+    let first = AtomId::from_parts(first_memory, 0);
+    let second = AtomId::from_parts(first_memory, 1);
+    let foreign = AtomId::from_parts(second_memory, 0);
+
+    assert_eq!(first.memory_id(), first_memory);
+    assert_eq!(first.sequence(), 0);
+    assert_eq!(
+        AtomId::from_parts(first.memory_id(), first.sequence()),
+        first
+    );
+    assert_eq!(first.to_string(), "00000000000000000000000000000001:0");
+    assert!(first < second);
+    assert!(second < foreign);
+}
+
+#[test]
+fn replaying_the_same_atom_sequence_recreates_durable_ids() {
+    let durable_id = memory_id(0xfeed);
+    let original_ids = {
+        let mut original = MemoryV0::new(durable_id);
+        assert_eq!(original.memory_id(), durable_id);
+        [insert(&mut original, 1), insert(&mut original, 2)]
+    };
+
+    let mut reopened = MemoryV0::new(durable_id);
+    let reopened_ids = [insert(&mut reopened, 1), insert(&mut reopened, 2)];
+
+    assert_eq!(reopened.memory_id(), durable_id);
+    assert_eq!(reopened_ids, original_ids);
+    assert_eq!(reopened_ids[0].sequence(), 0);
+    assert_eq!(reopened_ids[1].sequence(), 1);
+}
+
+#[test]
 fn insertion_canonicalizes_context_but_keeps_occurrences_distinct() {
     let low = statement(1, &[1]);
     let high = statement(2, &[1]);
     let mut episode = draft(1);
     episode.context = vec![high.clone(), low.clone(), high];
 
-    let mut memory = MemoryV0::new();
+    let mut memory = new_memory(1);
     let first = memory
         .insert_episode(episode.clone())
         .expect("first atom inserts");
@@ -94,7 +165,7 @@ fn statements_and_episode_metadata_preserve_caller_semantics() {
         &[TermId::new(30), TermId::new(20), TermId::new(10)]
     );
 
-    let mut memory = MemoryV0::new();
+    let mut memory = new_memory(1);
     let atom = memory
         .insert_episode(EpisodeDraft {
             occurred_at: TimestampMs::new(-50),
@@ -118,7 +189,7 @@ fn statements_and_episode_metadata_preserve_caller_semantics() {
 
 #[test]
 fn atom_content_is_immutable_across_graph_and_state_changes() {
-    let mut memory = MemoryV0::new();
+    let mut memory = new_memory(1);
     let source = insert(&mut memory, 1);
     let target = insert(&mut memory, 2);
     let original = memory.episode(source).expect("atom exists").clone();
@@ -138,7 +209,7 @@ fn atom_content_is_immutable_across_graph_and_state_changes() {
 
 #[test]
 fn graph_validation_is_atomic_and_budgeted() {
-    let mut memory = MemoryV0::new();
+    let mut memory = new_memory(1);
     let source = insert(&mut memory, 1);
     let first = insert(&mut memory, 2);
     let second = insert(&mut memory, 3);
@@ -176,7 +247,7 @@ fn graph_validation_is_atomic_and_budgeted() {
             .contains(&source.to_string())
     );
 
-    let mut other = MemoryV0::new();
+    let mut other = new_memory(2);
     let unknown = (0..4)
         .fold(None, |_, seed| Some(insert(&mut other, seed)))
         .unwrap();
@@ -226,26 +297,35 @@ fn graph_validation_is_atomic_and_budgeted() {
 }
 
 #[test]
-fn ids_from_another_memory_cannot_alias_local_atoms() {
-    let mut first_memory = MemoryV0::new();
+fn foreign_and_absent_ids_cannot_alias_local_atoms() {
+    let mut first_memory = new_memory(1);
     let local = insert(&mut first_memory, 1);
-    let mut second_memory = MemoryV0::new();
+    let mut second_memory = new_memory(2);
     let foreign = insert(&mut second_memory, 1);
+    let absent_local = AtomId::from_parts(first_memory.memory_id(), u64::MAX);
 
-    assert_eq!(local.get(), foreign.get());
-    assert_ne!(local.memory_namespace(), foreign.memory_namespace());
+    assert_eq!(local.sequence(), foreign.sequence());
+    assert_ne!(local.memory_id(), foreign.memory_id());
     assert_eq!(
         local.to_string(),
-        format!("{}:{}", local.memory_namespace(), local.get())
+        format!("{}:{}", local.memory_id(), local.sequence())
     );
     assert_ne!(local.to_string(), foreign.to_string());
     assert_eq!(first_memory.episode(foreign), None);
     assert_eq!(first_memory.activation(foreign), None);
     assert_eq!(first_memory.relevance(local, foreign), None);
     assert_eq!(first_memory.relevance(foreign, local), None);
+    assert_eq!(first_memory.episode(absent_local), None);
+    assert_eq!(first_memory.activation(absent_local), None);
+    assert_eq!(first_memory.relevance(local, absent_local), None);
+    assert_eq!(first_memory.relevance(absent_local, local), None);
     assert_eq!(
         first_memory.stimulate(foreign, Activation::ONE),
         Err(GraphError::UnknownAtom(foreign))
+    );
+    assert_eq!(
+        first_memory.stimulate(absent_local, Activation::ONE),
+        Err(GraphError::UnknownAtom(absent_local))
     );
     assert_eq!(
         first_memory.set_relevance(local, foreign, weight(1)),
@@ -256,6 +336,14 @@ fn ids_from_another_memory_cannot_alias_local_atoms() {
         Err(GraphError::UnknownAtom(foreign))
     );
     assert_eq!(
+        first_memory.set_relevance(local, absent_local, weight(1)),
+        Err(GraphError::UnknownAtom(absent_local))
+    );
+    assert_eq!(
+        first_memory.set_relevance(absent_local, local, weight(1)),
+        Err(GraphError::UnknownAtom(absent_local))
+    );
+    assert_eq!(
         first_memory.remove_relevance(local, foreign),
         Err(GraphError::UnknownAtom(foreign))
     );
@@ -263,17 +351,26 @@ fn ids_from_another_memory_cannot_alias_local_atoms() {
         first_memory.remove_relevance(foreign, local),
         Err(GraphError::UnknownAtom(foreign))
     );
+    assert_eq!(
+        first_memory.remove_relevance(local, absent_local),
+        Err(GraphError::UnknownAtom(absent_local))
+    );
+    assert_eq!(
+        first_memory.remove_relevance(absent_local, local),
+        Err(GraphError::UnknownAtom(absent_local))
+    );
     assert!(
         GraphError::UnknownAtom(foreign)
             .to_string()
             .contains(&foreign.to_string())
     );
     assert_eq!(first_memory.activation(local), Some(Activation::ZERO));
+    assert_eq!(first_memory.relevance_edges().count(), 0);
 }
 
 #[test]
 fn empty_memory_operations_are_noops() {
-    let mut memory = MemoryV0::new();
+    let mut memory = new_memory(1);
 
     assert_eq!(memory.episodes().len(), 0);
     assert_eq!(memory.relevance_edges().count(), 0);
@@ -286,7 +383,7 @@ fn empty_memory_operations_are_noops() {
 
 #[test]
 fn relevance_is_directed_sorted_and_removal_of_absent_edge_is_a_noop() {
-    let mut memory = MemoryV0::new();
+    let mut memory = new_memory(1);
     let a = insert(&mut memory, 1);
     let b = insert(&mut memory, 2);
     let c = insert(&mut memory, 3);
@@ -323,7 +420,7 @@ fn relevance_is_directed_sorted_and_removal_of_absent_edge_is_a_noop() {
 
 #[test]
 fn stimulation_adds_and_saturates() {
-    let mut memory = MemoryV0::new();
+    let mut memory = new_memory(1);
     let atom = insert(&mut memory, 1);
 
     assert_eq!(
@@ -342,7 +439,7 @@ fn stimulation_adds_and_saturates() {
 
 #[test]
 fn golden_chain_propagates_synchronously() {
-    let mut memory = MemoryV0::new();
+    let mut memory = new_memory(1);
     let a = insert(&mut memory, 1);
     let b = insert(&mut memory, 2);
     let c = insert(&mut memory, 3);
@@ -365,7 +462,7 @@ fn golden_chain_propagates_synchronously() {
 
 #[test]
 fn golden_branch_respects_weight_allocation() {
-    let mut memory = MemoryV0::new();
+    let mut memory = new_memory(1);
     let a = insert(&mut memory, 1);
     let b = insert(&mut memory, 2);
     let c = insert(&mut memory, 3);
@@ -387,7 +484,7 @@ fn golden_branch_respects_weight_allocation() {
 
 #[test]
 fn incoming_contributions_are_aggregated_before_rounding() {
-    let mut memory = MemoryV0::new();
+    let mut memory = new_memory(1);
     let sources: Vec<_> = (0..3).map(|seed| insert(&mut memory, seed)).collect();
     let target = insert(&mut memory, 10);
     for source in sources {
@@ -405,7 +502,7 @@ fn incoming_contributions_are_aggregated_before_rounding() {
 
 #[test]
 fn individually_sub_ppm_weights_can_combine_at_one_target() {
-    let mut memory = MemoryV0::new();
+    let mut memory = new_memory(1);
     let sources: Vec<_> = (0..3).map(|seed| insert(&mut memory, seed)).collect();
     let target = insert(&mut memory, 10);
     for source in sources {
@@ -423,7 +520,7 @@ fn individually_sub_ppm_weights_can_combine_at_one_target() {
 
 #[test]
 fn retention_and_propagation_share_one_rounding_boundary() {
-    let mut memory = MemoryV0::new();
+    let mut memory = new_memory(1);
     let source = insert(&mut memory, 1);
     let target = insert(&mut memory, 2);
     memory
@@ -442,7 +539,7 @@ fn retention_and_propagation_share_one_rounding_boundary() {
 
 #[test]
 fn converging_incoming_edges_clamp_target_at_full_activation() {
-    let mut memory = MemoryV0::new();
+    let mut memory = new_memory(1);
     let sources: Vec<_> = (0..3).map(|seed| insert(&mut memory, seed)).collect();
     let target = insert(&mut memory, 10);
     for source in sources {
@@ -460,7 +557,7 @@ fn converging_incoming_edges_clamp_target_at_full_activation() {
 
 #[test]
 fn cycles_are_bounded_and_lose_total_activation() {
-    let mut memory = MemoryV0::new();
+    let mut memory = new_memory(1);
     let a = insert(&mut memory, 1);
     let b = insert(&mut memory, 2);
     memory.set_relevance(a, b, weight(SCALE)).expect("A to B");
@@ -486,7 +583,7 @@ fn cycles_are_bounded_and_lose_total_activation() {
 
 #[test]
 fn disconnected_components_do_not_receive_activation() {
-    let mut memory = MemoryV0::new();
+    let mut memory = new_memory(1);
     let a = insert(&mut memory, 1);
     let b = insert(&mut memory, 2);
     let x = insert(&mut memory, 3);
@@ -510,7 +607,7 @@ fn disconnected_components_do_not_receive_activation() {
 
 #[test]
 fn top_k_excludes_zero_and_breaks_ties_by_atom_id() {
-    let mut memory = MemoryV0::new();
+    let mut memory = new_memory(1);
     let first = insert(&mut memory, 1);
     let second = insert(&mut memory, 2);
     let zero = insert(&mut memory, 3);
@@ -531,7 +628,7 @@ fn top_k_excludes_zero_and_breaks_ties_by_atom_id() {
 
 #[test]
 fn top_k_small_limit_keeps_only_the_best_ranked_hits() {
-    let mut memory = MemoryV0::new();
+    let mut memory = new_memory(1);
     let ids: Vec<_> = (0..6).map(|seed| insert(&mut memory, seed)).collect();
     for (id, value) in ids
         .iter()
@@ -551,7 +648,7 @@ fn top_k_small_limit_keeps_only_the_best_ranked_hits() {
 
 #[test]
 fn top_k_matches_full_ranking_for_every_limit() {
-    let mut memory = MemoryV0::new();
+    let mut memory = new_memory(1);
     let ids: Vec<_> = (0..12).map(|seed| insert(&mut memory, seed)).collect();
     for (id, value) in ids
         .iter()
@@ -570,7 +667,7 @@ fn top_k_matches_full_ranking_for_every_limit() {
 
 #[test]
 fn step_buffers_remain_aligned_after_insertion_and_reset() {
-    let mut memory = MemoryV0::new();
+    let mut memory = new_memory(1);
     let first = insert(&mut memory, 1);
     let second = insert(&mut memory, 2);
     memory
@@ -597,8 +694,8 @@ fn step_buffers_remain_aligned_after_insertion_and_reset() {
 
 #[test]
 fn edge_insertion_order_does_not_change_dynamics() {
-    let mut forward = MemoryV0::new();
-    let mut reverse = MemoryV0::new();
+    let mut forward = new_memory(1);
+    let mut reverse = new_memory(2);
     let forward_ids: Vec<_> = (0..4).map(|seed| insert(&mut forward, seed)).collect();
     let reverse_ids: Vec<_> = (0..4).map(|seed| insert(&mut reverse, seed)).collect();
     let edges = [
@@ -637,12 +734,12 @@ fn edge_insertion_order_does_not_change_dynamics() {
         let forward_ranking: Vec<_> = forward
             .top_k(4)
             .into_iter()
-            .map(|hit| (hit.atom_id.get(), hit.activation))
+            .map(|hit| (hit.atom_id.sequence(), hit.activation))
             .collect();
         let reverse_ranking: Vec<_> = reverse
             .top_k(4)
             .into_iter()
-            .map(|hit| (hit.atom_id.get(), hit.activation))
+            .map(|hit| (hit.atom_id.sequence(), hit.activation))
             .collect();
         assert_eq!(forward_ranking, reverse_ranking);
     }
@@ -688,7 +785,7 @@ fn ten_thousand_graphs_match_independent_dense_reference() {
 
     for case_index in 0..10_000_u64 {
         let atom_count = usize::try_from(1 + generator.next() % 8).expect("small count");
-        let mut memory = MemoryV0::new();
+        let mut memory = new_memory(u128::from(case_index) + 1);
         let ids: Vec<_> = (0..atom_count)
             .map(|index| insert(&mut memory, case_index * 16 + index as u64))
             .collect();
@@ -721,8 +818,8 @@ fn ten_thousand_graphs_match_independent_dense_reference() {
             .relevance_edges()
             .map(|edge| {
                 (
-                    usize::try_from(edge.from().get()).expect("small source id"),
-                    usize::try_from(edge.to().get()).expect("small target id"),
+                    usize::try_from(edge.from().sequence()).expect("small source id"),
+                    usize::try_from(edge.to().sequence()).expect("small target id"),
                     edge.weight().as_ppm(),
                 )
             })
