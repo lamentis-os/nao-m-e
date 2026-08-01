@@ -2,9 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::env;
-use std::error::Error;
 use std::ffi::{OsStr, OsString};
-use std::fmt;
 use std::fs::File;
 use std::io::{self, BufReader, Write as IoWrite};
 use std::path::{Path, PathBuf};
@@ -85,24 +83,7 @@ fn main() -> ExitCode {
     }
 }
 
-#[derive(Debug)]
-struct CliError(String);
-
-impl CliError {
-    fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
-    }
-}
-
-impl fmt::Display for CliError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl Error for CliError {}
-
-type CliResult<T> = Result<T, CliError>;
+type CliResult<T> = Result<T, String>;
 
 enum ParsedArgs {
     Execute(Command),
@@ -218,12 +199,8 @@ fn execute(command: Command) -> CliResult<Vec<u8>> {
 }
 
 fn execute_init(database: &Path) -> CliResult<Vec<u8>> {
-    let store = SqliteStore::create(database).map_err(|error| {
-        CliError::new(format!(
-            "could not create `{}`: {error}",
-            database.display()
-        ))
-    })?;
+    let store = SqliteStore::create(database)
+        .map_err(|error| format!("could not create `{}`: {error}", database.display()))?;
     let response = InitResponse {
         schema_version: SCHEMA_VERSION,
         memory_id: encode_memory_id(store.memory_id()),
@@ -235,13 +212,13 @@ fn execute_init(database: &Path) -> CliResult<Vec<u8>> {
 fn execute_run(database: &Path, input: &Path) -> CliResult<Vec<u8>> {
     let scenario = read_scenario(input)?;
     if scenario.schema_version != SCHEMA_VERSION {
-        return Err(CliError::new(format!(
+        return Err(format!(
             "unsupported scenario schema_version {}; expected {SCHEMA_VERSION}",
             scenario.schema_version
-        )));
+        ));
     }
     if scenario.operations.is_empty() {
-        return Err(CliError::new("scenario operations must not be empty"));
+        return Err("scenario operations must not be empty".to_owned());
     }
 
     let operations = scenario
@@ -250,13 +227,12 @@ fn execute_run(database: &Path, input: &Path) -> CliResult<Vec<u8>> {
         .enumerate()
         .map(|(index, operation)| {
             serde_json::from_value(operation)
-                .map_err(|error| CliError::new(format!("operations[{index}] is invalid: {error}")))
+                .map_err(|error| format!("operations[{index}] is invalid: {error}"))
         })
         .collect::<CliResult<Vec<OperationInput>>>()?;
     let operation_count = operations.len();
-    let mut store = SqliteStore::open(database).map_err(|error| {
-        CliError::new(format!("could not open `{}`: {error}", database.display()))
-    })?;
+    let mut store = SqliteStore::open(database)
+        .map_err(|error| format!("could not open `{}`: {error}", database.display()))?;
     let baseline_episode_count = store.memory().episodes().len();
     let mut labels = BTreeMap::new();
     let mut inserted = Vec::new();
@@ -265,14 +241,12 @@ fn execute_run(database: &Path, input: &Path) -> CliResult<Vec<u8>> {
         let name = operation.name();
         if let Err(error) = apply_operation(
             operation,
-            &mut store,
+            store.memory_mut(),
             baseline_episode_count,
             &mut labels,
             &mut inserted,
         ) {
-            return Err(CliError::new(format!(
-                "operations[{index}] ({name}) failed: {error}"
-            )));
+            return Err(format!("operations[{index}] ({name}) failed: {error}"));
         }
     }
 
@@ -280,26 +254,25 @@ fn execute_run(database: &Path, input: &Path) -> CliResult<Vec<u8>> {
         schema_version: SCHEMA_VERSION,
         memory_id: encode_memory_id(store.memory_id()),
         operations_applied: u64::try_from(operation_count)
-            .map_err(|_| CliError::new("operation count exceeds the JSON protocol range"))?,
+            .map_err(|_| "operation count exceeds the JSON protocol range".to_owned())?,
         episode_count: u64::try_from(store.memory().episodes().len())
-            .map_err(|_| CliError::new("episode count exceeds the JSON protocol range"))?,
+            .map_err(|_| "episode count exceeds the JSON protocol range".to_owned())?,
         inserted,
     };
     let output = serialize_response(&response)?;
 
     store.save().map_err(|error| {
-        CliError::new(format!(
+        format!(
             "could not save `{}`: {error}; the batch was not committed",
             database.display()
-        ))
+        )
     })?;
     Ok(output)
 }
 
 fn execute_recall(database: &Path, mode: RecallMode) -> CliResult<Vec<u8>> {
-    let store = SqliteStore::open(database).map_err(|error| {
-        CliError::new(format!("could not open `{}`: {error}", database.display()))
-    })?;
+    let store = SqliteStore::open(database)
+        .map_err(|error| format!("could not open `{}`: {error}", database.display()))?;
     let memory_id = encode_memory_id(store.memory_id());
 
     match mode {
@@ -327,7 +300,7 @@ fn execute_recall(database: &Path, mode: RecallMode) -> CliResult<Vec<u8>> {
             let episode = store
                 .memory()
                 .episode(id)
-                .ok_or_else(|| CliError::new(format!("unknown episode sequence {sequence}")))?;
+                .ok_or_else(|| format!("unknown episode sequence {sequence}"))?;
             let activation = store
                 .memory()
                 .activation(id)
@@ -346,23 +319,18 @@ fn execute_recall(database: &Path, mode: RecallMode) -> CliResult<Vec<u8>> {
 fn read_scenario(input: &Path) -> CliResult<ScenarioInput> {
     if input.as_os_str() == OsStr::new("-") {
         serde_json::from_reader(io::stdin().lock())
-            .map_err(|error| CliError::new(format!("invalid scenario JSON from stdin: {error}")))
+            .map_err(|error| format!("invalid scenario JSON from stdin: {error}"))
     } else {
-        let file = File::open(input).map_err(|error| {
-            CliError::new(format!("could not read `{}`: {error}", input.display()))
-        })?;
-        serde_json::from_reader(BufReader::new(file)).map_err(|error| {
-            CliError::new(format!(
-                "invalid scenario JSON in `{}`: {error}",
-                input.display()
-            ))
-        })
+        let file = File::open(input)
+            .map_err(|error| format!("could not read `{}`: {error}", input.display()))?;
+        serde_json::from_reader(BufReader::new(file))
+            .map_err(|error| format!("invalid scenario JSON in `{}`: {error}", input.display()))
     }
 }
 
 fn apply_operation(
     operation: OperationInput,
-    store: &mut SqliteStore,
+    memory: &mut MemoryV0,
     baseline_episode_count: usize,
     labels: &mut BTreeMap<String, AtomId>,
     inserted: &mut Vec<InsertedEpisode>,
@@ -371,20 +339,17 @@ fn apply_operation(
         OperationInput::InsertEpisode { label, episode } => {
             if let Some(label) = label.as_deref() {
                 if label.is_empty() {
-                    return Err(CliError::new("insert label must not be empty"));
+                    return Err("insert label must not be empty".to_owned());
                 }
                 if labels.contains_key(label) {
-                    return Err(CliError::new(format!(
-                        "insert label `{label}` is already defined"
-                    )));
+                    return Err(format!("insert label `{label}` is already defined"));
                 }
             }
 
             let draft = episode.into_draft()?;
-            let id = store
-                .memory_mut()
+            let id = memory
                 .insert_episode(draft)
-                .map_err(|error| CliError::new(error.to_string()))?;
+                .map_err(|error| error.to_string())?;
             if let Some(label) = label.as_ref() {
                 labels.insert(label.clone(), id);
             }
@@ -398,41 +363,37 @@ fn apply_operation(
             to,
             weight_ppm,
         } => {
-            let from = resolve_atom(from, store.memory(), baseline_episode_count, labels)?;
-            let to = resolve_atom(to, store.memory(), baseline_episode_count, labels)?;
-            let weight = InfluenceWeight::from_ppm(weight_ppm)
-                .map_err(|error| CliError::new(error.to_string()))?;
-            store
-                .memory_mut()
+            let from = resolve_atom(from, memory, baseline_episode_count, labels)?;
+            let to = resolve_atom(to, memory, baseline_episode_count, labels)?;
+            let weight =
+                InfluenceWeight::from_ppm(weight_ppm).map_err(|error| error.to_string())?;
+            memory
                 .set_relevance(from, to, weight)
-                .map_err(|error| CliError::new(error.to_string()))?;
+                .map_err(|error| error.to_string())?;
         }
         OperationInput::RemoveRelevance { from, to } => {
-            let from = resolve_atom(from, store.memory(), baseline_episode_count, labels)?;
-            let to = resolve_atom(to, store.memory(), baseline_episode_count, labels)?;
-            store
-                .memory_mut()
+            let from = resolve_atom(from, memory, baseline_episode_count, labels)?;
+            let to = resolve_atom(to, memory, baseline_episode_count, labels)?;
+            memory
                 .remove_relevance(from, to)
-                .map_err(|error| CliError::new(error.to_string()))?;
+                .map_err(|error| error.to_string())?;
         }
         OperationInput::Stimulate { atom, amount_ppm } => {
-            let atom = resolve_atom(atom, store.memory(), baseline_episode_count, labels)?;
-            let amount = Activation::from_ppm(amount_ppm)
-                .map_err(|error| CliError::new(error.to_string()))?;
-            store
-                .memory_mut()
+            let atom = resolve_atom(atom, memory, baseline_episode_count, labels)?;
+            let amount = Activation::from_ppm(amount_ppm).map_err(|error| error.to_string())?;
+            memory
                 .stimulate(atom, amount)
-                .map_err(|error| CliError::new(error.to_string()))?;
+                .map_err(|error| error.to_string())?;
         }
         OperationInput::Step { count } => {
             if count == 0 {
-                return Err(CliError::new("step count must be positive"));
+                return Err("step count must be positive".to_owned());
             }
             for _ in 0..count {
-                store.memory_mut().step();
+                memory.step();
             }
         }
-        OperationInput::ResetActivations {} => store.memory_mut().reset_activations(),
+        OperationInput::ResetActivations {} => memory.reset_activations(),
     }
     Ok(())
 }
@@ -444,38 +405,31 @@ fn resolve_atom(
     labels: &BTreeMap<String, AtomId>,
 ) -> CliResult<AtomId> {
     match reference {
-        AtomReferenceInput::Sequence(SequenceReferenceInput { sequence }) => {
-            let index = usize::try_from(sequence).map_err(|_| {
-                CliError::new(format!("episode sequence {sequence} is not addressable"))
-            })?;
+        AtomReferenceInput::Sequence { sequence } => {
+            let index = usize::try_from(sequence)
+                .map_err(|_| format!("episode sequence {sequence} is not addressable"))?;
             if index >= baseline_episode_count {
-                return Err(CliError::new(format!(
+                return Err(format!(
                     "episode sequence {sequence} was not persisted before this batch; use an insert label"
-                )));
+                ));
             }
-            let id = AtomId::from_parts(memory.memory_id(), sequence);
-            if memory.episode(id).is_none() {
-                return Err(CliError::new(format!(
-                    "unknown episode sequence {sequence}"
-                )));
-            }
-            Ok(id)
+            Ok(AtomId::from_parts(memory.memory_id(), sequence))
         }
-        AtomReferenceInput::Label(LabelReferenceInput { label }) => {
+        AtomReferenceInput::Label { label } => {
             if label.is_empty() {
-                return Err(CliError::new("atom label must not be empty"));
+                return Err("atom label must not be empty".to_owned());
             }
             labels
                 .get(&label)
                 .copied()
-                .ok_or_else(|| CliError::new(format!("unknown or forward label `{label}`")))
+                .ok_or_else(|| format!("unknown or forward label `{label}`"))
         }
     }
 }
 
 fn serialize_response<T: Serialize>(response: &T) -> CliResult<Vec<u8>> {
     let mut output = serde_json::to_vec_pretty(response)
-        .map_err(|error| CliError::new(format!("could not serialize JSON output: {error}")))?;
+        .map_err(|error| format!("could not serialize JSON output: {error}"))?;
     output.push(b'\n');
     Ok(output)
 }
@@ -485,7 +439,7 @@ fn write_stdout(output: Vec<u8>) -> CliResult<()> {
     stdout
         .write_all(&output)
         .and_then(|()| stdout.flush())
-        .map_err(|error| CliError::new(format!("could not write standard output: {error}")))
+        .map_err(|error| format!("could not write standard output: {error}"))
 }
 
 fn encode_memory_id(memory_id: MemoryId) -> String {
@@ -540,22 +494,10 @@ impl OperationInput {
 }
 
 #[derive(Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 enum AtomReferenceInput {
-    Sequence(SequenceReferenceInput),
-    Label(LabelReferenceInput),
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SequenceReferenceInput {
-    sequence: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LabelReferenceInput {
-    label: String,
+    Sequence { sequence: u64 },
+    Label { label: String },
 }
 
 #[derive(Deserialize, Serialize)]
@@ -582,23 +524,23 @@ impl EpisodeDocument {
             .map(|(index, statement)| {
                 statement
                     .into_statement()
-                    .map_err(|error| CliError::new(format!("context[{index}]: {error}")))
+                    .map_err(|error| format!("context[{index}]: {error}"))
             })
             .collect::<CliResult<Vec<_>>>()?;
         let observation = self
             .observation
             .into_statement()
-            .map_err(|error| CliError::new(format!("observation: {error}")))?;
+            .map_err(|error| format!("observation: {error}"))?;
         let action = self
             .action
             .map(StatementDocument::into_statement)
             .transpose()
-            .map_err(|error| CliError::new(format!("action: {error}")))?;
+            .map_err(|error| format!("action: {error}"))?;
         let outcome = self
             .outcome
             .map(StatementDocument::into_statement)
             .transpose()
-            .map_err(|error| CliError::new(format!("outcome: {error}")))?;
+            .map_err(|error| format!("outcome: {error}"))?;
 
         Ok(EpisodeDraft {
             occurred_at: TimestampMs::new(self.occurred_at_ms),

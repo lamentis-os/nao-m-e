@@ -539,6 +539,22 @@ fn malformed_and_invalid_scenarios_fail_closed() {
         );
     }
 
+    for atom in [
+        json!({"sequence": 0, "label": "ambiguous"}),
+        json!({"label": "missing", "extra": true}),
+    ] {
+        let scenario = json!({
+            "schema_version": 1,
+            "operations": [{
+                "op": "stimulate",
+                "atom": atom,
+                "amount_ppm": 1
+            }]
+        });
+        let stderr = assert_runtime_failure(run_stdin(&database, &scenario));
+        assert!(stderr.contains("operations[0] is invalid"));
+    }
+
     let unknown_operation = json!({
         "schema_version": 1,
         "operations": [{"op": "unknown"}]
