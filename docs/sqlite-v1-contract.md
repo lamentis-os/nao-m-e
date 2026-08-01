@@ -296,8 +296,10 @@ rows and statement structure are validated as they are consumed into a local
 Any rejection by the core during reconstruction is invalid stored data. The
 local reconstruction is not exposed until every storage-level and core
 validation succeeds; any later activation or relevance error discards it, so
-the adapter returns no partial memory. The transition scratch buffer is not
-stored because every logical `step()` overwrites it before use.
+the adapter returns no partial memory. If a snapshot contains multiple
+independent violations, which violation is reported first is unspecified. The
+transition scratch buffer is not stored because every logical `step()`
+overwrites it before use.
 
 ## Saving and writer exclusion
 
