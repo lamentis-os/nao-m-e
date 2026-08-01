@@ -7,6 +7,9 @@ pub const RETENTION_PPM: u32 = 500_000;
 /// Fraction of weighted activation propagated during one logical step.
 pub const PROPAGATION_GAIN_PPM: u32 = 400_000;
 
+/// Maximum total relevance increment apportioned equally to a positive feedback list.
+pub const FEEDBACK_STEP_PPM: u32 = 100_000;
+
 /// Squared fixed-point scale used as the propagation denominator.
 pub(crate) const SCALE_SQUARED: u64 = SCALE as u64 * SCALE as u64;
 
@@ -15,4 +18,5 @@ pub(crate) const SCALE_CUBED: u64 = SCALE_SQUARED * SCALE as u64;
 
 const _: () = assert!(RETENTION_PPM <= SCALE);
 const _: () = assert!(PROPAGATION_GAIN_PPM <= SCALE);
+const _: () = assert!(FEEDBACK_STEP_PPM <= SCALE);
 const _: () = assert!(RETENTION_PPM + PROPAGATION_GAIN_PPM < SCALE);

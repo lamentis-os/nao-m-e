@@ -65,6 +65,56 @@ edge validates both endpoints and the resulting budget before mutation.
 A positive weight controls activation flow only. It does not encode truth,
 probability, confidence, evidence, causality, or semantic support.
 
+## External feedback
+
+`apply_feedback(source, targets, helpful)` applies one caller-supplied binary
+assessment to the source's outgoing relevance. `helpful = true` is positive
+feedback and `helpful = false` is negative feedback. The kernel accepts the
+assessment as input; it does not infer whether a recall was useful.
+
+The operation first validates the source and every target. Any unknown atom
+rejects the complete operation without mutation. It then sorts and deduplicates
+the targets and removes the source itself. Target input order, rank, duplicates,
+and self-hits therefore have no effect. An empty effective target set is a
+successful no-op.
+
+The fixed feedback step is:
+
+```text
+FEEDBACK_STEP_PPM = 100,000
+```
+
+For a non-empty effective target set `T` of size `n`, positive feedback computes:
+
+```text
+target_total = sum(weight[source,target] for target in T)
+per_target = min(
+    floor(FEEDBACK_STEP_PPM / n),
+    floor((SCALE - target_total) / n)
+)
+total_award = per_target * n
+```
+
+The award first consumes unused outgoing budget. If the unused budget is less
+than `total_award`, the deficit is funded by scaling only non-target edges. If
+their old total is `non_target_total` and the deficit is `needed`, every
+non-target weight is replaced by:
+
+```text
+floor(weight * (non_target_total - needed) / non_target_total)
+```
+
+Each target weight is then increased by `per_target`. Flooring can leave some
+outgoing budget unused. A zero result is represented by edge absence.
+
+Negative feedback computes `per_target = floor(FEEDBACK_STEP_PPM / n)` and
+replaces each target weight with `max(0, weight - per_target)`. Missing target
+edges and all non-target edges remain unchanged. If `per_target` is zero, either
+feedback value is a no-op.
+
+The complete resulting source row is staged before publication, so feedback is
+atomic. Feedback changes neither immutable episode content nor activation.
+
 ## Activation dynamics
 
 All unit-interval values use integer parts per million:
@@ -112,6 +162,7 @@ Resetting activation leaves atoms and relevance edges unchanged.
 The V0 kernel stores atoms, activation, and relevance only in a `MemoryV0`
 instance. It performs no persistence, loading, synchronization, or multi-writer
 coordination. It also performs no free-text processing, embedding or LLM calls,
-or automatic relevance learning. Persistence adapters remain outside the
+or autonomous relevance learning. Relevance changes only through explicit graph
+mutation or caller-supplied feedback. Persistence adapters remain outside the
 kernel; the format and lifecycle of the optional SQLite adapter are specified
 separately in the [SQLite V1 contract](sqlite-v1-contract.md).
