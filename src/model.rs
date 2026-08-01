@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use crate::memory::SCALE;
+use crate::parameters::SCALE;
 
 macro_rules! unsigned_id {
     ($name:ident, $description:literal) => {
@@ -56,6 +56,12 @@ impl AtomId {
     #[must_use]
     pub const fn memory_namespace(self) -> u64 {
         self.memory_namespace
+    }
+}
+
+impl fmt::Display for AtomId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}:{}", self.memory_namespace, self.local_id)
     }
 }
 
@@ -366,15 +372,14 @@ pub enum GraphError {
 impl fmt::Display for GraphError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownAtom(id) => write!(formatter, "unknown atom {}", id.get()),
-            Self::SelfEdge(id) => write!(formatter, "atom {} cannot influence itself", id.get()),
+            Self::UnknownAtom(id) => write!(formatter, "unknown atom {id}"),
+            Self::SelfEdge(id) => write!(formatter, "atom {id} cannot influence itself"),
             Self::OutgoingWeightBudgetExceeded {
                 from,
                 attempted_ppm,
             } => write!(
                 formatter,
-                "atom {} outgoing weight {attempted_ppm} exceeds {SCALE}",
-                from.get()
+                "atom {from} outgoing weight {attempted_ppm} exceeds {SCALE}",
             ),
         }
     }

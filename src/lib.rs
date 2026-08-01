@@ -49,9 +49,11 @@
 
 mod memory;
 mod model;
+mod parameters;
 
-pub use memory::{MemoryV0, PROPAGATION_GAIN_PPM, RETENTION_PPM, RecallHit, RelevanceEdge, SCALE};
+pub use memory::{MemoryV0, RecallHit, RelevanceEdge};
 pub use model::{
     Activation, AtomId, EpisodeAtom, EpisodeDraft, GraphError, InfluenceWeight, MemoryError,
     ModelError, PredicateId, SourceId, Statement, TermId, TimestampMs, ValueError,
 };
+pub use parameters::{PROPAGATION_GAIN_PPM, RETENTION_PPM, SCALE};

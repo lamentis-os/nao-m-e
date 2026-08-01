@@ -19,6 +19,10 @@ Episode content is symbolic. Predicates, terms, and provenance sources are
 caller-owned numeric identifiers; V0 never stores free-form text and does not
 generate those identifiers.
 
+Atom identifiers distinguish memory instances only inside one running process.
+They are not durable or globally unique identities and must not be persisted as
+cross-process references.
+
 An episode contains:
 
 - occurrence and recording time;
@@ -39,18 +43,26 @@ All unit-interval values use integer parts per million:
     RETENTION = 500,000
     PROPAGATION_GAIN = 400,000
 
-One synchronous step computes:
+One synchronous logical step computes:
 
     next[j] =
-        floor(RETENTION * current[j] / SCALE)
-        + sum floor(
-            PROPAGATION_GAIN * weight[i,j] * current[i]
-            / SCALE^2
-          )
+        floor(
+            min(SCALE^3,
+                RETENTION * SCALE * current[j]
+                + PROPAGATION_GAIN * sum(weight[i,j] * current[i])
+            ) / SCALE^2
+        )
 
-The result is clamped to SCALE. Each source has an outgoing weight budget of
-at most SCALE. Because retention plus propagation gain is 0.9, total
-activation cannot grow without an external stimulus.
+Retention and every incoming contribution are therefore accumulated before one
+rounding operation per target. The numerator is clamped at SCALE cubed, so
+converging inputs cannot overflow the activation range.
+Each source has an outgoing weight budget of at most SCALE. Because retention
+plus propagation gain is 0.9, total activation cannot grow without an external
+stimulus.
+
+A step is an explicit logical tick, not elapsed wall-clock time. Episode
+timestamps are immutable metadata and do not alter retention. Callers that map
+steps to real time must define and keep that cadence themselves.
 
 Positive relevance only means that activating one atom makes another atom
 more accessible. It does not encode truth, evidence, causality, or semantic
@@ -118,5 +130,5 @@ stable `Rust CI` check succeeds only after the quality job and every platform
 matrix entry have succeeded.
 
 The tests include exact golden graphs, graph and value invariants, ordering
-checks, and 10,000 deterministic generated graphs compared with an independent
-dense reference evaluator.
+checks, and four transitions across 10,000 deterministic generated graphs
+compared with an independent dense reference evaluator.

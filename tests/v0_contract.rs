@@ -159,10 +159,21 @@ fn graph_validation_is_atomic_and_budgeted() {
     );
     assert_eq!(memory.relevance(source, first), Some(weight(700_000)));
     assert_eq!(memory.relevance(source, second), None);
+    assert!(
+        rejected
+            .expect_err("budget violation is retained for diagnostics")
+            .to_string()
+            .contains(&source.to_string())
+    );
 
     assert_eq!(
         memory.set_relevance(source, source, weight(1)),
         Err(GraphError::SelfEdge(source))
+    );
+    assert!(
+        GraphError::SelfEdge(source)
+            .to_string()
+            .contains(&source.to_string())
     );
 
     let mut other = MemoryV0::new();
@@ -184,12 +195,34 @@ fn graph_validation_is_atomic_and_budgeted() {
         .set_relevance(source, second, weight(400_000))
         .expect("remaining budget fits");
     assert_eq!(
+        memory.set_relevance(source, first, weight(700_000)),
+        Err(GraphError::OutgoingWeightBudgetExceeded {
+            from: source,
+            attempted_ppm: 1_100_000,
+        })
+    );
+    assert_eq!(memory.relevance(source, first), Some(weight(600_000)));
+    assert_eq!(memory.relevance(source, second), Some(weight(400_000)));
+    assert_eq!(
         memory
             .remove_relevance(source, first)
             .expect("endpoints are known"),
         Some(weight(600_000))
     );
     assert_eq!(memory.relevance(source, first), None);
+    memory
+        .set_relevance(source, first, weight(600_000))
+        .expect("removal restores cached budget");
+    memory
+        .remove_relevance(source, first)
+        .expect("first cached edge removes");
+    memory
+        .remove_relevance(source, second)
+        .expect("last cached edge removes its sparse source");
+    assert_eq!(memory.relevance_edges().count(), 0);
+    memory
+        .set_relevance(source, first, weight(SCALE))
+        .expect("removed sparse source can be recreated");
 }
 
 #[test]
@@ -202,10 +235,53 @@ fn ids_from_another_memory_cannot_alias_local_atoms() {
     assert_eq!(local.get(), foreign.get());
     assert_ne!(local.memory_namespace(), foreign.memory_namespace());
     assert_eq!(
+        local.to_string(),
+        format!("{}:{}", local.memory_namespace(), local.get())
+    );
+    assert_ne!(local.to_string(), foreign.to_string());
+    assert_eq!(first_memory.episode(foreign), None);
+    assert_eq!(first_memory.activation(foreign), None);
+    assert_eq!(first_memory.relevance(local, foreign), None);
+    assert_eq!(first_memory.relevance(foreign, local), None);
+    assert_eq!(
         first_memory.stimulate(foreign, Activation::ONE),
         Err(GraphError::UnknownAtom(foreign))
     );
+    assert_eq!(
+        first_memory.set_relevance(local, foreign, weight(1)),
+        Err(GraphError::UnknownAtom(foreign))
+    );
+    assert_eq!(
+        first_memory.set_relevance(foreign, local, weight(1)),
+        Err(GraphError::UnknownAtom(foreign))
+    );
+    assert_eq!(
+        first_memory.remove_relevance(local, foreign),
+        Err(GraphError::UnknownAtom(foreign))
+    );
+    assert_eq!(
+        first_memory.remove_relevance(foreign, local),
+        Err(GraphError::UnknownAtom(foreign))
+    );
+    assert!(
+        GraphError::UnknownAtom(foreign)
+            .to_string()
+            .contains(&foreign.to_string())
+    );
     assert_eq!(first_memory.activation(local), Some(Activation::ZERO));
+}
+
+#[test]
+fn empty_memory_operations_are_noops() {
+    let mut memory = MemoryV0::new();
+
+    assert_eq!(memory.episodes().len(), 0);
+    assert_eq!(memory.relevance_edges().count(), 0);
+    assert!(memory.top_k(0).is_empty());
+    assert!(memory.top_k(10).is_empty());
+    memory.step();
+    memory.reset_activations();
+    assert!(memory.top_k(10).is_empty());
 }
 
 #[test]
@@ -214,6 +290,14 @@ fn relevance_is_directed_sorted_and_removal_of_absent_edge_is_a_noop() {
     let a = insert(&mut memory, 1);
     let b = insert(&mut memory, 2);
     let c = insert(&mut memory, 3);
+    assert_eq!(
+        memory
+            .episodes()
+            .rev()
+            .map(|episode| episode.id())
+            .collect::<Vec<_>>(),
+        vec![c, b, a]
+    );
     memory.set_relevance(b, c, weight(200_000)).expect("B to C");
     memory.set_relevance(a, c, weight(300_000)).expect("A to C");
     memory.set_relevance(a, b, weight(400_000)).expect("A to B");
@@ -302,7 +386,7 @@ fn golden_branch_respects_weight_allocation() {
 }
 
 #[test]
-fn each_incoming_edge_is_rounded_before_contributions_are_summed() {
+fn incoming_contributions_are_aggregated_before_rounding() {
     let mut memory = MemoryV0::new();
     let sources: Vec<_> = (0..3).map(|seed| insert(&mut memory, seed)).collect();
     let target = insert(&mut memory, 10);
@@ -316,7 +400,44 @@ fn each_incoming_edge_is_rounded_before_contributions_are_summed() {
     }
 
     memory.step();
-    assert_activation(&memory, target, 0);
+    assert_activation(&memory, target, 1);
+}
+
+#[test]
+fn individually_sub_ppm_weights_can_combine_at_one_target() {
+    let mut memory = MemoryV0::new();
+    let sources: Vec<_> = (0..3).map(|seed| insert(&mut memory, seed)).collect();
+    let target = insert(&mut memory, 10);
+    for source in sources {
+        memory
+            .set_relevance(source, target, weight(1))
+            .expect("positive sub-ppm contribution is retained");
+        memory
+            .stimulate(source, Activation::ONE)
+            .expect("full source stimulus");
+    }
+
+    memory.step();
+    assert_activation(&memory, target, 1);
+}
+
+#[test]
+fn retention_and_propagation_share_one_rounding_boundary() {
+    let mut memory = MemoryV0::new();
+    let source = insert(&mut memory, 1);
+    let target = insert(&mut memory, 2);
+    memory
+        .set_relevance(source, target, weight(SCALE))
+        .expect("full edge");
+    memory
+        .stimulate(source, activation(2))
+        .expect("two ppm source stimulus");
+    memory
+        .stimulate(target, activation(1))
+        .expect("one ppm retained stimulus");
+
+    memory.step();
+    assert_activation(&memory, target, 1);
 }
 
 #[test]
@@ -324,9 +445,6 @@ fn converging_incoming_edges_clamp_target_at_full_activation() {
     let mut memory = MemoryV0::new();
     let sources: Vec<_> = (0..3).map(|seed| insert(&mut memory, seed)).collect();
     let target = insert(&mut memory, 10);
-    memory
-        .stimulate(target, Activation::ONE)
-        .expect("target seed");
     for source in sources {
         memory
             .set_relevance(source, target, weight(SCALE))
@@ -412,12 +530,83 @@ fn top_k_excludes_zero_and_breaks_ties_by_atom_id() {
 }
 
 #[test]
+fn top_k_small_limit_keeps_only_the_best_ranked_hits() {
+    let mut memory = MemoryV0::new();
+    let ids: Vec<_> = (0..6).map(|seed| insert(&mut memory, seed)).collect();
+    for (id, value) in ids
+        .iter()
+        .copied()
+        .zip([100_000, 900_000, 500_000, 900_000, 700_000, 900_000])
+    {
+        memory.stimulate(id, activation(value)).expect("known atom");
+    }
+
+    let hits = memory.top_k(2);
+    assert_eq!(
+        hits.iter().map(|hit| hit.atom_id).collect::<Vec<_>>(),
+        vec![ids[1], ids[3]]
+    );
+    assert!(hits.iter().all(|hit| hit.activation == activation(900_000)));
+}
+
+#[test]
+fn top_k_matches_full_ranking_for_every_limit() {
+    let mut memory = MemoryV0::new();
+    let ids: Vec<_> = (0..12).map(|seed| insert(&mut memory, seed)).collect();
+    for (id, value) in ids
+        .iter()
+        .copied()
+        .zip([0, 20, 20, 1, 900_000, 0, 700_000, 20, 3, 900_000, 2, 0])
+    {
+        memory.stimulate(id, activation(value)).expect("known atom");
+    }
+
+    let complete = memory.top_k(ids.len());
+    for limit in 0..=ids.len() + 1 {
+        let expected: Vec<_> = complete.iter().copied().take(limit).collect();
+        assert_eq!(memory.top_k(limit), expected, "limit {limit}");
+    }
+}
+
+#[test]
+fn step_buffers_remain_aligned_after_insertion_and_reset() {
+    let mut memory = MemoryV0::new();
+    let first = insert(&mut memory, 1);
+    let second = insert(&mut memory, 2);
+    memory
+        .set_relevance(first, second, weight(SCALE))
+        .expect("first edge");
+    memory
+        .stimulate(first, Activation::ONE)
+        .expect("initial stimulus");
+    memory.step();
+
+    let inserted_after_step = insert(&mut memory, 3);
+    memory
+        .set_relevance(second, inserted_after_step, weight(SCALE))
+        .expect("edge to newly inserted atom");
+    memory.step();
+    assert_activation(&memory, first, 250_000);
+    assert_activation(&memory, second, 400_000);
+    assert_activation(&memory, inserted_after_step, 160_000);
+
+    memory.reset_activations();
+    memory.step();
+    assert!(memory.top_k(3).is_empty());
+}
+
+#[test]
 fn edge_insertion_order_does_not_change_dynamics() {
     let mut forward = MemoryV0::new();
     let mut reverse = MemoryV0::new();
     let forward_ids: Vec<_> = (0..4).map(|seed| insert(&mut forward, seed)).collect();
     let reverse_ids: Vec<_> = (0..4).map(|seed| insert(&mut reverse, seed)).collect();
-    let edges = [(0, 1, 400_000), (0, 2, 600_000), (1, 3, SCALE)];
+    let edges = [
+        (0, 1, 400_000),
+        (0, 2, 600_000),
+        (1, 3, SCALE),
+        (2, 3, SCALE),
+    ];
 
     for &(from, to, ppm) in &edges {
         forward
@@ -461,21 +650,22 @@ fn edge_insertion_order_does_not_change_dynamics() {
 
 fn reference_step(current: &[u32], edges: &[(usize, usize, u32)]) -> Vec<u32> {
     let scale = u128::from(SCALE);
-    let mut next: Vec<u128> = current
-        .iter()
-        .map(|&value| u128::from(value) * u128::from(RETENTION_PPM) / scale)
-        .collect();
     let denominator = scale * scale;
+    let saturation = denominator * scale;
+    let mut numerators: Vec<u128> = current
+        .iter()
+        .map(|&value| u128::from(value) * u128::from(RETENTION_PPM) * scale)
+        .collect();
 
     for &(from, to, edge_weight) in edges {
-        next[to] +=
-            u128::from(current[from]) * u128::from(edge_weight) * u128::from(PROPAGATION_GAIN_PPM)
-                / denominator;
-        next[to] = next[to].min(scale);
+        numerators[to] +=
+            u128::from(current[from]) * u128::from(edge_weight) * u128::from(PROPAGATION_GAIN_PPM);
+        numerators[to] = numerators[to].min(saturation);
     }
 
-    next.into_iter()
-        .map(|value| u32::try_from(value).expect("reference value is bounded"))
+    numerators
+        .into_iter()
+        .map(|value| u32::try_from(value / denominator).expect("reference activation is bounded"))
         .collect()
 }
 
@@ -537,40 +727,47 @@ fn ten_thousand_graphs_match_independent_dense_reference() {
                 )
             })
             .collect();
-        let expected = reference_step(&before, &edges);
-        memory.step();
+        let mut previous = before;
+        for step_index in 0..4 {
+            let expected = reference_step(&previous, &edges);
+            memory.step();
 
-        let actual: Vec<_> = ids
-            .iter()
-            .map(|&id| memory.activation(id).expect("known atom").as_ppm())
-            .collect();
-        assert_eq!(actual, expected, "differential case {case_index}");
+            let actual: Vec<_> = ids
+                .iter()
+                .map(|&id| memory.activation(id).expect("known atom").as_ppm())
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "differential case {case_index}, step {step_index}"
+            );
 
-        let mut expected_ranking: Vec<_> = ids
-            .iter()
-            .copied()
-            .zip(expected.iter().copied())
-            .filter(|(_, value)| *value != 0)
-            .collect();
-        expected_ranking.sort_unstable_by(|left, right| {
-            right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0))
-        });
-        let actual_ranking: Vec<_> = memory
-            .top_k(atom_count)
-            .into_iter()
-            .map(|hit| (hit.atom_id, hit.activation.as_ppm()))
-            .collect();
-        assert_eq!(
-            actual_ranking, expected_ranking,
-            "ranking case {case_index}"
-        );
+            let mut expected_ranking: Vec<_> = ids
+                .iter()
+                .copied()
+                .zip(expected.iter().copied())
+                .filter(|(_, value)| *value != 0)
+                .collect();
+            expected_ranking.sort_unstable_by(|left, right| {
+                right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0))
+            });
+            let actual_ranking: Vec<_> = memory
+                .top_k(atom_count)
+                .into_iter()
+                .map(|hit| (hit.atom_id, hit.activation.as_ppm()))
+                .collect();
+            assert_eq!(
+                actual_ranking, expected_ranking,
+                "ranking case {case_index}, step {step_index}"
+            );
 
-        let before_total: u128 = before.iter().copied().map(u128::from).sum();
-        let after_total: u128 = actual.iter().copied().map(u128::from).sum();
-        assert!(
-            after_total * u128::from(SCALE)
-                <= before_total * u128::from(RETENTION_PPM + PROPAGATION_GAIN_PPM),
-            "mass bound case {case_index}"
-        );
+            let before_total: u128 = previous.iter().copied().map(u128::from).sum();
+            let after_total: u128 = actual.iter().copied().map(u128::from).sum();
+            assert!(
+                after_total * u128::from(SCALE)
+                    <= before_total * u128::from(RETENTION_PPM + PROPAGATION_GAIN_PPM),
+                "mass bound case {case_index}, step {step_index}"
+            );
+            previous = expected;
+        }
     }
 }
