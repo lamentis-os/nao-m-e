@@ -2,9 +2,11 @@
 
 ## Scope and purpose
 
-These instructions apply to the entire repository. `nao_m_e` is a Rust 2024
-research library for deterministic, in-memory symbolic episode memory. The
-cross-cutting V0 behavior is defined in `docs/v0-contract.md`.
+These instructions apply to the entire repository. The workspace contains a
+deterministic, in-memory Rust 2024 kernel for symbolic episode memory and an
+optional SQLite snapshot adapter. Core behavior is defined in
+`docs/v0-contract.md`; the persistence format and lifecycle are defined in
+`docs/sqlite-v1-contract.md`.
 
 ## Source layout
 
@@ -15,10 +17,12 @@ cross-cutting V0 behavior is defined in `docs/v0-contract.md`.
 - `src/parameters.rs` owns fixed-point constants.
 - `tests/v0_contract.rs` exercises the public V0 contract and independent
   differential reference behavior.
+- `crates/nao-m-e-sqlite` owns SQLite connection handling, format validation,
+  snapshot transactions, and adapter tests.
 
 ## Contract guardrails
 
-The exact semantics live only in `docs/v0-contract.md`. Preserve these
+The exact semantics live in the applicable contract document. Preserve these
 repository-level guardrails when changing the implementation:
 
 - Preserve `#![forbid(unsafe_code)]` and deterministic behavior across supported
@@ -32,6 +36,10 @@ repository-level guardrails when changing the implementation:
 - Keep relevance directed, positive, budgeted, and atomically validated.
 - Keep recall ordering deterministic and relevance semantically distinct from
   truth or confidence.
+- Keep persistence outside the core crate. Decode and validate a complete
+  snapshot before exposing reconstructed state, and commit a save atomically.
+- Preserve canonical fixed-width identifier encodings and reject stale writers
+  rather than silently merging or overwriting their snapshots.
 
 ## Change discipline
 
@@ -40,8 +48,8 @@ repository-level guardrails when changing the implementation:
 - Add dependencies, randomness, external I/O, networking, or wall-clock-driven
   dynamics only when the task explicitly requires them. Keep integrations out
   of deterministic transition logic.
-- Update implementation, `docs/v0-contract.md`, and contract tests together for
-  every intentional behavior change.
+- Update implementation, the applicable contract document, and contract tests
+  together for every intentional behavior change.
 - Do not split coherent modules or add abstraction without a concrete ownership
   or maintenance benefit.
 
@@ -49,7 +57,9 @@ repository-level guardrails when changing the implementation:
 
 - `README.md` is the durable user entry point: purpose, overview, minimal use,
   boundaries, and links.
-- `docs/v0-contract.md` is the single cross-cutting technical specification.
+- `docs/v0-contract.md` is the single cross-cutting core specification.
+- `docs/sqlite-v1-contract.md` is the single SQLite format and lifecycle
+  specification.
 - Rustdoc describes symbol-local semantics, errors, and non-obvious behavior.
   Public items remain documented under `#![deny(missing_docs)]`.
 - Ordinary comments explain only non-obvious reasons or invariants, not control
@@ -75,9 +85,14 @@ git diff --check
 Treat `.github/workflows/ci.yml` as the operational source of truth when the CI
 matrix changes.
 
+When persistence dependencies change, also inspect
+`cargo tree -p nao-m-e --edges normal` and confirm that the core package still
+has no runtime dependencies.
+
 ## Evidence
 
 - Report only checks that were actually executed.
 - Separate local verification from remote CI and its platform results.
-- Do not claim persistence, learned relevance, semantic correctness,
-  production readiness, or cross-platform verification without direct evidence.
+- Do not claim persistence, physical power-loss resilience, learned relevance,
+  semantic correctness, production readiness, or cross-platform verification
+  without direct evidence.

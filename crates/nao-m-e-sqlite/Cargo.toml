@@ -1,0 +1,15 @@
+[package]
+name = "nao-m-e-sqlite"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.95.0"
+description = "SQLite persistence adapter for nao-m-e"
+license = "Apache-2.0"
+repository = "https://github.com/lamentis-os/nao-m-e"
+publish = false
+
+[dependencies]
+getrandom = "0.4.3"
+nao-m-e = { path = "../.." }
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled", "serialize"] }
+tempfile = "3.27.0"
