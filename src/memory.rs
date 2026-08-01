@@ -104,15 +104,14 @@ impl MemoryV0 {
 
     /// Canonicalizes the draft context and appends an immutable episode.
     pub fn insert_episode(&mut self, draft: EpisodeDraft) -> Result<AtomId, MemoryError> {
-        self.debug_assert_parallel_storage();
+        self.debug_assert_storage();
         let sequence = u64::try_from(self.atoms.len()).map_err(|_| MemoryError::IdExhausted)?;
         let id = AtomId::from_parts(self.memory_id, sequence);
         let atom = EpisodeAtom::from_draft(id, draft);
 
         self.atoms.push(atom);
         self.activations.push(Activation::ZERO);
-        self.transition_numerators.push(0);
-        self.debug_assert_parallel_storage();
+        self.debug_assert_storage();
         Ok(id)
     }
 
@@ -238,7 +237,8 @@ impl MemoryV0 {
     ///
     /// Retention and incoming influence share one rounding operation per atom.
     pub fn step(&mut self) {
-        self.debug_assert_parallel_storage();
+        self.debug_assert_storage();
+        self.transition_numerators.resize(self.activations.len(), 0);
         for (index, &activation) in self.activations.iter().enumerate() {
             self.transition_numerators[index] =
                 u64::from(activation.as_ppm()) * u64::from(RETENTION_PPM) * u64::from(SCALE);
@@ -266,7 +266,7 @@ impl MemoryV0 {
                 u32::try_from(next).expect("transition activation is bounded by SCALE"),
             );
         }
-        self.debug_assert_parallel_storage();
+        self.debug_assert_storage();
     }
 
     /// Returns at most `limit` non-zero activations, highest first.
@@ -339,9 +339,9 @@ impl MemoryV0 {
         self.local_index(id).ok_or(GraphError::UnknownAtom(id))
     }
 
-    fn debug_assert_parallel_storage(&self) {
+    fn debug_assert_storage(&self) {
         debug_assert_eq!(self.activations.len(), self.atoms.len());
-        debug_assert_eq!(self.transition_numerators.len(), self.atoms.len());
+        debug_assert!(self.transition_numerators.len() <= self.atoms.len());
     }
 }
 
