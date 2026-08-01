@@ -222,10 +222,7 @@ fn load_memory(connection: &mut Connection) -> Result<(MemoryV0, usize, i64), St
     let (memory_id, revision) = read_metadata(&transaction)?;
     verify_quick_check(&transaction)?;
     verify_foreign_keys(&transaction)?;
-    let episode_rows = read_episodes(&transaction)?;
-    let mut statement_rows = read_statements(&transaction)?;
-    attach_terms(&transaction, &mut statement_rows)?;
-    let mut memory = reconstruct_memory(memory_id, episode_rows, statement_rows)?;
+    let mut memory = reconstruct_memory(&transaction, memory_id)?;
     restore_activations(&transaction, &mut memory)?;
     restore_relevance(&transaction, &mut memory)?;
     let episode_count = memory.episodes().len();
@@ -333,37 +330,27 @@ struct EpisodeRow {
     source: SourceId,
 }
 
-fn read_episodes(connection: &Connection) -> Result<Vec<EpisodeRow>, StoreError> {
-    let mut statement = connection.prepare(
-        "SELECT sequence, occurred_at_ms, recorded_at_ms, source_id
-         FROM episodes
-         ORDER BY sequence",
-    )?;
-    let mut rows = statement.query([])?;
-    let mut episodes = Vec::new();
-    let mut expected = 0_u64;
-    while let Some(row) = rows.next()? {
-        let sequence = read_u64(row, 0, "episodes", "sequence")?;
-        if sequence != expected {
-            return Err(StoreIntegrityError::NonContiguousEpisodeSequence {
-                expected,
-                found: sequence,
-            }
-            .into());
+fn read_next_episode(
+    rows: &mut rusqlite::Rows<'_>,
+    expected: u64,
+) -> Result<Option<EpisodeRow>, StoreError> {
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let sequence = read_u64(row, 0, "episodes", "sequence")?;
+    if sequence != expected {
+        return Err(StoreIntegrityError::NonContiguousEpisodeSequence {
+            expected,
+            found: sequence,
         }
-        episodes.push(EpisodeRow {
-            sequence,
-            occurred_at: TimestampMs::new(read_integer(row, 1, "episodes", "occurred_at_ms")?),
-            recorded_at: TimestampMs::new(read_integer(row, 2, "episodes", "recorded_at_ms")?),
-            source: SourceId::new(read_u64(row, 3, "episodes", "source_id")?),
-        });
-        expected = expected
-            .checked_add(1)
-            .ok_or(StoreIntegrityError::InvalidMetadata {
-                detail: "episode sequence space is exhausted",
-            })?;
+        .into());
     }
-    Ok(episodes)
+    Ok(Some(EpisodeRow {
+        sequence,
+        occurred_at: TimestampMs::new(read_integer(row, 1, "episodes", "occurred_at_ms")?),
+        recorded_at: TimestampMs::new(read_integer(row, 2, "episodes", "recorded_at_ms")?),
+        source: SourceId::new(read_u64(row, 3, "episodes", "source_id")?),
+    }))
 }
 
 #[derive(Debug)]
@@ -371,57 +358,7 @@ struct StoredStatement {
     episode_sequence: u64,
     role: i64,
     ordinal: u64,
-    predicate: PredicateId,
-    arguments: Vec<TermId>,
-}
-
-impl StoredStatement {
-    const fn key(&self) -> (u64, i64, u64) {
-        (self.episode_sequence, self.role, self.ordinal)
-    }
-}
-
-fn read_statements(connection: &Connection) -> Result<Vec<StoredStatement>, StoreError> {
-    let mut statement = connection.prepare(
-        "SELECT episode_sequence, role, statement_ordinal, predicate_id
-         FROM episode_statements
-         ORDER BY episode_sequence, role, statement_ordinal",
-    )?;
-    let mut rows = statement.query([])?;
-    let mut statements = Vec::new();
-    while let Some(row) = rows.next()? {
-        let episode_sequence = read_u64(row, 0, "episode_statements", "episode_sequence")?;
-        let role = read_integer(row, 1, "episode_statements", "role")?;
-        let ordinal = read_non_negative_u64(
-            row,
-            2,
-            "episode_statements",
-            "statement_ordinal",
-            episode_sequence,
-        )?;
-        if !(ROLE_CONTEXT..=ROLE_OUTCOME).contains(&role) {
-            return Err(StoreIntegrityError::InvalidEpisode {
-                sequence: episode_sequence,
-                detail: "unknown statement role",
-            }
-            .into());
-        }
-        if role != ROLE_CONTEXT && ordinal != 0 {
-            return Err(StoreIntegrityError::InvalidEpisode {
-                sequence: episode_sequence,
-                detail: "singleton statement role has a non-zero ordinal",
-            }
-            .into());
-        }
-        statements.push(StoredStatement {
-            episode_sequence,
-            role,
-            ordinal,
-            predicate: PredicateId::new(read_u64(row, 3, "episode_statements", "predicate_id")?),
-            arguments: Vec::new(),
-        });
-    }
-    Ok(statements)
+    value: Statement,
 }
 
 #[derive(Debug)]
@@ -465,87 +402,132 @@ fn read_next_term(rows: &mut rusqlite::Rows<'_>) -> Result<Option<TermRow>, Stor
     }))
 }
 
-fn attach_terms(
+fn read_next_statement(
+    statement_rows: &mut rusqlite::Rows<'_>,
+    term_rows: &mut rusqlite::Rows<'_>,
+    next_term: &mut Option<TermRow>,
+) -> Result<Option<StoredStatement>, StoreError> {
+    let Some(row) = statement_rows.next()? else {
+        return Ok(None);
+    };
+    let episode_sequence = read_u64(row, 0, "episode_statements", "episode_sequence")?;
+    let role = read_integer(row, 1, "episode_statements", "role")?;
+    let ordinal = read_non_negative_u64(
+        row,
+        2,
+        "episode_statements",
+        "statement_ordinal",
+        episode_sequence,
+    )?;
+    if !(ROLE_CONTEXT..=ROLE_OUTCOME).contains(&role) {
+        return Err(StoreIntegrityError::InvalidEpisode {
+            sequence: episode_sequence,
+            detail: "unknown statement role",
+        }
+        .into());
+    }
+    if role != ROLE_CONTEXT && ordinal != 0 {
+        return Err(StoreIntegrityError::InvalidEpisode {
+            sequence: episode_sequence,
+            detail: "singleton statement role has a non-zero ordinal",
+        }
+        .into());
+    }
+    let predicate = PredicateId::new(read_u64(row, 3, "episode_statements", "predicate_id")?);
+    let statement_key = (episode_sequence, role, ordinal);
+    let mut arguments = Vec::new();
+    let mut expected_ordinal = 0_u64;
+    while next_term
+        .as_ref()
+        .is_some_and(|term| term.statement_key() == statement_key)
+    {
+        let term = next_term
+            .take()
+            .expect("a matching term was checked before extraction");
+        if term.term_ordinal != expected_ordinal {
+            return Err(StoreIntegrityError::InvalidEpisode {
+                sequence: episode_sequence,
+                detail: "term ordinals are not contiguous",
+            }
+            .into());
+        }
+        arguments.push(term.term);
+        expected_ordinal =
+            expected_ordinal
+                .checked_add(1)
+                .ok_or(StoreIntegrityError::InvalidEpisode {
+                    sequence: episode_sequence,
+                    detail: "term ordinal space is exhausted",
+                })?;
+        *next_term = read_next_term(term_rows)?;
+    }
+    if arguments.is_empty() {
+        return Err(StoreIntegrityError::InvalidEpisode {
+            sequence: episode_sequence,
+            detail: "statement has no terms",
+        }
+        .into());
+    }
+    let value =
+        Statement::new(predicate, arguments).map_err(|_| StoreIntegrityError::InvalidEpisode {
+            sequence: episode_sequence,
+            detail: "statement has no terms",
+        })?;
+    Ok(Some(StoredStatement {
+        episode_sequence,
+        role,
+        ordinal,
+        value,
+    }))
+}
+
+fn reconstruct_memory(
     connection: &Connection,
-    statements: &mut [StoredStatement],
-) -> Result<(), StoreError> {
-    let mut query = connection.prepare(
+    memory_id: MemoryId,
+) -> Result<MemoryV0, StoreError> {
+    let mut episode_query = connection.prepare(
+        "SELECT sequence, occurred_at_ms, recorded_at_ms, source_id
+         FROM episodes
+         ORDER BY sequence",
+    )?;
+    let mut statement_query = connection.prepare(
+        "SELECT episode_sequence, role, statement_ordinal, predicate_id
+         FROM episode_statements
+         ORDER BY episode_sequence, role, statement_ordinal",
+    )?;
+    let mut term_query = connection.prepare(
         "SELECT episode_sequence, role, statement_ordinal, term_ordinal, term_id
          FROM statement_terms
          ORDER BY episode_sequence, role, statement_ordinal, term_ordinal",
     )?;
-    let mut rows = query.query([])?;
-    let mut next_term = read_next_term(&mut rows)?;
-
-    for statement in statements {
-        let mut expected_ordinal = 0_u64;
-        while next_term
-            .as_ref()
-            .is_some_and(|term| term.statement_key() == statement.key())
-        {
-            let term = next_term
-                .take()
-                .expect("a matching term was checked before extraction");
-            if term.term_ordinal != expected_ordinal {
-                return Err(StoreIntegrityError::InvalidEpisode {
-                    sequence: statement.episode_sequence,
-                    detail: "term ordinals are not contiguous",
-                }
-                .into());
-            }
-            statement.arguments.push(term.term);
-            expected_ordinal =
-                expected_ordinal
-                    .checked_add(1)
-                    .ok_or(StoreIntegrityError::InvalidEpisode {
-                        sequence: statement.episode_sequence,
-                        detail: "term ordinal space is exhausted",
-                    })?;
-            next_term = read_next_term(&mut rows)?;
-        }
-        if statement.arguments.is_empty() {
-            return Err(StoreIntegrityError::InvalidEpisode {
-                sequence: statement.episode_sequence,
-                detail: "statement has no terms",
-            }
-            .into());
-        }
-    }
-    if let Some(term) = next_term {
-        return Err(StoreIntegrityError::InvalidEpisode {
-            sequence: term.episode_sequence,
-            detail: "term references an absent statement",
-        }
-        .into());
-    }
-    Ok(())
-}
-
-fn reconstruct_memory(
-    memory_id: MemoryId,
-    episodes: Vec<EpisodeRow>,
-    statements: Vec<StoredStatement>,
-) -> Result<MemoryV0, StoreError> {
-    let mut statements = statements.into_iter().peekable();
+    let mut episode_rows = episode_query.query([])?;
+    let mut statement_rows = statement_query.query([])?;
+    let mut term_rows = term_query.query([])?;
+    let mut next_term = read_next_term(&mut term_rows)?;
+    let mut next_statement =
+        read_next_statement(&mut statement_rows, &mut term_rows, &mut next_term)?;
     let mut memory = MemoryV0::new(memory_id);
-    for episode in episodes {
+    let mut expected_sequence = 0_u64;
+    while let Some(episode) = read_next_episode(&mut episode_rows, expected_sequence)? {
+        expected_sequence =
+            expected_sequence
+                .checked_add(1)
+                .ok_or(StoreIntegrityError::InvalidMetadata {
+                    detail: "episode sequence space is exhausted",
+                })?;
         let mut context = Vec::new();
         let mut observation = None;
         let mut action = None;
         let mut outcome = None;
         let mut next_context_ordinal = 0_u64;
 
-        while statements
-            .peek()
+        while next_statement
+            .as_ref()
             .is_some_and(|statement| statement.episode_sequence == episode.sequence)
         {
-            let statement = statements.next().expect("peeked statement exists");
-            let value = Statement::new(statement.predicate, statement.arguments).map_err(|_| {
-                StoreIntegrityError::InvalidEpisode {
-                    sequence: episode.sequence,
-                    detail: "statement has no terms",
-                }
-            })?;
+            let statement = next_statement
+                .take()
+                .expect("a matching statement was checked before extraction");
             match statement.role {
                 ROLE_CONTEXT => {
                     if statement.ordinal != next_context_ordinal {
@@ -556,22 +538,30 @@ fn reconstruct_memory(
                         .into());
                     }
                     next_context_ordinal += 1;
-                    context.push(value);
+                    context.push(statement.value);
                 }
                 ROLE_OBSERVATION => set_singleton(
                     &mut observation,
-                    value,
+                    statement.value,
                     episode.sequence,
                     "multiple observations",
                 )?,
-                ROLE_ACTION => {
-                    set_singleton(&mut action, value, episode.sequence, "multiple actions")?
-                }
-                ROLE_OUTCOME => {
-                    set_singleton(&mut outcome, value, episode.sequence, "multiple outcomes")?
-                }
+                ROLE_ACTION => set_singleton(
+                    &mut action,
+                    statement.value,
+                    episode.sequence,
+                    "multiple actions",
+                )?,
+                ROLE_OUTCOME => set_singleton(
+                    &mut outcome,
+                    statement.value,
+                    episode.sequence,
+                    "multiple outcomes",
+                )?,
                 _ => unreachable!("statement roles were validated while reading"),
             }
+            next_statement =
+                read_next_statement(&mut statement_rows, &mut term_rows, &mut next_term)?;
         }
 
         if context.windows(2).any(|pair| pair[0] >= pair[1]) {
@@ -609,10 +599,17 @@ fn reconstruct_memory(
             .into());
         }
     }
-    if let Some(statement) = statements.next() {
+    if let Some(statement) = next_statement {
         return Err(StoreIntegrityError::InvalidEpisode {
             sequence: statement.episode_sequence,
             detail: "statement references an absent episode",
+        }
+        .into());
+    }
+    if let Some(term) = next_term {
+        return Err(StoreIntegrityError::InvalidEpisode {
+            sequence: term.episode_sequence,
+            detail: "term references an absent statement",
         }
         .into());
     }
@@ -1449,6 +1446,33 @@ mod tests {
             StoreIntegrityError::InvalidEpisode {
                 sequence: 2,
                 detail: "observation is missing"
+            }
+        ));
+    }
+
+    #[test]
+    fn late_term_corruption_discards_streamed_reconstruction() {
+        let directory = tempdir().expect("temporary directory is available");
+        let path = saved_store(&directory, 3);
+        let two = codec::encode_u64(2);
+        let connection = Connection::open(&path).expect("fixture database opens");
+        connection
+            .execute(
+                "UPDATE statement_terms
+                 SET term_ordinal = 2
+                 WHERE episode_sequence = ?1
+                   AND role = 1
+                   AND term_ordinal = 1",
+                [two.as_slice()],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            integrity_error(&path),
+            StoreIntegrityError::InvalidEpisode {
+                sequence: 2,
+                detail: "term ordinals are not contiguous"
             }
         ));
     }
