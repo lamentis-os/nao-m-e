@@ -72,9 +72,9 @@ struct OutgoingRelevance {
 
 /// Append-only atom storage with mutable activation and sparse relevance edges.
 ///
-/// A memory identifier denotes exactly one logical, exclusively written memory.
-/// Passing an atom identifier from another logical memory is rejected instead
-/// of aliasing a local atom.
+/// Each memory ID must name one exclusively written logical memory. Reopening
+/// requires reconstructing its complete atom sequence before appending. Atom
+/// identifiers from another memory are rejected rather than aliased.
 pub struct MemoryV0 {
     memory_id: MemoryId,
     atoms: Vec<EpisodeAtom>,
@@ -84,11 +84,7 @@ pub struct MemoryV0 {
 }
 
 impl MemoryV0 {
-    /// Creates an empty memory with a caller-owned durable identifier.
-    ///
-    /// The caller must reuse `memory_id` only when reopening the same logical
-    /// memory, reconstruct its complete atom sequence before appending, and
-    /// must not independently write divergent copies under one ID.
+    /// Creates an empty memory with the caller-owned durable identifier.
     #[must_use]
     pub fn new(memory_id: MemoryId) -> Self {
         Self {

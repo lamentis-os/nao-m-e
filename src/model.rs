@@ -31,12 +31,10 @@ macro_rules! unsigned_id {
     };
 }
 
-/// Identifies one logical memory independently of a process lifetime.
+/// Non-zero 128-bit identifier for one logical memory.
 ///
-/// The caller owns allocation and must persist and reuse this value when the
-/// same logical memory is reopened. The all-zero value is reserved as invalid.
-/// Persist the value through [`MemoryId::to_be_bytes`]. [`fmt::Display`] renders
-/// exactly 32 lowercase hexadecimal digits for diagnostics only.
+/// Persist its canonical bytes. [`fmt::Display`] emits exactly 32 lowercase
+/// hexadecimal digits for diagnostics only.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct MemoryId {
     high: u64,
@@ -79,20 +77,17 @@ impl fmt::Display for MemoryId {
     }
 }
 
-/// Identifies an atom within one logical memory.
+/// Durable atom reference composed of a memory ID and insertion sequence.
 ///
-/// The identifier is a durable reference composed of the owning memory and a
-/// monotonic insertion sequence. Its diagnostic display joins the fixed-width
-/// memory display and decimal sequence with a colon. It is not a permission or
-/// a content hash.
+/// [`fmt::Display`] joins the memory ID and decimal sequence with a colon for
+/// diagnostics only. The ID is a reference, not a permission or content hash.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AtomId {
     memory_id: MemoryId,
     sequence: u64,
 }
 
-// IDs are stored per atom and copied into recall and edge results. Keep their
-// composite layout free of padding without promising a stable Rust ABI.
+// Keep frequently copied IDs padding-free without promising a stable Rust ABI.
 const _: () = {
     assert!(std::mem::size_of::<MemoryId>() == 2 * std::mem::size_of::<u64>());
     assert!(std::mem::align_of::<MemoryId>() <= std::mem::align_of::<u64>());
@@ -103,10 +98,7 @@ const _: () = {
 };
 
 impl AtomId {
-    /// Constructs an atom identifier from its durable components.
-    ///
-    /// Construction does not prove that the referenced atom exists in a
-    /// particular [`crate::MemoryV0`]. Memory accessors validate membership.
+    /// Constructs an identifier without checking that the atom exists.
     #[must_use]
     pub const fn from_parts(memory_id: MemoryId, sequence: u64) -> Self {
         Self {
