@@ -1212,6 +1212,8 @@ mod tests {
         SequenceGap,
         MissingObservation,
         EmptyStatement,
+        InvalidRole,
+        ContextOrdinalGap,
         TermGap,
         NonCanonicalContext,
         MissingActivation,
@@ -1226,6 +1228,8 @@ mod tests {
             StateCorruption::SequenceGap,
             StateCorruption::MissingObservation,
             StateCorruption::EmptyStatement,
+            StateCorruption::InvalidRole,
+            StateCorruption::ContextOrdinalGap,
             StateCorruption::TermGap,
             StateCorruption::NonCanonicalContext,
             StateCorruption::MissingActivation,
@@ -1288,6 +1292,55 @@ mod tests {
                         .execute(
                             "DELETE FROM statement_terms
                              WHERE episode_sequence = ?1 AND role = 1",
+                            [zero.as_slice()],
+                        )
+                        .unwrap();
+                }
+                StateCorruption::InvalidRole => {
+                    connection
+                        .pragma_update(None, "foreign_keys", false)
+                        .unwrap();
+                    connection
+                        .pragma_update(None, "ignore_check_constraints", true)
+                        .unwrap();
+                    connection
+                        .execute(
+                            "UPDATE statement_terms
+                             SET role = 4
+                             WHERE episode_sequence = ?1 AND role = 1",
+                            [zero.as_slice()],
+                        )
+                        .unwrap();
+                    connection
+                        .execute(
+                            "UPDATE episode_statements
+                             SET role = 4
+                             WHERE episode_sequence = ?1 AND role = 1",
+                            [zero.as_slice()],
+                        )
+                        .unwrap();
+                }
+                StateCorruption::ContextOrdinalGap => {
+                    connection
+                        .pragma_update(None, "foreign_keys", false)
+                        .unwrap();
+                    connection
+                        .execute(
+                            "UPDATE statement_terms
+                             SET statement_ordinal = 2
+                             WHERE episode_sequence = ?1
+                               AND role = 0
+                               AND statement_ordinal = 1",
+                            [zero.as_slice()],
+                        )
+                        .unwrap();
+                    connection
+                        .execute(
+                            "UPDATE episode_statements
+                             SET statement_ordinal = 2
+                             WHERE episode_sequence = ?1
+                               AND role = 0
+                               AND statement_ordinal = 1",
                             [zero.as_slice()],
                         )
                         .unwrap();
@@ -1386,6 +1439,16 @@ mod tests {
                     StoreIntegrityError::InvalidEpisode {
                         sequence: 0,
                         detail: "statement has no terms"
+                    }
+                ),
+                StateCorruption::InvalidRole => {
+                    matches!(error, StoreIntegrityError::QuickCheckFailed { .. })
+                }
+                StateCorruption::ContextOrdinalGap => matches!(
+                    error,
+                    StoreIntegrityError::InvalidEpisode {
+                        sequence: 0,
+                        detail: "context ordinals are not contiguous"
                     }
                 ),
                 StateCorruption::MissingObservation
