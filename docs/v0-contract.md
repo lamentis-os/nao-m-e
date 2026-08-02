@@ -203,4 +203,4 @@ coordination. It also performs no free-text processing, embedding or LLM calls,
 or autonomous relevance learning. Relevance changes only through explicit graph
 mutation or caller-supplied feedback. Persistence adapters remain outside the
 kernel; the format and lifecycle of the optional SQLite adapter are specified
-separately in the [SQLite V1 contract](sqlite-v1-contract.md).
+separately in the [SQLite V2 contract](sqlite-v2-contract.md).

@@ -11,7 +11,7 @@ pub enum StoreError {
     Database(rusqlite::Error),
     /// Operating-system entropy was unavailable while allocating a memory ID.
     Entropy(getrandom::Error),
-    /// Persisted data did not satisfy the SQLite V1 contract.
+    /// Persisted data did not satisfy the SQLite V2 contract.
     InvalidStore(StoreIntegrityError),
     /// Another store session committed after this session was opened or saved.
     ConcurrentModification {
@@ -135,7 +135,7 @@ pub enum StoreIntegrityError {
         /// Violated episode invariant.
         detail: &'static str,
     },
-    /// An activation row is missing or invalid.
+    /// A persisted positive activation is invalid.
     InvalidActivation {
         /// Sequence of the affected episode.
         sequence: u64,

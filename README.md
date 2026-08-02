@@ -169,9 +169,8 @@ CLI protocol V2 supports `insert_episode`, `set_relevance`,
 `--input -`. Later batches can refer to already persisted atoms as
 `{ "sequence": 0 }`; labels exist only within the batch that defines them. A
 successful batch is saved once as a complete snapshot. If parsing, an
-operation, validation, or saving fails, none of that batch is persisted. V1
-scenario documents are rejected; this does not change the SQLite V1 snapshot
-format, so existing databases require no migration.
+operation, validation, or saving fails, none of that batch is persisted.
+Scenario documents whose `schema_version` is not `2` are rejected.
 
 Recall from the failure episode. The default limit is ten:
 
@@ -235,14 +234,17 @@ relevance again. Exit code `2` denotes invalid CLI syntax, while input, model,
 graph, store, and output errors use exit code `1`.
 
 Scenario input and data-command responses are strict, versioned JSON.
-`schema_version` identifies the CLI protocol, not the SQLite format. Predicate,
-term, source, and time values are caller-owned numeric symbols; the CLI does not
-interpret text, assign symbols, deduplicate episodes, or provide embeddings.
-`run` and `recall` each load the complete snapshot. The current adapter opens
-that snapshot read-write, so `recall` requires write access even though it never
-saves. Simultaneous writers are rejected rather than merged. Stateful
-activation, global activation ranking, and direct episode inspection remain
-available through the Rust APIs but are intentionally absent from CLI V2.
+`schema_version = 2` identifies the CLI protocol; SQLite `format_version = 2`
+identifies the database format. The equal numbers do not couple the two
+protocols. The adapter rejects every other persisted format version, including
+`format_version = 1`, and performs no migration. Predicate, term, source, and
+time values are caller-owned numeric symbols; the CLI does not interpret text,
+assign symbols, deduplicate episodes, or provide embeddings. `run` and `recall`
+each load the complete snapshot. The current adapter opens that snapshot
+read-write, so `recall` requires write access even though it never saves.
+Simultaneous writers are rejected rather than merged. Stateful activation,
+global activation ranking, and direct episode inspection remain available
+through the Rust APIs but are intentionally absent from CLI V2.
 
 ## Boundaries
 
@@ -254,7 +256,7 @@ embeddings, and it makes no LLM calls. Relevance controls accessibility; it
 does not establish truth or confidence.
 
 See the [V0 core contract](docs/v0-contract.md) and the
-[SQLite V1 contract](docs/sqlite-v1-contract.md) for exact semantics. Generate
+[SQLite V2 contract](docs/sqlite-v2-contract.md) for exact semantics. Generate
 local API documentation with
 `cargo doc --workspace --no-deps --all-features --locked --open`.
 
