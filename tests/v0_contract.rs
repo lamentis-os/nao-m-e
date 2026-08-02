@@ -530,59 +530,57 @@ fn learned_shortcut_changes_the_next_step_by_the_existing_formula() {
 
 #[test]
 fn positive_feedback_funds_exactly_with_carried_remainders() {
-    fn prepared_memory() -> (MemoryV0, [AtomId; 5]) {
-        let mut memory = new_memory(1);
-        let source = insert(&mut memory, 1);
-        let first = insert(&mut memory, 2);
-        let second = insert(&mut memory, 3);
-        let non_target_a = insert(&mut memory, 4);
-        let non_target_b = insert(&mut memory, 5);
-        memory
-            .set_relevance(source, first, weight(100_000))
-            .expect("first target fits");
-        memory
-            .set_relevance(source, second, weight(200_000))
-            .expect("second target fits");
-        memory
-            .set_relevance(source, non_target_a, weight(400_000))
-            .expect("first non-target fits");
-        memory
-            .set_relevance(source, non_target_b, weight(300_000))
-            .expect("second non-target fits");
-        (memory, [source, first, second, non_target_a, non_target_b])
-    }
+    let mut memory = new_memory(1);
+    let source = insert(&mut memory, 1);
+    let missing_before = insert(&mut memory, 2);
+    let non_target_a = insert(&mut memory, 3);
+    let existing_target = insert(&mut memory, 4);
+    let missing_between = insert(&mut memory, 5);
+    let non_target_b = insert(&mut memory, 6);
+    let missing_after = insert(&mut memory, 7);
+    memory
+        .set_relevance(source, non_target_a, weight(400_001))
+        .expect("first non-target fits");
+    memory
+        .set_relevance(source, existing_target, weight(100_000))
+        .expect("existing target fits");
+    memory
+        .set_relevance(source, non_target_b, weight(499_999))
+        .expect("second non-target fills the budget");
 
-    let (mut forward, [source, first, second, non_target_a, non_target_b]) = prepared_memory();
-    let (mut reordered, reordered_ids) = prepared_memory();
-    forward
-        .apply_feedback(source, &[second, first], true)
-        .expect("known feedback targets");
-    reordered
+    memory
         .apply_feedback(
-            reordered_ids[0],
+            source,
             &[
-                reordered_ids[1],
-                reordered_ids[0],
-                reordered_ids[2],
-                reordered_ids[1],
+                missing_after,
+                existing_target,
+                missing_before,
+                missing_between,
+                existing_target,
+                source,
+                missing_after,
             ],
             true,
         )
-        .expect("rank and duplicates do not matter");
+        .expect("target order and duplicates do not matter");
 
-    assert_eq!(relevance_snapshot(&forward), relevance_snapshot(&reordered));
-    assert_eq!(forward.relevance(source, first), Some(weight(101_000)));
-    assert_eq!(forward.relevance(source, second), Some(weight(201_000)));
     assert_eq!(
-        forward.relevance(source, non_target_a),
-        Some(weight(398_858))
+        memory.relevance(source, non_target_a),
+        Some(weight(398_224))
     );
     assert_eq!(
-        forward.relevance(source, non_target_b),
-        Some(weight(299_142))
+        memory.relevance(source, existing_target),
+        Some(weight(101_000))
     );
     assert_eq!(
-        forward
+        memory.relevance(source, non_target_b),
+        Some(weight(497_776))
+    );
+    for target in [missing_before, missing_between, missing_after] {
+        assert_eq!(memory.relevance(source, target), Some(weight(1_000)));
+    }
+    assert_eq!(
+        memory
             .relevance_edges()
             .filter(|edge| edge.from() == source)
             .map(|edge| edge.weight().as_ppm())

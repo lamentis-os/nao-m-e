@@ -294,8 +294,17 @@ impl MemoryV0 {
                 let non_target_total = current_total - target_total;
                 let mut remainder = 0_u64;
                 let mut distributed_reduction = 0_u64;
+                let mut target_cursor = 0;
                 outgoing.targets.retain(|target_index, weight| {
-                    if target_indices.binary_search(target_index).is_ok() {
+                    // `BTreeMap::retain` and `target_indices` both visit ascending keys.
+                    while target_indices
+                        .get(target_cursor)
+                        .is_some_and(|target| target < target_index)
+                    {
+                        target_cursor += 1;
+                    }
+                    if target_indices.get(target_cursor) == Some(target_index) {
+                        target_cursor += 1;
                         return true;
                     }
 
