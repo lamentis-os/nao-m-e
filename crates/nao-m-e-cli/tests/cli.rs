@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use nao_m_e::{Activation, AtomId, InfluenceWeight, MAX_FEEDBACK_TARGETS};
+use nao_m_e::{AtomId, InfluenceWeight, MAX_FEEDBACK_TARGETS};
 use nao_m_e_sqlite::SqliteStore;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -364,7 +364,7 @@ fn source_recall_rejects_an_unknown_source_without_success_output() {
 }
 
 #[test]
-fn source_recall_ignores_stored_activation_and_does_not_advance_the_revision() {
+fn source_recall_does_not_mutate_state_or_advance_the_revision() {
     let directory = TempDir::new().expect("temporary directory");
     let database = directory.path().join("memory.sqlite3");
     init(&database);
@@ -388,11 +388,7 @@ fn source_recall_ignores_stored_activation_and_does_not_advance_the_revision() {
         .memory_mut()
         .set_relevance(source, direct, InfluenceWeight::from_ppm(600_000).unwrap())
         .unwrap();
-    writer
-        .memory_mut()
-        .stimulate(ambient, Activation::ONE)
-        .unwrap();
-    writer.save().expect("ambient activation is persisted");
+    writer.save().expect("initial relevance is persisted");
 
     let recall = assert_success(recall_source(&database, 0, None));
     assert_eq!(recall["hits"].as_array().unwrap().len(), 1);
@@ -1047,7 +1043,6 @@ fn maximum_weight_produces_the_exact_source_recall_score() {
         store.memory().relevance(from, to).unwrap().as_ppm(),
         1000000
     );
-    assert_eq!(store.memory().activation(from).unwrap().as_ppm(), 0);
 }
 
 #[test]

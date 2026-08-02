@@ -11,7 +11,7 @@ pub enum StoreError {
     Database(rusqlite::Error),
     /// Operating-system entropy was unavailable while allocating a memory ID.
     Entropy(getrandom::Error),
-    /// Persisted data did not satisfy the SQLite V1 contract.
+    /// Persisted data did not satisfy the SQLite V2 contract.
     InvalidStore(StoreIntegrityError),
     /// Another store session committed after this session was opened or saved.
     ConcurrentModification {
@@ -102,11 +102,6 @@ pub enum StoreIntegrityError {
         /// Diagnostic returned by SQLite.
         detail: String,
     },
-    /// SQLite reported at least one foreign-key violation.
-    ForeignKeyViolation {
-        /// Compact diagnostic identifying the violation.
-        detail: String,
-    },
     /// A column did not contain its canonical fixed-width encoding.
     InvalidEncoding {
         /// Table containing the invalid value.
@@ -133,13 +128,6 @@ pub enum StoreIntegrityError {
         /// Sequence of the affected episode.
         sequence: u64,
         /// Violated episode invariant.
-        detail: &'static str,
-    },
-    /// An activation row is missing or invalid.
-    InvalidActivation {
-        /// Sequence of the affected episode.
-        sequence: u64,
-        /// Violated activation invariant.
         detail: &'static str,
     },
     /// A relevance edge is invalid.
@@ -169,9 +157,6 @@ impl fmt::Display for StoreIntegrityError {
             Self::QuickCheckFailed { detail } => {
                 write!(formatter, "SQLite quick check failed: {detail}")
             }
-            Self::ForeignKeyViolation { detail } => {
-                write!(formatter, "SQLite foreign-key check failed: {detail}")
-            }
             Self::InvalidEncoding { table, column } => {
                 write!(formatter, "invalid encoding in {table}.{column}")
             }
@@ -183,12 +168,6 @@ impl fmt::Display for StoreIntegrityError {
             ),
             Self::InvalidEpisode { sequence, detail } => {
                 write!(formatter, "invalid episode {sequence}: {detail}")
-            }
-            Self::InvalidActivation { sequence, detail } => {
-                write!(
-                    formatter,
-                    "invalid activation for episode {sequence}: {detail}"
-                )
             }
             Self::InvalidRelevance { from, to, detail } => {
                 write!(formatter, "invalid relevance edge {from}->{to}: {detail}")
