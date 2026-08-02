@@ -1,7 +1,8 @@
 use nao_m_e::{
-    Activation, AtomId, EpisodeDraft, FEEDBACK_STEP_PPM, GraphError, InfluenceWeight, MemoryId,
-    MemoryIdError, MemoryV0, ModelError, PROPAGATION_GAIN_PPM, PredicateId, RETENTION_PPM, SCALE,
-    SourceId, Statement, TermId, TimestampMs, ValueError,
+    Activation, AtomId, EpisodeDraft, FEEDBACK_MAX_EVENT_PPM, FEEDBACK_TARGET_STEP_PPM, GraphError,
+    InfluenceWeight, MAX_FEEDBACK_TARGETS, MemoryId, MemoryIdError, MemoryV0, ModelError,
+    PROPAGATION_GAIN_PPM, PredicateId, RETENTION_PPM, SCALE, SourceId, Statement, TermId,
+    TimestampMs, ValueError,
 };
 
 fn memory_id(value: u128) -> MemoryId {
@@ -62,7 +63,9 @@ fn relevance_snapshot(memory: &MemoryV0) -> Vec<(AtomId, AtomId, u32)> {
 
 #[test]
 fn model_constructors_enforce_their_boundaries() {
-    assert_eq!(FEEDBACK_STEP_PPM, 100_000);
+    assert_eq!(FEEDBACK_TARGET_STEP_PPM, 1_000);
+    assert_eq!(FEEDBACK_MAX_EVENT_PPM, 10_000);
+    assert_eq!(MAX_FEEDBACK_TARGETS, 10_000);
     assert_eq!(
         Statement::new(PredicateId::new(1), Vec::new()),
         Err(ModelError::EmptyArguments)
@@ -349,6 +352,54 @@ fn feedback_validates_source_and_every_target_before_mutation() {
 }
 
 #[test]
+fn feedback_target_limit_keeps_the_event_share_positive() {
+    let mut memory = new_memory(1);
+    let source = insert(&mut memory, 1);
+    let targets: Vec<_> = (0..MAX_FEEDBACK_TARGETS)
+        .map(|index| {
+            insert(
+                &mut memory,
+                u64::try_from(index + 2).expect("small target index"),
+            )
+        })
+        .collect();
+
+    memory
+        .apply_feedback(source, &targets, true)
+        .expect("the maximum target count is accepted");
+    assert_eq!(memory.relevance(source, targets[0]), Some(weight(1)));
+    assert_eq!(
+        memory.relevance(source, targets[MAX_FEEDBACK_TARGETS - 1]),
+        Some(weight(1))
+    );
+    assert_eq!(
+        memory
+            .relevance_edges()
+            .map(|edge| edge.weight().as_ppm())
+            .sum::<u32>(),
+        FEEDBACK_MAX_EVENT_PPM
+    );
+
+    let before = relevance_snapshot(&memory);
+    let duplicate = targets[0];
+    let mut too_many = targets;
+    too_many.push(duplicate);
+    assert_eq!(
+        memory.apply_feedback(source, &too_many, false),
+        Err(GraphError::FeedbackTargetLimitExceeded {
+            count: MAX_FEEDBACK_TARGETS + 1,
+            max: MAX_FEEDBACK_TARGETS,
+        })
+    );
+    assert_eq!(relevance_snapshot(&memory), before);
+
+    memory
+        .apply_feedback(source, &too_many[..MAX_FEEDBACK_TARGETS], false)
+        .expect("the maximum target count keeps a non-zero negative share");
+    assert_eq!(memory.relevance_edges().count(), 0);
+}
+
+#[test]
 fn feedback_ignores_self_duplicates_and_empty_effective_lists() {
     let mut memory = new_memory(1);
     let source = insert(&mut memory, 1);
@@ -397,8 +448,8 @@ fn positive_feedback_splits_the_step_and_uses_free_budget_first() {
         .apply_feedback(source, &[second, source, first, second, first], true)
         .expect("known feedback targets");
 
-    assert_eq!(memory.relevance(source, first), Some(weight(150_000)));
-    assert_eq!(memory.relevance(source, second), Some(weight(50_000)));
+    assert_eq!(memory.relevance(source, first), Some(weight(101_000)));
+    assert_eq!(memory.relevance(source, second), Some(weight(1_000)));
     assert_eq!(memory.relevance(source, non_target), Some(weight(800_000)));
     assert_eq!(memory.relevance(source, source), None);
     assert_eq!(
@@ -410,7 +461,7 @@ fn positive_feedback_splits_the_step_and_uses_free_budget_first() {
 }
 
 #[test]
-fn repeated_positive_feedback_awards_at_most_one_step_per_call() {
+fn repeated_positive_feedback_uses_target_step_and_event_budget() {
     let mut memory = new_memory(1);
     let source = insert(&mut memory, 1);
     let targets = [
@@ -439,11 +490,14 @@ fn repeated_positive_feedback_awards_at_most_one_step_per_call() {
             .sum();
 
         assert!(after >= before);
-        assert!(after - before <= FEEDBACK_STEP_PPM);
+        assert_eq!(after - before, 3 * FEEDBACK_TARGET_STEP_PPM);
+        assert!(after - before <= FEEDBACK_MAX_EVENT_PPM);
         if iteration == 0 {
-            assert_eq!(after - before, 99_999);
             for &target in &targets {
-                assert_eq!(memory.relevance(source, target), Some(weight(33_333)));
+                assert_eq!(
+                    memory.relevance(source, target),
+                    Some(weight(FEEDBACK_TARGET_STEP_PPM))
+                );
             }
         }
     }
@@ -463,12 +517,12 @@ fn learned_shortcut_changes_the_next_step_by_the_existing_formula() {
 
     assert_eq!(
         memory.relevance(source, target),
-        Some(weight(FEEDBACK_STEP_PPM))
+        Some(weight(FEEDBACK_TARGET_STEP_PPM))
     );
     memory.step();
     assert_activation(&memory, source, RETENTION_PPM);
     let expected_target = u32::try_from(
-        u64::from(FEEDBACK_STEP_PPM) * u64::from(PROPAGATION_GAIN_PPM) / u64::from(SCALE),
+        u64::from(FEEDBACK_TARGET_STEP_PPM) * u64::from(PROPAGATION_GAIN_PPM) / u64::from(SCALE),
     )
     .expect("one propagated activation fits in ppm");
     assert_activation(&memory, target, expected_target);
@@ -517,15 +571,15 @@ fn positive_feedback_scales_only_non_targets_with_floor_rounding() {
         .expect("rank and duplicates do not matter");
 
     assert_eq!(relevance_snapshot(&forward), relevance_snapshot(&reordered));
-    assert_eq!(forward.relevance(source, first), Some(weight(150_000)));
-    assert_eq!(forward.relevance(source, second), Some(weight(250_000)));
+    assert_eq!(forward.relevance(source, first), Some(weight(101_000)));
+    assert_eq!(forward.relevance(source, second), Some(weight(201_000)));
     assert_eq!(
         forward.relevance(source, non_target_a),
-        Some(weight(342_857))
+        Some(weight(398_857))
     );
     assert_eq!(
         forward.relevance(source, non_target_b),
-        Some(weight(257_142))
+        Some(weight(299_142))
     );
     assert_eq!(
         forward
@@ -548,18 +602,18 @@ fn positive_feedback_caps_award_by_remaining_target_capacity() {
         .set_relevance(source, first, weight(600_000))
         .expect("first target fits");
     memory
-        .set_relevance(source, second, weight(350_000))
+        .set_relevance(source, second, weight(399_000))
         .expect("second target fits");
     memory
-        .set_relevance(source, non_target, weight(50_000))
+        .set_relevance(source, non_target, weight(1_000))
         .expect("non-target fits");
 
     memory
         .apply_feedback(source, &[first, second], true)
         .expect("known feedback targets");
 
-    assert_eq!(memory.relevance(source, first), Some(weight(625_000)));
-    assert_eq!(memory.relevance(source, second), Some(weight(375_000)));
+    assert_eq!(memory.relevance(source, first), Some(weight(600_500)));
+    assert_eq!(memory.relevance(source, second), Some(weight(399_500)));
     assert_eq!(memory.relevance(source, non_target), None);
 }
 
@@ -572,27 +626,27 @@ fn negative_feedback_splits_the_step_drops_zero_and_preserves_non_targets() {
     let non_target = insert(&mut memory, 4);
     let missing_target = insert(&mut memory, 5);
     memory
-        .set_relevance(source, first, weight(70_000))
+        .set_relevance(source, first, weight(1_500))
         .expect("first target fits");
     memory
-        .set_relevance(source, second, weight(20_000))
+        .set_relevance(source, second, weight(500))
         .expect("second target fits");
     memory
-        .set_relevance(source, non_target, weight(910_000))
+        .set_relevance(source, non_target, weight(998_000))
         .expect("non-target fits");
 
     memory
         .apply_feedback(source, &[second, source, first, first], false)
         .expect("known feedback targets");
 
-    assert_eq!(memory.relevance(source, first), Some(weight(20_000)));
+    assert_eq!(memory.relevance(source, first), Some(weight(500)));
     assert_eq!(memory.relevance(source, second), None);
-    assert_eq!(memory.relevance(source, non_target), Some(weight(910_000)));
+    assert_eq!(memory.relevance(source, non_target), Some(weight(998_000)));
     memory
         .apply_feedback(source, &[first], false)
         .expect("remaining target can reach zero");
     assert_eq!(memory.relevance(source, first), None);
-    assert_eq!(memory.relevance(source, non_target), Some(weight(910_000)));
+    assert_eq!(memory.relevance(source, non_target), Some(weight(998_000)));
     let before_missing = relevance_snapshot(&memory);
     memory
         .apply_feedback(source, &[missing_target], false)

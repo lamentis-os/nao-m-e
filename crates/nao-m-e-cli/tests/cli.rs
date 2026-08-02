@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use nao_m_e::AtomId;
+use nao_m_e::{AtomId, MAX_FEEDBACK_TARGETS};
 use nao_m_e_sqlite::SqliteStore;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -392,21 +392,21 @@ fn feedback_uses_the_explicit_target_list_and_persists_exact_updates() {
             .memory()
             .relevance(source, first)
             .map(|weight| weight.as_ppm()),
-        Some(50_000)
+        Some(1_000)
     );
     assert_eq!(
         store
             .memory()
             .relevance(source, second)
             .map(|weight| weight.as_ppm()),
-        Some(50_000)
+        Some(1_000)
     );
     assert_eq!(
         store
             .memory()
             .relevance(source, existing)
             .map(|weight| weight.as_ppm()),
-        Some(900_000)
+        Some(998_000)
     );
     drop(store);
 
@@ -431,7 +431,7 @@ fn feedback_uses_the_explicit_target_list_and_persists_exact_updates() {
             .memory()
             .relevance(source, existing)
             .map(|weight| weight.as_ppm()),
-        Some(900_000)
+        Some(998_000)
     );
     assert_eq!(store.memory().episodes().len(), 4);
 }
@@ -484,6 +484,55 @@ fn feedback_target_order_produces_the_same_persisted_snapshot() {
     assert_eq!(
         fs::read(&forward).expect("forward snapshot is readable"),
         fs::read(&reversed).expect("reversed snapshot is readable")
+    );
+}
+
+#[test]
+fn feedback_target_limit_accepts_the_boundary_and_rejects_excess() {
+    let directory = TempDir::new().expect("temporary directory");
+    let database = directory.path().join("memory.sqlite3");
+    init(&database);
+    assert_success(run_stdin(
+        &database,
+        &json!({
+            "schema_version": 1,
+            "operations": [insert(None, 1), insert(None, 2)]
+        }),
+    ));
+
+    let target = json!({"sequence": 1});
+    let at_limit = json!({
+        "schema_version": 1,
+        "operations": [{
+            "op": "apply_feedback",
+            "source": {"sequence": 0},
+            "targets": vec![target.clone(); MAX_FEEDBACK_TARGETS],
+            "feedback": 1
+        }]
+    });
+    assert_success(run_stdin(&database, &at_limit));
+
+    let over_limit = json!({
+        "schema_version": 1,
+        "operations": [{
+            "op": "apply_feedback",
+            "source": {"sequence": 0},
+            "targets": vec![target; MAX_FEEDBACK_TARGETS + 1],
+            "feedback": 0
+        }]
+    });
+    let stderr = assert_runtime_failure(run_stdin(&database, &over_limit));
+    assert!(stderr.contains("feedback target count 10001 exceeds 10000"));
+
+    let store = SqliteStore::open(&database).expect("limit failure leaves snapshot valid");
+    let source = AtomId::from_parts(store.memory_id(), 0);
+    let target = AtomId::from_parts(store.memory_id(), 1);
+    assert_eq!(
+        store
+            .memory()
+            .relevance(source, target)
+            .map(|weight| weight.as_ppm()),
+        Some(1_000)
     );
 }
 

@@ -183,8 +183,10 @@ Relevance weights use `1..=1_000_000` ppm, stimulation uses
 `1` is helpful and `0` is unhelpful. The supplied target list is authoritative;
 the CLI does not recompute recall or a top-k set. The core removes source
 self-hits and duplicate targets, then applies the deterministic feedback rule
-documented in the V0 contract. The snapshot stores only the resulting relevance
-graph, not a feedback receipt or provenance record.
+documented in the V0 contract. A feedback event accepts at most 10,000 target
+entries, changes each effective target by at most 1,000 ppm, and changes at most
+10,000 ppm in total. The snapshot stores only the resulting relevance graph, not
+a feedback receipt or provenance record.
 
 Successful `init`, `run`, and `recall` commands write one JSON document to
 standard output; help and version output are plain text. `run` reports the

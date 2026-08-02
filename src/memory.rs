@@ -8,7 +8,8 @@ use crate::model::{
     MemoryId,
 };
 use crate::parameters::{
-    FEEDBACK_STEP_PPM, PROPAGATION_GAIN_PPM, RETENTION_PPM, SCALE, SCALE_CUBED, SCALE_SQUARED,
+    FEEDBACK_MAX_EVENT_PPM, FEEDBACK_TARGET_STEP_PPM, MAX_FEEDBACK_TARGETS, PROPAGATION_GAIN_PPM,
+    RETENTION_PPM, SCALE, SCALE_CUBED, SCALE_SQUARED,
 };
 
 /// A directed positive relevance edge between two atoms.
@@ -222,12 +223,14 @@ impl MemoryV0 {
 
     /// Applies one external binary assessment to a source and recalled targets.
     ///
-    /// Targets are treated as an unordered set: duplicates and the source atom
-    /// are ignored. Positive feedback divides [`crate::FEEDBACK_STEP_PPM`]
-    /// equally across the remaining targets. Free outgoing budget is used first;
-    /// if more is needed, only non-target edges are proportionally reduced. Each
-    /// resulting non-target weight is rounded down. Negative feedback subtracts
-    /// the equal share from each target edge and removes edges that reach zero.
+    /// At most [`crate::MAX_FEEDBACK_TARGETS`] entries are accepted. Targets are
+    /// then treated as an unordered set: duplicates and the source atom are
+    /// ignored. Each effective target changes by at most
+    /// [`crate::FEEDBACK_TARGET_STEP_PPM`], while the total change is bounded by
+    /// [`crate::FEEDBACK_MAX_EVENT_PPM`]. Positive feedback uses free outgoing
+    /// budget first; if more is needed, only non-target edges are proportionally
+    /// reduced. Each resulting non-target weight is rounded down. Negative
+    /// feedback removes edges that reach zero and does not redistribute weight.
     ///
     /// The complete source row is validated and staged before it is replaced.
     /// Episode content and activation are not changed.
@@ -235,7 +238,8 @@ impl MemoryV0 {
     /// # Errors
     ///
     /// Returns [`GraphError::UnknownAtom`] if the source or any target does not
-    /// belong to this memory. Failure leaves all relevance unchanged.
+    /// belong to this memory, or [`GraphError::FeedbackTargetLimitExceeded`] if
+    /// the supplied slice is too long. Failure leaves all relevance unchanged.
     pub fn apply_feedback(
         &mut self,
         source: AtomId,
@@ -243,6 +247,12 @@ impl MemoryV0 {
         helpful: bool,
     ) -> Result<(), GraphError> {
         let source_index = self.require_atom(source)?;
+        if targets.len() > MAX_FEEDBACK_TARGETS {
+            return Err(GraphError::FeedbackTargetLimitExceeded {
+                count: targets.len(),
+                max: MAX_FEEDBACK_TARGETS,
+            });
+        }
         let mut target_indices = Vec::with_capacity(targets.len());
         for &target in targets {
             target_indices.push(self.require_atom(target)?);
@@ -268,7 +278,8 @@ impl MemoryV0 {
                         .and_then(|outgoing| outgoing.targets.get(target_index))
                         .map_or(0, |weight| u64::from(weight.as_ppm()))
             });
-            let per_target = (u64::from(FEEDBACK_STEP_PPM) / target_count)
+            let per_target = u64::from(FEEDBACK_TARGET_STEP_PPM)
+                .min(u64::from(FEEDBACK_MAX_EVENT_PPM) / target_count)
                 .min((u64::from(SCALE) - target_total) / target_count);
             if per_target == 0 {
                 return Ok(());
@@ -316,7 +327,8 @@ impl MemoryV0 {
                 );
             }
         } else {
-            let per_target = u64::from(FEEDBACK_STEP_PPM) / target_count;
+            let per_target = u64::from(FEEDBACK_TARGET_STEP_PPM)
+                .min(u64::from(FEEDBACK_MAX_EVENT_PPM) / target_count);
             if per_target == 0 {
                 return Ok(());
             }

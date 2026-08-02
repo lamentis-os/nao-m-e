@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use nao_m_e::{
-    Activation, AtomId, EpisodeAtom, EpisodeDraft, InfluenceWeight, MemoryId, MemoryV0,
-    PredicateId, SourceId, Statement, TermId, TimestampMs,
+    Activation, AtomId, EpisodeAtom, EpisodeDraft, InfluenceWeight, MAX_FEEDBACK_TARGETS, MemoryId,
+    MemoryV0, PredicateId, SourceId, Statement, TermId, TimestampMs,
 };
 use nao_m_e_sqlite::SqliteStore;
 use serde::{Deserialize, Serialize};
@@ -396,6 +396,12 @@ fn apply_operation(
                 _ => return Err("feedback must be 0 or 1".to_owned()),
             };
             let source = resolve_atom(source, memory, baseline_episode_count, labels)?;
+            if targets.len() > MAX_FEEDBACK_TARGETS {
+                return Err(format!(
+                    "feedback target count {} exceeds {MAX_FEEDBACK_TARGETS}",
+                    targets.len()
+                ));
+            }
             let targets = targets
                 .into_iter()
                 .map(|target| resolve_atom(target, memory, baseline_episode_count, labels))

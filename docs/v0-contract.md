@@ -72,16 +72,19 @@ assessment to the source's outgoing relevance. `helpful = true` is positive
 feedback and `helpful = false` is negative feedback. The kernel accepts the
 assessment as input; it does not infer whether a recall was useful.
 
-The operation first validates the source and every target. Any unknown atom
-rejects the complete operation without mutation. It then sorts and deduplicates
-the targets and removes the source itself. Target input order, rank, duplicates,
-and self-hits therefore have no effect. An empty effective target set is a
-successful no-op.
+The operation first validates the source. A supplied target list longer than
+`MAX_FEEDBACK_TARGETS` is rejected without mutation. Every entry of an accepted
+list is then validated; any unknown atom rejects the complete operation. The
+targets are sorted and deduplicated and the source itself is removed. Target
+input order, rank, duplicates, and self-hits therefore have no effect. An empty
+effective target set is a successful no-op.
 
-The fixed feedback step is:
+The fixed feedback parameters are:
 
 ```text
-FEEDBACK_STEP_PPM = 100,000
+FEEDBACK_TARGET_STEP_PPM = 1,000
+FEEDBACK_MAX_EVENT_PPM = 10,000
+MAX_FEEDBACK_TARGETS = 10,000
 ```
 
 For a non-empty effective target set `T` of size `n`, positive feedback computes:
@@ -89,11 +92,18 @@ For a non-empty effective target set `T` of size `n`, positive feedback computes
 ```text
 target_total = sum(weight[source,target] for target in T)
 per_target = min(
-    floor(FEEDBACK_STEP_PPM / n),
+    FEEDBACK_TARGET_STEP_PPM,
+    floor(FEEDBACK_MAX_EVENT_PPM / n),
     floor((SCALE - target_total) / n)
 )
 total_award = per_target * n
 ```
+
+Thus a normal list of at most ten effective targets changes each target by
+1,000 ppm, while longer lists share at most 10,000 ppm. The entry limit ensures
+that the event-budget share is at least one ppm. Remaining outgoing capacity can
+still make positive feedback a no-op when it cannot fund an equal one-ppm
+increase for every effective target.
 
 The award first consumes unused outgoing budget. If the unused budget is less
 than `total_award`, the deficit is funded by scaling only non-target edges. If
@@ -107,10 +117,10 @@ floor(weight * (non_target_total - needed) / non_target_total)
 Each target weight is then increased by `per_target`. Flooring can leave some
 outgoing budget unused. A zero result is represented by edge absence.
 
-Negative feedback computes `per_target = floor(FEEDBACK_STEP_PPM / n)` and
-replaces each target weight with `max(0, weight - per_target)`. Missing target
-edges and all non-target edges remain unchanged. If `per_target` is zero, either
-feedback value is a no-op.
+Negative feedback computes `per_target = min(FEEDBACK_TARGET_STEP_PPM,
+floor(FEEDBACK_MAX_EVENT_PPM / n))` and replaces each target weight with
+`max(0, weight - per_target)`. Missing target edges and all non-target edges
+remain unchanged.
 
 The complete resulting source row is staged before publication, so feedback is
 atomic. Feedback changes neither immutable episode content nor activation.
