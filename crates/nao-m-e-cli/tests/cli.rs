@@ -437,7 +437,7 @@ fn feedback_uses_the_explicit_target_list_and_persists_exact_updates() {
 }
 
 #[test]
-fn feedback_target_order_produces_the_same_persisted_snapshot() {
+fn feedback_target_order_produces_the_same_relevance_graph() {
     let directory = TempDir::new().expect("temporary directory");
     let base = directory.path().join("base.sqlite3");
     let forward = directory.path().join("forward.sqlite3");
@@ -481,9 +481,11 @@ fn feedback_target_order_produces_the_same_persisted_snapshot() {
     assert_success(run_stdin(&forward, &feedback([1, 2])));
     assert_success(run_stdin(&reversed, &feedback([2, 1])));
 
+    let forward = SqliteStore::open(&forward).expect("forward snapshot reopens");
+    let reversed = SqliteStore::open(&reversed).expect("reversed snapshot reopens");
     assert_eq!(
-        fs::read(&forward).expect("forward snapshot is readable"),
-        fs::read(&reversed).expect("reversed snapshot is readable")
+        forward.memory().relevance_edges().collect::<Vec<_>>(),
+        reversed.memory().relevance_edges().collect::<Vec<_>>()
     );
 }
 

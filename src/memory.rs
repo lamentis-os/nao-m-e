@@ -226,14 +226,16 @@ impl MemoryV0 {
     /// At most [`crate::MAX_FEEDBACK_TARGETS`] entries are accepted. Targets are
     /// then treated as an unordered set: duplicates and the source atom are
     /// ignored. Each effective target changes by at most
-    /// [`crate::FEEDBACK_TARGET_STEP_PPM`], while the total change is bounded by
-    /// [`crate::FEEDBACK_MAX_EVENT_PPM`]. Positive feedback uses free outgoing
-    /// budget first; if more is needed, only non-target edges are proportionally
-    /// reduced. Each resulting non-target weight is rounded down. Negative
-    /// feedback removes edges that reach zero and does not redistribute weight.
+    /// [`crate::FEEDBACK_TARGET_STEP_PPM`], while their aggregate direct change
+    /// is bounded by [`crate::FEEDBACK_MAX_EVENT_PPM`]. Positive feedback uses
+    /// free outgoing budget first; if more is needed, only non-target edges are
+    /// proportionally reduced. Integer remainders are carried across non-target
+    /// edges in ascending identifier order, so their aggregate reduction exactly
+    /// funds the award. Negative feedback removes edges that reach zero and does
+    /// not redistribute weight.
     ///
-    /// The complete source row is validated and staged before it is replaced.
-    /// Episode content and activation are not changed.
+    /// All identifiers are validated before relevance is mutated. Episode
+    /// content and activation are not changed.
     ///
     /// # Errors
     ///
@@ -267,9 +269,10 @@ impl MemoryV0 {
 
         let target_count = u64::try_from(target_indices.len())
             .expect("target count fits in u64 on supported platforms");
+        let base_per_target = u64::from(FEEDBACK_TARGET_STEP_PPM)
+            .min(u64::from(FEEDBACK_MAX_EVENT_PPM) / target_count);
         let current_outgoing = self.outgoing.get(&source_index);
-        let current_total = current_outgoing.map_or(0, |outgoing| outgoing.total_ppm);
-        let mut staged_targets;
+        let current_total = current_outgoing.map_or(0, |outgoing| u64::from(outgoing.total_ppm));
 
         if helpful {
             let target_total = target_indices.iter().fold(0_u64, |total, target_index| {
@@ -278,47 +281,49 @@ impl MemoryV0 {
                         .and_then(|outgoing| outgoing.targets.get(target_index))
                         .map_or(0, |weight| u64::from(weight.as_ppm()))
             });
-            let per_target = u64::from(FEEDBACK_TARGET_STEP_PPM)
-                .min(u64::from(FEEDBACK_MAX_EVENT_PPM) / target_count)
-                .min((u64::from(SCALE) - target_total) / target_count);
+            let per_target = base_per_target.min((u64::from(SCALE) - target_total) / target_count);
             if per_target == 0 {
                 return Ok(());
             }
-            staged_targets =
-                current_outgoing.map_or_else(BTreeMap::new, |outgoing| outgoing.targets.clone());
 
             let total_award = per_target * target_count;
-            let free_budget = u64::from(SCALE - current_total);
+            let free_budget = u64::from(SCALE) - current_total;
             let funding_needed = total_award.saturating_sub(free_budget);
+            let outgoing = self.outgoing.entry(source_index).or_default();
             if funding_needed != 0 {
-                let non_target_total = u64::from(current_total) - target_total;
-                let retained_non_target = non_target_total
-                    .checked_sub(funding_needed)
-                    .expect("feedback award is bounded by available non-target weight");
-                staged_targets.retain(|target_index, weight| {
+                let non_target_total = current_total - target_total;
+                let mut remainder = 0_u64;
+                let mut distributed_reduction = 0_u64;
+                outgoing.targets.retain(|target_index, weight| {
                     if target_indices.binary_search(target_index).is_ok() {
                         return true;
                     }
 
-                    let scaled =
-                        u64::from(weight.as_ppm()) * retained_non_target / non_target_total;
-                    if scaled == 0 {
+                    let numerator = u64::from(weight.as_ppm()) * funding_needed + remainder;
+                    let reduction = numerator / non_target_total;
+                    remainder = numerator % non_target_total;
+                    distributed_reduction += reduction;
+                    let updated = u64::from(weight.as_ppm()) - reduction;
+                    if updated == 0 {
                         return false;
                     }
                     *weight = InfluenceWeight::from_ppm(
-                        u32::try_from(scaled).expect("scaled relevance is bounded by SCALE"),
+                        u32::try_from(updated).expect("scaled relevance is bounded by SCALE"),
                     )
                     .expect("scaled non-zero relevance is valid");
                     true
                 });
+                debug_assert_eq!(distributed_reduction, funding_needed);
+                debug_assert_eq!(remainder, 0);
             }
 
             for target_index in target_indices {
-                let existing = staged_targets
+                let existing = outgoing
+                    .targets
                     .get(&target_index)
                     .map_or(0, |weight| u64::from(weight.as_ppm()));
                 let updated = existing + per_target;
-                staged_targets.insert(
+                outgoing.targets.insert(
                     target_index,
                     InfluenceWeight::from_ppm(
                         u32::try_from(updated).expect("feedback relevance is bounded by SCALE"),
@@ -326,44 +331,36 @@ impl MemoryV0 {
                     .expect("positive feedback creates non-zero relevance"),
                 );
             }
+            let updated_total = current_total + total_award - funding_needed;
+            outgoing.total_ppm =
+                u32::try_from(updated_total).expect("outgoing relevance is bounded by SCALE");
         } else {
-            let per_target = u64::from(FEEDBACK_TARGET_STEP_PPM)
-                .min(u64::from(FEEDBACK_MAX_EVENT_PPM) / target_count);
-            if per_target == 0 {
-                return Ok(());
-            }
-            let per_target = u32::try_from(per_target).expect("feedback step is bounded by SCALE");
-            staged_targets =
-                current_outgoing.map_or_else(BTreeMap::new, |outgoing| outgoing.targets.clone());
-
-            for target_index in target_indices {
-                if let Entry::Occupied(mut entry) = staged_targets.entry(target_index) {
-                    let updated = entry.get().as_ppm().saturating_sub(per_target);
-                    if updated == 0 {
-                        entry.remove();
-                    } else {
-                        *entry.get_mut() = InfluenceWeight::from_ppm(updated)
-                            .expect("remaining relevance is non-zero and bounded");
+            let per_target =
+                u32::try_from(base_per_target).expect("feedback step is bounded by SCALE");
+            let remove_source = {
+                let Some(outgoing) = self.outgoing.get_mut(&source_index) else {
+                    return Ok(());
+                };
+                let mut removed_total = 0_u32;
+                for target_index in target_indices {
+                    if let Entry::Occupied(mut entry) = outgoing.targets.entry(target_index) {
+                        let previous = entry.get().as_ppm();
+                        let updated = previous.saturating_sub(per_target);
+                        removed_total += previous - updated;
+                        if updated == 0 {
+                            entry.remove();
+                        } else {
+                            *entry.get_mut() = InfluenceWeight::from_ppm(updated)
+                                .expect("remaining relevance is non-zero and bounded");
+                        }
                     }
                 }
+                outgoing.total_ppm -= removed_total;
+                outgoing.targets.is_empty()
+            };
+            if remove_source {
+                self.outgoing.remove(&source_index);
             }
-        }
-
-        let staged_total = staged_targets
-            .values()
-            .fold(0_u64, |total, weight| total + u64::from(weight.as_ppm()));
-        debug_assert!(staged_total <= u64::from(SCALE));
-        if staged_targets.is_empty() {
-            self.outgoing.remove(&source_index);
-        } else {
-            self.outgoing.insert(
-                source_index,
-                OutgoingRelevance {
-                    total_ppm: u32::try_from(staged_total)
-                        .expect("outgoing relevance is bounded by SCALE"),
-                    targets: staged_targets,
-                },
-            );
         }
         Ok(())
     }

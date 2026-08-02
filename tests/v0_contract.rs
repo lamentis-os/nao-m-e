@@ -529,7 +529,7 @@ fn learned_shortcut_changes_the_next_step_by_the_existing_formula() {
 }
 
 #[test]
-fn positive_feedback_scales_only_non_targets_with_floor_rounding() {
+fn positive_feedback_funds_exactly_with_carried_remainders() {
     fn prepared_memory() -> (MemoryV0, [AtomId; 5]) {
         let mut memory = new_memory(1);
         let source = insert(&mut memory, 1);
@@ -575,7 +575,7 @@ fn positive_feedback_scales_only_non_targets_with_floor_rounding() {
     assert_eq!(forward.relevance(source, second), Some(weight(201_000)));
     assert_eq!(
         forward.relevance(source, non_target_a),
-        Some(weight(398_857))
+        Some(weight(398_858))
     );
     assert_eq!(
         forward.relevance(source, non_target_b),
@@ -587,7 +587,42 @@ fn positive_feedback_scales_only_non_targets_with_floor_rounding() {
             .filter(|edge| edge.from() == source)
             .map(|edge| edge.weight().as_ppm())
             .sum::<u32>(),
-        999_999
+        SCALE
+    );
+}
+
+#[test]
+fn positive_feedback_funding_is_independent_of_non_target_fragmentation() {
+    let mut memory = new_memory(1);
+    let source = insert(&mut memory, 1);
+    let target = insert(&mut memory, 2);
+    for seed in 3..103 {
+        let non_target = insert(&mut memory, seed);
+        memory
+            .set_relevance(source, non_target, weight(1))
+            .expect("fragmented edge fits");
+    }
+    let large_non_target = insert(&mut memory, 103);
+    memory
+        .set_relevance(source, large_non_target, weight(999_900))
+        .expect("large edge fills the outgoing budget");
+
+    memory
+        .apply_feedback(source, &[target], true)
+        .expect("known feedback target");
+
+    assert_eq!(memory.relevance(source, target), Some(weight(1_000)));
+    assert_eq!(
+        memory.relevance(source, large_non_target),
+        Some(weight(998_900))
+    );
+    assert_eq!(
+        memory
+            .relevance_edges()
+            .filter(|edge| edge.from() == source)
+            .map(|edge| edge.weight().as_ppm())
+            .sum::<u32>(),
+        SCALE
     );
 }
 

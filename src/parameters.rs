@@ -10,7 +10,7 @@ pub const PROPAGATION_GAIN_PPM: u32 = 400_000;
 /// Preferred relevance change applied to each target in one feedback event.
 pub const FEEDBACK_TARGET_STEP_PPM: u32 = 1_000;
 
-/// Maximum total relevance change applied by one feedback event.
+/// Maximum aggregate direct target adjustment in one feedback event.
 pub const FEEDBACK_MAX_EVENT_PPM: u32 = 10_000;
 
 /// Maximum number of target entries accepted by one feedback event.

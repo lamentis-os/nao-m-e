@@ -100,30 +100,42 @@ total_award = per_target * n
 ```
 
 Thus a normal list of at most ten effective targets changes each target by
-1,000 ppm, while longer lists share at most 10,000 ppm. The entry limit ensures
-that the event-budget share is at least one ppm. Remaining outgoing capacity can
-still make positive feedback a no-op when it cannot fund an equal one-ppm
-increase for every effective target.
+1,000 ppm, while longer lists share at most 10,000 ppm of direct target
+adjustment. `FEEDBACK_MAX_EVENT_PPM` bounds that aggregate target award or
+reduction; positive feedback can additionally move weight away from non-targets
+to fund the award. The entry limit ensures that the event-budget share is at
+least one ppm. Remaining outgoing capacity can still make positive feedback a
+no-op when it cannot fund an equal one-ppm increase for every effective target.
 
 The award first consumes unused outgoing budget. If the unused budget is less
-than `total_award`, the deficit is funded by scaling only non-target edges. If
-their old total is `non_target_total` and the deficit is `needed`, every
-non-target weight is replaced by:
+than `total_award`, the deficit is funded by scaling only non-target edges.
+Let `non_target_total` be their old total and `needed` be the deficit.
+Non-target edges are visited in ascending target identifier order with
+`remainder` initially zero. For each old weight, the proportional reduction,
+replacement, and next remainder are:
 
 ```text
-floor(weight * (non_target_total - needed) / non_target_total)
+numerator = weight * needed + remainder
+reduction = floor(numerator / non_target_total)
+remainder = numerator mod non_target_total
+replacement = weight - reduction
 ```
 
-Each target weight is then increased by `per_target`. Flooring can leave some
-outgoing budget unused. A zero result is represented by edge absence.
+Carrying the remainder makes the reductions sum to exactly `needed`, so
+fragmentation cannot remove additional weight.
+Each target weight is then increased by `per_target`. A zero result is
+represented by edge absence. Positive feedback therefore moves at most
+`FEEDBACK_MAX_EVENT_PPM` into targets and at most that same amount out of
+non-targets; the sum of absolute edge changes can include both sides.
 
 Negative feedback computes `per_target = min(FEEDBACK_TARGET_STEP_PPM,
 floor(FEEDBACK_MAX_EVENT_PPM / n))` and replaces each target weight with
 `max(0, weight - per_target)`. Missing target edges and all non-target edges
 remain unchanged.
 
-The complete resulting source row is staged before publication, so feedback is
-atomic. Feedback changes neither immutable episode content nor activation.
+All identifiers and the target-count limit are validated before relevance is
+mutated, so every returned error leaves the complete graph unchanged. Feedback
+changes neither immutable episode content nor activation.
 
 ## Activation dynamics
 

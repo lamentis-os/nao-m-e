@@ -184,9 +184,13 @@ Relevance weights use `1..=1_000_000` ppm, stimulation uses
 the CLI does not recompute recall or a top-k set. The core removes source
 self-hits and duplicate targets, then applies the deterministic feedback rule
 documented in the V0 contract. A feedback event accepts at most 10,000 target
-entries, changes each effective target by at most 1,000 ppm, and changes at most
-10,000 ppm in total. The snapshot stores only the resulting relevance graph, not
-a feedback receipt or provenance record.
+entries, changes each effective target by at most 1,000 ppm, and caps their
+aggregate direct adjustment at 10,000 ppm. Positive feedback uses free outgoing
+capacity first, then removes exactly the remaining required total from
+non-target edges, independent of how that weight is fragmented. Total absolute
+graph movement can therefore include both target increases and non-target
+reductions. The snapshot stores only the resulting relevance graph, not a
+feedback receipt or provenance record.
 
 Successful `init`, `run`, and `recall` commands write one JSON document to
 standard output; help and version output are plain text. `run` reports the
@@ -196,9 +200,9 @@ write diagnostics to standard error. A standard-output failure can leave a
 partial JSON document and does not roll back a completed side effect: `init`
 may already have created the store, and `run` may already have committed its
 batch. Inspect or reopen the store before retrying; batches containing inserts
-or feedback are not idempotent, and replaying feedback applies another
-mutation. Exit code `2` denotes invalid CLI syntax, while input, model, graph,
-store, and output errors use exit code `1`.
+or feedback are not generally idempotent, and replaying feedback may mutate
+relevance again. Exit code `2` denotes invalid CLI syntax, while input, model,
+graph, store, and output errors use exit code `1`.
 
 Recall ranked active episodes, or inspect one episode including zero
 activation:
