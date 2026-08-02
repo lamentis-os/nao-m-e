@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use nao_m_e::{
-    Activation, AtomId, EpisodeAtom, EpisodeDraft, InfluenceWeight, MemoryId, MemoryV0,
-    PredicateId, SourceId, Statement, TermId, TimestampMs,
+    Activation, AtomId, EpisodeAtom, EpisodeDraft, InfluenceWeight, MAX_FEEDBACK_TARGETS, MemoryId,
+    MemoryV0, PredicateId, SourceId, Statement, TermId, TimestampMs,
 };
 use nao_m_e_sqlite::SqliteStore;
 use serde::{Deserialize, Serialize};
@@ -385,6 +385,31 @@ fn apply_operation(
                 .stimulate(atom, amount)
                 .map_err(|error| error.to_string())?;
         }
+        OperationInput::ApplyFeedback {
+            source,
+            targets,
+            feedback,
+        } => {
+            let helpful = match feedback {
+                0 => false,
+                1 => true,
+                _ => return Err("feedback must be 0 or 1".to_owned()),
+            };
+            let source = resolve_atom(source, memory, baseline_episode_count, labels)?;
+            if targets.len() > MAX_FEEDBACK_TARGETS {
+                return Err(format!(
+                    "feedback target count {} exceeds {MAX_FEEDBACK_TARGETS}",
+                    targets.len()
+                ));
+            }
+            let targets = targets
+                .into_iter()
+                .map(|target| resolve_atom(target, memory, baseline_episode_count, labels))
+                .collect::<CliResult<Vec<_>>>()?;
+            memory
+                .apply_feedback(source, &targets, helpful)
+                .map_err(|error| error.to_string())?;
+        }
         OperationInput::Step { count } => {
             if count == 0 {
                 return Err("step count must be positive".to_owned());
@@ -474,6 +499,11 @@ enum OperationInput {
         atom: AtomReferenceInput,
         amount_ppm: u32,
     },
+    ApplyFeedback {
+        source: AtomReferenceInput,
+        targets: Vec<AtomReferenceInput>,
+        feedback: u8,
+    },
     Step {
         count: u32,
     },
@@ -487,6 +517,7 @@ impl OperationInput {
             Self::SetRelevance { .. } => "set_relevance",
             Self::RemoveRelevance { .. } => "remove_relevance",
             Self::Stimulate { .. } => "stimulate",
+            Self::ApplyFeedback { .. } => "apply_feedback",
             Self::Step { .. } => "step",
             Self::ResetActivations {} => "reset_activations",
         }

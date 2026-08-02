@@ -27,6 +27,13 @@ only operation that persists those changes. There is no automatic save on
 mutation or drop. A failed save leaves the in-memory state available for a
 retry, while an unsaved state is lost when its process ends.
 
+Explicit feedback adjusts ordinary in-memory relevance state. `save()` persists
+the resulting relevance matrix through the existing snapshot transaction and
+revision compare-and-swap; it does not use a separate persistence path. The V1
+format and schema are unchanged and store no feedback receipt, history, count,
+or idempotency key. Reapplying the same feedback after a successful save is a
+new mutation and can adjust relevance again; V1 does not detect feedback replay.
+
 The adapter does not expose its SQLite connection and does not accept an
 independently constructed `MemoryV0` for saving. Database copies carrying the
 same `MemoryId` must not be modified independently and later merged.

@@ -65,6 +65,78 @@ edge validates both endpoints and the resulting budget before mutation.
 A positive weight controls activation flow only. It does not encode truth,
 probability, confidence, evidence, causality, or semantic support.
 
+## External feedback
+
+`apply_feedback(source, targets, helpful)` applies one caller-supplied binary
+assessment to the source's outgoing relevance. `helpful = true` is positive
+feedback and `helpful = false` is negative feedback. The kernel accepts the
+assessment as input; it does not infer whether a recall was useful.
+
+The operation first validates the source. A supplied target list longer than
+`MAX_FEEDBACK_TARGETS` is rejected without mutation. Every entry of an accepted
+list is then validated; any unknown atom rejects the complete operation. The
+targets are sorted and deduplicated and the source itself is removed. Target
+input order, rank, duplicates, and self-hits therefore have no effect. An empty
+effective target set is a successful no-op.
+
+The fixed feedback parameters are:
+
+```text
+FEEDBACK_TARGET_STEP_PPM = 1,000
+FEEDBACK_MAX_EVENT_PPM = 10,000
+MAX_FEEDBACK_TARGETS = 10,000
+```
+
+For a non-empty effective target set `T` of size `n`, positive feedback computes:
+
+```text
+target_total = sum(weight[source,target] for target in T)
+per_target = min(
+    FEEDBACK_TARGET_STEP_PPM,
+    floor(FEEDBACK_MAX_EVENT_PPM / n),
+    floor((SCALE - target_total) / n)
+)
+total_award = per_target * n
+```
+
+Thus a normal list of at most ten effective targets changes each target by
+1,000 ppm, while longer lists share at most 10,000 ppm of direct target
+adjustment. `FEEDBACK_MAX_EVENT_PPM` bounds that aggregate target award or
+reduction; positive feedback can additionally move weight away from non-targets
+to fund the award. The entry limit ensures that the event-budget share is at
+least one ppm. Remaining outgoing capacity can still make positive feedback a
+no-op when it cannot fund an equal one-ppm increase for every effective target.
+
+The award first consumes unused outgoing budget. If the unused budget is less
+than `total_award`, the deficit is funded by scaling only non-target edges.
+Let `non_target_total` be their old total and `needed` be the deficit.
+Non-target edges are visited in ascending target identifier order with
+`remainder` initially zero. For each old weight, the proportional reduction,
+replacement, and next remainder are:
+
+```text
+numerator = weight * needed + remainder
+reduction = floor(numerator / non_target_total)
+remainder = numerator mod non_target_total
+replacement = weight - reduction
+```
+
+Carrying the remainder makes the reductions sum to exactly `needed`, so
+fragmentation cannot remove additional weight.
+Each target weight is then increased by `per_target`. A zero result is
+represented by edge absence. Positive feedback therefore moves at most
+`FEEDBACK_MAX_EVENT_PPM` into targets and at most that same amount out of
+non-targets; the sum of absolute edge changes can include both sides.
+
+Negative feedback computes `per_target = min(FEEDBACK_TARGET_STEP_PPM,
+floor(FEEDBACK_MAX_EVENT_PPM / n))` and replaces each target weight with
+`max(0, weight - per_target)`. Missing target edges and all non-target edges
+remain unchanged.
+
+All identifiers and the target-count limit are validated before relevance is
+mutated, so every returned error leaves the complete graph unchanged. Feedback
+changes neither immutable episode content nor activation.
+
 ## Activation dynamics
 
 All unit-interval values use integer parts per million:
@@ -112,6 +184,7 @@ Resetting activation leaves atoms and relevance edges unchanged.
 The V0 kernel stores atoms, activation, and relevance only in a `MemoryV0`
 instance. It performs no persistence, loading, synchronization, or multi-writer
 coordination. It also performs no free-text processing, embedding or LLM calls,
-or automatic relevance learning. Persistence adapters remain outside the
+or autonomous relevance learning. Relevance changes only through explicit graph
+mutation or caller-supplied feedback. Persistence adapters remain outside the
 kernel; the format and lifecycle of the optional SQLite adapter are specified
 separately in the [SQLite V1 contract](sqlite-v1-contract.md).

@@ -745,6 +745,9 @@ fn restore_relevance(connection: &Connection, memory: &mut MemoryV0) -> Result<(
                 to,
                 detail: match error {
                     GraphError::UnknownAtom(_) => "edge endpoint is absent",
+                    GraphError::FeedbackTargetLimitExceeded { .. } => {
+                        "feedback target limit was exceeded during reconstruction"
+                    }
                     GraphError::SelfEdge(_) => "self-edge",
                     GraphError::OutgoingWeightBudgetExceeded { .. } => {
                         "outgoing weight budget is exceeded"

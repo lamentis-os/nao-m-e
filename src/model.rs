@@ -436,6 +436,13 @@ impl Error for MemoryError {}
 pub enum GraphError {
     /// An operation referred to an atom absent from this memory.
     UnknownAtom(AtomId),
+    /// A feedback event supplied more target entries than allowed.
+    FeedbackTargetLimitExceeded {
+        /// Number of supplied target entries.
+        count: usize,
+        /// Maximum accepted target entries.
+        max: usize,
+    },
     /// A relevance edge attempted to connect an atom to itself.
     SelfEdge(AtomId),
     /// Updated outgoing weights would exceed [`crate::SCALE`].
@@ -451,6 +458,9 @@ impl fmt::Display for GraphError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownAtom(id) => write!(formatter, "unknown atom {id}"),
+            Self::FeedbackTargetLimitExceeded { count, max } => {
+                write!(formatter, "feedback target count {count} exceeds {max}")
+            }
             Self::SelfEdge(id) => write!(formatter, "atom {id} cannot influence itself"),
             Self::OutgoingWeightBudgetExceeded {
                 from,
