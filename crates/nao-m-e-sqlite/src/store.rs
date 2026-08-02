@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use nao_m_e::{Activation, AtomId, GraphError, InfluenceWeight, MemoryId, MemoryV0, SCALE};
+use nao_m_e::{AtomId, GraphError, InfluenceWeight, MemoryId, MemoryV0, SCALE};
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior};
 
@@ -76,8 +76,8 @@ impl SqliteStore {
         &mut self.memory
     }
 
-    /// Atomically persists newly appended episodes and the complete mutable
-    /// activation and relevance state.
+    /// Atomically persists newly appended episodes and the complete relevance
+    /// graph.
     ///
     /// A stale store session is rejected instead of overwriting a later
     /// snapshot. On every error, the previous database snapshot remains
@@ -132,7 +132,6 @@ impl SqliteStore {
         }
 
         append_episodes(&transaction, memory, *persisted_episode_count)?;
-        replace_activations(&transaction, memory)?;
         replace_relevance(&transaction, memory)?;
         transaction.commit()?;
 
@@ -192,7 +191,6 @@ fn load_memory(connection: &mut Connection) -> Result<(MemoryV0, usize, i64), St
     verify_quick_check(&transaction)?;
     verify_foreign_keys(&transaction)?;
     let mut memory = reconstruct_memory(&transaction, memory_id)?;
-    restore_activations(&transaction, &mut memory)?;
     restore_relevance(&transaction, &mut memory)?;
     let episode_count = memory.episodes().len();
     transaction.commit()?;
@@ -368,39 +366,6 @@ fn reconstruct_memory(
     Ok(memory)
 }
 
-fn restore_activations(connection: &Connection, memory: &mut MemoryV0) -> Result<(), StoreError> {
-    let mut statement = connection.prepare(
-        "SELECT episode_sequence, activation_ppm
-         FROM activations
-         ORDER BY episode_sequence",
-    )?;
-    let mut rows = statement.query([])?;
-    while let Some(row) = rows.next()? {
-        let sequence = read_u64(row, 0, "activations", "episode_sequence")?;
-        let value = read_integer(row, 1, "activations", "activation_ppm")?;
-        let ppm = u32::try_from(value)
-            .ok()
-            .filter(|value| (1..=SCALE).contains(value))
-            .ok_or(StoreIntegrityError::InvalidActivation {
-                sequence,
-                detail: "activation is outside the positive fixed-point range",
-            })?;
-        let id = AtomId::from_parts(memory.memory_id(), sequence);
-        let activation =
-            Activation::from_ppm(ppm).map_err(|_| StoreIntegrityError::InvalidActivation {
-                sequence,
-                detail: "activation is outside the positive fixed-point range",
-            })?;
-        memory
-            .stimulate(id, activation)
-            .map_err(|_| StoreIntegrityError::InvalidActivation {
-                sequence,
-                detail: "activation references an absent episode",
-            })?;
-    }
-    Ok(())
-}
-
 fn restore_relevance(connection: &Connection, memory: &mut MemoryV0) -> Result<(), StoreError> {
     let mut statement = connection.prepare(
         "SELECT from_sequence, to_sequence, weight_ppm
@@ -503,25 +468,6 @@ fn append_episodes(
         let sequence = codec::encode_u64(episode.id().sequence());
         let payload = codec::encode_episode(episode);
         insert.execute((sequence.as_slice(), payload.as_slice()))?;
-    }
-    Ok(())
-}
-
-fn replace_activations(transaction: &Transaction<'_>, memory: &MemoryV0) -> Result<(), StoreError> {
-    transaction.execute("DELETE FROM activations", [])?;
-    let mut insert = transaction.prepare(
-        "INSERT INTO activations (episode_sequence, activation_ppm)
-         VALUES (?1, ?2)",
-    )?;
-    for episode in memory.episodes() {
-        let activation = memory
-            .activation(episode.id())
-            .expect("an in-memory episode always has parallel activation storage");
-        if activation == Activation::ZERO {
-            continue;
-        }
-        let sequence = codec::encode_u64(episode.id().sequence());
-        insert.execute((sequence.as_slice(), i64::from(activation.as_ppm())))?;
     }
     Ok(())
 }
@@ -714,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn payload_sequence_and_sparse_state_corruption_are_rejected() {
+    fn payload_and_sequence_corruption_are_rejected() {
         let directory = tempdir().unwrap();
         let path = saved_store(&directory, 1);
         let raw = Connection::open(&path).unwrap();
@@ -742,61 +688,6 @@ mod tests {
             integrity_error(&path),
             StoreIntegrityError::InvalidEpisode { sequence: 0, .. }
         ));
-
-        let directory = tempdir().unwrap();
-        let path = saved_store(&directory, 1);
-        let raw = Connection::open(&path).unwrap();
-        raw.pragma_update(None, "ignore_check_constraints", true)
-            .unwrap();
-        raw.execute(
-            "INSERT INTO activations VALUES (?1, 0)",
-            [codec::encode_u64(0).as_slice()],
-        )
-        .unwrap();
-        drop(raw);
-        assert!(matches!(
-            integrity_error(&path),
-            StoreIntegrityError::QuickCheckFailed { .. }
-        ));
-    }
-
-    #[test]
-    fn sparse_activations_store_only_positive_values() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("memory.sqlite3");
-        let mut store = SqliteStore::create(&path).unwrap();
-        let ids: Vec<_> = (0..3)
-            .map(|seed| store.memory_mut().insert_episode(draft(seed)).unwrap())
-            .collect();
-        store
-            .memory_mut()
-            .stimulate(ids[1], Activation::from_ppm(42).unwrap())
-            .unwrap();
-        store.save().unwrap();
-
-        let raw = Connection::open(&path).unwrap();
-        let rows: i64 = raw
-            .query_row("SELECT count(*) FROM activations", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(rows, 1);
-        drop(raw);
-        drop(store);
-
-        let mut reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(reopened.memory().activation(ids[0]), Some(Activation::ZERO));
-        assert_eq!(
-            reopened.memory().activation(ids[1]),
-            Some(Activation::from_ppm(42).unwrap())
-        );
-        reopened.memory_mut().reset_activations();
-        reopened.save().unwrap();
-        drop(reopened);
-
-        let raw = Connection::open(&path).unwrap();
-        let rows: i64 = raw
-            .query_row("SELECT count(*) FROM activations", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(rows, 0);
     }
 
     #[test]
@@ -837,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_save_rolls_back_revision_episodes_and_mutable_state() {
+    fn failed_save_rolls_back_revision_episodes_and_relevance() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("memory.sqlite3");
         let mut store = SqliteStore::create(&path).unwrap();
@@ -846,17 +737,13 @@ mod tests {
         let second = store.memory_mut().insert_episode(draft(1)).unwrap();
         store
             .memory_mut()
-            .stimulate(first, Activation::ONE)
-            .unwrap();
-        store
-            .memory_mut()
             .set_relevance(first, second, InfluenceWeight::from_ppm(1).unwrap())
             .unwrap();
         store
             .connection
             .execute_batch(
-                "CREATE TEMP TRIGGER abort_activation_insert
-                 BEFORE INSERT ON main.activations
+                "CREATE TEMP TRIGGER abort_relevance_insert
+                 BEFORE INSERT ON main.relevance_edges
                  BEGIN SELECT RAISE(ABORT, 'test abort'); END;",
             )
             .unwrap();
@@ -867,7 +754,6 @@ mod tests {
 
         let reopened = SqliteStore::open(&path).unwrap();
         assert_eq!(reopened.memory().episodes().len(), 1);
-        assert_eq!(reopened.memory().activation(first), Some(Activation::ZERO));
         assert_eq!(reopened.memory().relevance_edges().count(), 0);
     }
 

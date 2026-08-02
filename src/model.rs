@@ -294,31 +294,20 @@ impl EpisodeAtom {
     }
 }
 
-/// Activation measured in parts per million, from zero through [`crate::SCALE`].
+/// Query-local recall activation measured in parts per million.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Activation(u32);
 
 impl Activation {
-    /// Zero activation.
+    /// Zero projected activation.
     pub const ZERO: Self = Self(0);
 
-    /// Full activation.
-    pub const ONE: Self = Self(SCALE);
-
-    /// Creates activation from zero through [`crate::SCALE`].
+    /// Creates a projected activation from zero through [`crate::SCALE`].
     pub const fn from_ppm(value: u32) -> Result<Self, ValueError> {
         if value > SCALE {
             return Err(ValueError::OutOfRange { value });
         }
         Ok(Self(value))
-    }
-
-    pub(crate) const fn from_clamped_ppm(value: u32) -> Self {
-        if value > SCALE {
-            Self(SCALE)
-        } else {
-            Self(value)
-        }
     }
 
     /// Returns the parts-per-million representation.
@@ -330,7 +319,8 @@ impl Activation {
 
 /// Positive relevance influence measured in parts per million.
 ///
-/// A weight controls activation flow; it is not a probability or confidence.
+/// A weight controls source-conditioned accessibility; it is not a probability
+/// or confidence.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct InfluenceWeight(u32);
 
@@ -431,7 +421,7 @@ impl fmt::Display for MemoryError {
 
 impl Error for MemoryError {}
 
-/// Failure while accessing activation or changing relevance topology.
+/// Failure while recalling or changing relevance topology.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GraphError {
     /// An operation referred to an atom absent from this memory.

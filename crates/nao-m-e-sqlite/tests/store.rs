@@ -3,8 +3,8 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use nao_m_e::{
-    Activation, AtomId, EpisodeAtom, EpisodeDraft, InfluenceWeight, MemoryId, MemoryV0,
-    PredicateId, RecallHit, RelevanceEdge, SCALE, SourceId, Statement, TermId, TimestampMs,
+    AtomId, EpisodeAtom, EpisodeDraft, InfluenceWeight, MemoryId, MemoryV0, PredicateId,
+    RelevanceEdge, SCALE, SourceId, Statement, TermId, TimestampMs,
 };
 use nao_m_e_sqlite::{SqliteStore, StoreError};
 use tempfile::{TempDir, tempdir};
@@ -13,31 +13,14 @@ use tempfile::{TempDir, tempdir};
 struct MemorySnapshot {
     memory_id: MemoryId,
     episodes: Vec<EpisodeAtom>,
-    activations: Vec<(AtomId, Activation)>,
     relevance_edges: Vec<RelevanceEdge>,
-    recall: Vec<RecallHit>,
 }
 
 fn snapshot(memory: &MemoryV0) -> MemorySnapshot {
-    let episodes: Vec<_> = memory.episodes().cloned().collect();
-    let activations = episodes
-        .iter()
-        .map(|episode| {
-            (
-                episode.id(),
-                memory
-                    .activation(episode.id())
-                    .expect("snapshot episode belongs to its memory"),
-            )
-        })
-        .collect();
-
     MemorySnapshot {
         memory_id: memory.memory_id(),
-        episodes,
-        activations,
+        episodes: memory.episodes().cloned().collect(),
         relevance_edges: memory.relevance_edges().collect(),
-        recall: memory.top_k(usize::MAX),
     }
 }
 
@@ -71,10 +54,6 @@ fn insert(store: &mut SqliteStore, episode: EpisodeDraft) -> AtomId {
         .memory_mut()
         .insert_episode(episode)
         .expect("test memory has identifier capacity")
-}
-
-fn activation(value: u32) -> Activation {
-    Activation::from_ppm(value).expect("test activation is in range")
 }
 
 fn weight(value: u32) -> InfluenceWeight {
@@ -148,7 +127,7 @@ fn concurrent_creators_publish_exactly_one_complete_store() {
 }
 
 #[test]
-fn full_snapshot_and_next_transition_round_trip_exactly() {
+fn full_snapshot_round_trips_exactly_and_continues_the_sequence() {
     let directory = tempdir().expect("temporary directory is available");
     let path = database_path(&directory);
     let mut store = SqliteStore::create(&path).expect("new store is created");
@@ -183,14 +162,6 @@ fn full_snapshot_and_next_transition_round_trip_exactly() {
 
     store
         .memory_mut()
-        .stimulate(first, Activation::ONE)
-        .expect("first atom is local");
-    store
-        .memory_mut()
-        .stimulate(second, activation(424_242))
-        .expect("second atom is local");
-    store
-        .memory_mut()
         .set_relevance(first, second, weight(600_000))
         .expect("first edge fits its source budget");
     store
@@ -204,15 +175,10 @@ fn full_snapshot_and_next_transition_round_trip_exactly() {
 
     let persisted = snapshot(store.memory());
     store.save().expect("snapshot is saved atomically");
-
-    store.memory_mut().step();
-    let expected_after_step = snapshot(store.memory());
     drop(store);
 
     let mut reopened = SqliteStore::open(&path).expect("saved store reopens");
     assert_eq!(snapshot(reopened.memory()), persisted);
-    reopened.memory_mut().step();
-    assert_eq!(snapshot(reopened.memory()), expected_after_step);
 
     let next = insert(&mut reopened, draft(8));
     assert_eq!(next.memory_id(), reopened.memory_id());
@@ -220,7 +186,7 @@ fn full_snapshot_and_next_transition_round_trip_exactly() {
 }
 
 #[test]
-fn repeated_saves_persist_edge_removal_and_activation_reset() {
+fn repeated_saves_persist_relevance_replacement() {
     let directory = tempdir().expect("temporary directory is available");
     let path = database_path(&directory);
     let mut store = SqliteStore::create(&path).expect("new store is created");
@@ -236,14 +202,6 @@ fn repeated_saves_persist_edge_removal_and_activation_reset() {
         .memory_mut()
         .set_relevance(second, third, weight(700_000))
         .expect("second edge inserts");
-    store
-        .memory_mut()
-        .stimulate(first, Activation::ONE)
-        .expect("first atom is stimulated");
-    store
-        .memory_mut()
-        .stimulate(second, activation(500_000))
-        .expect("second atom is stimulated");
     store.save().expect("initial snapshot is saved");
 
     assert_eq!(
@@ -257,7 +215,6 @@ fn repeated_saves_persist_edge_removal_and_activation_reset() {
         .memory_mut()
         .set_relevance(third, first, weight(123_456))
         .expect("replacement topology is valid");
-    store.memory_mut().reset_activations();
     store.save().expect("replacement snapshot is saved");
     store
         .save()
@@ -266,12 +223,6 @@ fn repeated_saves_persist_edge_removal_and_activation_reset() {
 
     let reopened = SqliteStore::open(&path).expect("updated store reopens");
     assert_eq!(reopened.memory().episodes().len(), 3);
-    for episode in reopened.memory().episodes() {
-        assert_eq!(
-            reopened.memory().activation(episode.id()),
-            Some(Activation::ZERO)
-        );
-    }
     assert_eq!(reopened.memory().relevance(first, second), None);
     assert_eq!(
         reopened.memory().relevance(second, third),
@@ -346,10 +297,6 @@ fn identical_episodes_remain_distinct_occurrences_after_reopen() {
     assert_eq!(first.sequence(), 0);
     assert_eq!(second.sequence(), 1);
     assert_ne!(first, second);
-    store
-        .memory_mut()
-        .stimulate(second, activation(7))
-        .expect("second occurrence is independently addressable");
     store.save().expect("both occurrences are saved");
     let memory_id = store.memory_id();
     drop(store);
@@ -367,8 +314,6 @@ fn identical_episodes_remain_distinct_occurrences_after_reopen() {
     assert_eq!(episodes[0].action(), episodes[1].action());
     assert_eq!(episodes[0].outcome(), episodes[1].outcome());
     assert_eq!(episodes[0].source(), episodes[1].source());
-    assert_eq!(reopened.memory().activation(first), Some(Activation::ZERO));
-    assert_eq!(reopened.memory().activation(second), Some(activation(7)));
 }
 
 #[test]
@@ -383,7 +328,6 @@ fn empty_memory_can_be_saved_and_reopened() {
     let reopened = SqliteStore::open(&path).expect("empty store reopens");
     assert_eq!(reopened.memory_id(), memory_id);
     assert_eq!(snapshot(reopened.memory()).episodes.len(), 0);
-    assert!(reopened.memory().top_k(10).is_empty());
     assert_eq!(reopened.memory().relevance_edges().count(), 0);
 }
 
@@ -406,13 +350,6 @@ fn thousand_episode_snapshot_reopens_without_semantic_drift() {
             .set_relevance(pair[0], pair[1], weight(1))
             .expect("chain edge has an independent source budget");
     }
-    for id in ids.iter().step_by(100) {
-        store
-            .memory_mut()
-            .stimulate(*id, activation(123_456))
-            .expect("sampled atom is local");
-    }
-
     store.save().expect("large deterministic fixture is saved");
     let expected = snapshot(store.memory());
     drop(store);

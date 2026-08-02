@@ -9,7 +9,7 @@ use crate::model::{
 };
 use crate::parameters::{
     FEEDBACK_MAX_EVENT_PPM, FEEDBACK_TARGET_STEP_PPM, MAX_FEEDBACK_TARGETS, PROPAGATION_GAIN_PPM,
-    RETENTION_PPM, SCALE, SCALE_CUBED, SCALE_SQUARED,
+    SCALE,
 };
 
 /// A directed positive relevance edge between two atoms.
@@ -40,12 +40,12 @@ impl RelevanceEdge {
     }
 }
 
-/// A non-zero activation score returned by recall ranking.
+/// A non-zero projected activation score returned by source-conditioned recall.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecallHit {
     /// Identifier of the recalled atom.
     pub atom_id: AtomId,
-    /// Current or projected fixed-point activation used for ranking.
+    /// Query-local fixed-point activation used for ranking.
     pub activation: Activation,
 }
 
@@ -73,7 +73,7 @@ struct OutgoingRelevance {
     targets: BTreeMap<usize, InfluenceWeight>,
 }
 
-/// Append-only atom storage with mutable activation and sparse relevance edges.
+/// Append-only atom storage with sparse mutable relevance edges.
 ///
 /// Each memory ID must name one exclusively written logical memory. Reopening
 /// requires reconstructing its complete atom sequence before appending. Atom
@@ -81,8 +81,6 @@ struct OutgoingRelevance {
 pub struct MemoryV0 {
     memory_id: MemoryId,
     atoms: Vec<EpisodeAtom>,
-    activations: Vec<Activation>,
-    transition_numerators: Vec<u64>,
     outgoing: BTreeMap<usize, OutgoingRelevance>,
 }
 
@@ -93,8 +91,6 @@ impl MemoryV0 {
         Self {
             memory_id,
             atoms: Vec::new(),
-            activations: Vec::new(),
-            transition_numerators: Vec::new(),
             outgoing: BTreeMap::new(),
         }
     }
@@ -107,14 +103,11 @@ impl MemoryV0 {
 
     /// Canonicalizes the draft context and appends an immutable episode.
     pub fn insert_episode(&mut self, draft: EpisodeDraft) -> Result<AtomId, MemoryError> {
-        self.debug_assert_storage();
         let sequence = u64::try_from(self.atoms.len()).map_err(|_| MemoryError::IdExhausted)?;
         let id = AtomId::from_parts(self.memory_id, sequence);
         let atom = EpisodeAtom::from_draft(id, draft);
 
         self.atoms.push(atom);
-        self.activations.push(Activation::ZERO);
-        self.debug_assert_storage();
         Ok(id)
     }
 
@@ -235,7 +228,7 @@ impl MemoryV0 {
     /// not redistribute weight.
     ///
     /// All identifiers are validated before relevance is mutated. Episode
-    /// content and activation are not changed.
+    /// content is not changed.
     ///
     /// # Errors
     ///
@@ -374,60 +367,11 @@ impl MemoryV0 {
         Ok(())
     }
 
-    /// Adds external activation, saturating at [`Activation::ONE`].
-    pub fn stimulate(&mut self, id: AtomId, amount: Activation) -> Result<Activation, GraphError> {
-        let index = self.require_atom(id)?;
-        let current = &mut self.activations[index];
-        let next = current.as_ppm().saturating_add(amount.as_ppm()).min(SCALE);
-        *current = Activation::from_clamped_ppm(next);
-        Ok(*current)
-    }
-
-    /// Returns activation, or `None` if the identifier does not belong here.
-    #[must_use]
-    pub fn activation(&self, id: AtomId) -> Option<Activation> {
-        self.local_index(id).map(|index| self.activations[index])
-    }
-
-    /// Advances every activation by one synchronous logical step.
-    ///
-    /// Retention and incoming influence share one rounding operation per atom.
-    pub fn step(&mut self) {
-        self.debug_assert_storage();
-        self.transition_numerators.resize(self.activations.len(), 0);
-        for (index, &activation) in self.activations.iter().enumerate() {
-            self.transition_numerators[index] =
-                u64::from(activation.as_ppm()) * u64::from(RETENTION_PPM) * u64::from(SCALE);
-        }
-
-        for (&from_index, outgoing) in &self.outgoing {
-            let source = self.activations[from_index].as_ppm();
-            if source == 0 {
-                continue;
-            }
-
-            for (&to_index, &weight) in &outgoing.targets {
-                let numerator = Self::propagation_numerator(source, weight);
-                self.transition_numerators[to_index] = self.transition_numerators[to_index]
-                    .saturating_add(numerator)
-                    .min(SCALE_CUBED);
-            }
-        }
-
-        for (index, &transition_numerator) in self.transition_numerators.iter().enumerate() {
-            let next = transition_numerator / SCALE_SQUARED;
-            self.activations[index] = Activation::from_clamped_ppm(
-                u32::try_from(next).expect("transition activation is bounded by SCALE"),
-            );
-        }
-        self.debug_assert_storage();
-    }
-
-    /// Ranks the direct one-step influence of `source` in isolation.
+    /// Ranks the direct one-hop influence of `source` in isolation.
     ///
     /// The projection treats the source as fully active and every other atom as
     /// inactive, scans only the source's outgoing relevance row, and leaves all
-    /// stored state unchanged. Each target score is the source's one-step
+    /// stored state unchanged. Each target score is the source's direct
     /// propagation contribution. Zero scores and the source itself are omitted;
     /// equal scores are ordered by ascending atom identifier.
     ///
@@ -450,10 +394,11 @@ impl MemoryV0 {
                 }
 
                 let score =
-                    Self::propagation_numerator(Activation::ONE.as_ppm(), weight) / SCALE_SQUARED;
-                let activation = Activation::from_clamped_ppm(
-                    u32::try_from(score).expect("isolated propagation is bounded by SCALE"),
-                );
+                    u64::from(weight.as_ppm()) * u64::from(PROPAGATION_GAIN_PPM) / u64::from(SCALE);
+                let activation = Activation::from_ppm(
+                    u32::try_from(score).expect("projected activation is bounded by SCALE"),
+                )
+                .expect("projected activation is bounded by SCALE");
                 (activation != Activation::ZERO).then_some(RecallHit {
                     atom_id: self.atoms[target_index].id(),
                     activation,
@@ -461,14 +406,6 @@ impl MemoryV0 {
             });
 
         Ok(Self::rank_hits(hits, outgoing.targets.len(), limit))
-    }
-
-    /// Returns at most `limit` non-zero activations, highest first.
-    ///
-    /// Equal activations are ordered by ascending atom identifier.
-    #[must_use]
-    pub fn top_k(&self, limit: usize) -> Vec<RecallHit> {
-        Self::rank_hits(self.active_hits(), self.activations.len(), limit)
     }
 
     fn rank_hits(
@@ -506,28 +443,6 @@ impl MemoryV0 {
         hits
     }
 
-    fn propagation_numerator(source_ppm: u32, weight: InfluenceWeight) -> u64 {
-        u64::from(source_ppm) * u64::from(weight.as_ppm()) * u64::from(PROPAGATION_GAIN_PPM)
-    }
-
-    /// Resets activation without changing atoms or relevance edges.
-    pub fn reset_activations(&mut self) {
-        self.activations.fill(Activation::ZERO);
-    }
-
-    fn active_hits(&self) -> impl Iterator<Item = RecallHit> + '_ {
-        self.activations
-            .iter()
-            .copied()
-            .enumerate()
-            .filter_map(|(index, activation)| {
-                (activation != Activation::ZERO).then_some(RecallHit {
-                    atom_id: self.atoms[index].id(),
-                    activation,
-                })
-            })
-    }
-
     fn sort_hits(hits: &mut [RecallHit]) {
         hits.sort_unstable_by_key(|hit| Reverse(RankedRecallHit(*hit)));
     }
@@ -544,11 +459,6 @@ impl MemoryV0 {
     fn require_atom(&self, id: AtomId) -> Result<usize, GraphError> {
         self.local_index(id).ok_or(GraphError::UnknownAtom(id))
     }
-
-    fn debug_assert_storage(&self) {
-        debug_assert_eq!(self.activations.len(), self.atoms.len());
-        debug_assert!(self.transition_numerators.len() <= self.atoms.len());
-    }
 }
 
 impl fmt::Debug for MemoryV0 {
@@ -557,7 +467,6 @@ impl fmt::Debug for MemoryV0 {
             .debug_struct("MemoryV0")
             .field("memory_id", &self.memory_id)
             .field("atoms", &self.atoms)
-            .field("activations", &self.activations)
             .field("outgoing", &self.outgoing)
             .finish_non_exhaustive()
     }

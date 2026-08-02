@@ -12,11 +12,9 @@ lifecycle are defined in `docs/sqlite-v2-contract.md`.
 
 - `src/model.rs` owns public identifiers, episode values, fixed-point values,
   and errors.
-- `src/memory.rs` owns atom storage, activation transitions, relevance, and
-  recall.
+- `src/memory.rs` owns atom storage, relevance, feedback, and recall.
 - `src/parameters.rs` owns fixed-point constants.
-- `tests/v0_contract.rs` exercises the public V0 contract and independent
-  differential reference behavior.
+- `tests/v0_contract.rs` exercises the public V0 contract.
 - `crates/nao-m-e-sqlite` owns SQLite connection handling, format validation,
   snapshot transactions, and adapter tests.
 - `crates/nao-m-e-cli` owns argument parsing, strict JSON V2 request and
@@ -29,10 +27,10 @@ repository-level guardrails when changing the implementation:
 
 - Preserve `#![forbid(unsafe_code)]` and deterministic behavior across supported
   platforms.
-- Use integer fixed-point arithmetic and ordered traversal for observable state
-  transitions and results.
-- Keep episode atoms append-only and immutable. Activation and relevance remain
-  separate mutable state.
+- Use integer fixed-point arithmetic and ordered traversal for observable recall,
+  feedback, and results.
+- Keep episode atoms append-only and immutable. Relevance remains separate
+  mutable state.
 - Keep caller-owned memory identity distinct from local insertion sequence;
   foreign or absent atom IDs must never alias local atoms.
 - Keep relevance directed, positive, budgeted, and atomically validated.
@@ -49,7 +47,7 @@ repository-level guardrails when changing the implementation:
   unless the task explicitly changes the contract.
 - Add dependencies, randomness, external I/O, networking, or wall-clock-driven
   dynamics only when the task explicitly requires them. Keep integrations out
-  of deterministic transition logic.
+  of deterministic recall and feedback logic.
 - Update implementation, the applicable contract document, and contract tests
   together for every intentional behavior change.
 - Do not split coherent modules or add abstraction without a concrete ownership

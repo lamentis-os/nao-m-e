@@ -5,18 +5,17 @@ Symbol-specific behavior remains documented in the Rust API.
 
 ## State
 
-At logical step `t`, a memory has the state:
+The memory state is:
 
 ```text
-M(t) = (A, a(t), W)
+M = (A, W)
 ```
 
 - `A` is an append-only sequence of immutable episode atoms.
-- `a(t)` contains one fixed-point activation value per atom.
 - `W` is a sparse matrix of directed, positive relevance weights.
 
-Activation and relevance are mutable state separate from episode content.
-Inserting identical episode content creates distinct atoms.
+Relevance is mutable state separate from episode content. Inserting identical
+episode content creates distinct atoms.
 
 ## Symbolic episodes
 
@@ -29,7 +28,7 @@ Insertion sorts and deduplicates the context list by predicate identifier and
 then lexicographically by the ordered argument identifiers. It does not reorder
 a statement's arguments or otherwise interpret caller-owned identifiers.
 Timestamps are signed milliseconds on a caller-defined timeline and do not
-drive state transitions.
+drive recall or feedback.
 
 ## Identity and membership
 
@@ -45,9 +44,8 @@ diagnostic display is `<memory-id>:<sequence>` and is not a database or wire
 format; V0 defines no combined byte representation for `AtomId`.
 
 Constructing an `AtomId` does not prove that the atom exists. Read operations
-return `None` for a foreign memory identifier or absent local sequence.
-Stimulation and graph mutations reject those identifiers with
-`GraphError::UnknownAtom`.
+return `None` for a foreign memory identifier or absent local sequence. Recall
+and graph mutations reject those identifiers with `GraphError::UnknownAtom`.
 
 The caller must assign one `MemoryId` to one logical memory. Reopening that
 memory requires the same identifier and reconstruction of its complete atom
@@ -62,8 +60,9 @@ represents no edge. Edges are directed, self-edges are rejected, and the sum of
 outgoing weights from one atom cannot exceed `SCALE`. Setting or replacing an
 edge validates both endpoints and the resulting budget before mutation.
 
-A positive weight controls activation flow only. It does not encode truth,
-probability, confidence, evidence, causality, or semantic support.
+A positive weight controls source-conditioned accessibility only. It does not
+encode truth, probability, confidence, evidence, causality, or semantic
+support.
 
 ## External feedback
 
@@ -135,53 +134,22 @@ remain unchanged.
 
 All identifiers and the target-count limit are validated before relevance is
 mutated, so every returned error leaves the complete graph unchanged. Feedback
-changes neither immutable episode content nor activation.
+does not change immutable episode content.
 
-## Activation dynamics
+## Source-conditioned recall
 
-All unit-interval values use integer parts per million:
+Recall scores use integer parts per million with these fixed parameters:
 
 ```text
 SCALE            = 1,000,000
-RETENTION        =   500,000
 PROPAGATION_GAIN =   400,000
 ```
 
-External stimulation adds activation and saturates at `SCALE`. One explicit,
-synchronous logical step computes every target from the previous activation
-vector:
-
-```text
-next[j] = floor(
-    min(
-        SCALE^3,
-        RETENTION * SCALE * current[j]
-            + PROPAGATION_GAIN * sum(weight[i,j] * current[i])
-    ) / SCALE^2
-)
-```
-
-Retention and all incoming contributions share one rounding operation per
-target. The numerator is clamped at `SCALE^3`, so activation stays within the
-unit interval even when many edges converge. Because each source has an
-outgoing budget of at most `SCALE`, an unstimulated step retains at most 90% of
-the previous total activation across the memory, although an individual target
-can grow through incoming flow.
-
-A step is a caller-triggered logical tick. It has no wall-clock dependency, and
-episode timestamps do not affect retention or propagation.
-
-## Recall and reset
-
-`top_k(limit)` returns at most `limit` atoms with non-zero activation. Results
-are ordered by descending activation and then ascending `AtomId`; within one
-memory, ties therefore preserve insertion order. A zero limit returns no hits.
-
-`recall_from(source, limit)` performs a read-only, source-conditioned one-step
+`recall_from(source, limit)` performs a read-only, source-conditioned one-hop
 projection. It validates `source` even when `limit` is zero, then treats that
 source as fully active and every other atom as inactive. Only the source's
 direct outgoing relevance row is scanned. For each target, the projected
-activation score is:
+query-local activation score is:
 
 ```text
 score[target] = floor(weight[source,target] * PROPAGATION_GAIN / SCALE)
@@ -189,18 +157,16 @@ score[target] = floor(weight[source,target] * PROPAGATION_GAIN / SCALE)
 
 The source itself and targets whose score rounds to zero are excluded. At most
 `limit` hits are returned by descending projected activation and then ascending
-`AtomId`. Stored activation is not read as projection input. Neither activation
-nor relevance is mutated. Incoming edges, other source rows, retention, and
-multi-step paths do not contribute.
-
-Resetting activation leaves atoms and relevance edges unchanged.
+`AtomId`. The memory stores no activation vector. Neither episodes nor
+relevance are mutated. Incoming edges, other source rows, and multi-hop paths
+do not contribute.
 
 ## Kernel boundary
 
-The V0 kernel stores atoms, activation, and relevance only in a `MemoryV0`
-instance. It performs no persistence, loading, synchronization, or multi-writer
-coordination. It also performs no free-text processing, embedding or LLM calls,
-or autonomous relevance learning. Relevance changes only through explicit graph
-mutation or caller-supplied feedback. Persistence adapters remain outside the
-kernel; the format and lifecycle of the optional SQLite adapter are specified
-separately in the [SQLite V2 contract](sqlite-v2-contract.md).
+The V0 kernel stores atoms and relevance only in a `MemoryV0` instance. It
+performs no persistence, loading, synchronization, or multi-writer coordination.
+It also performs no free-text processing, embedding or LLM calls, or autonomous
+relevance learning. Relevance changes only through explicit graph mutation or
+caller-supplied feedback. Persistence adapters remain outside the kernel; the
+format and lifecycle of the optional SQLite adapter are specified separately in
+the [SQLite V2 contract](sqlite-v2-contract.md).

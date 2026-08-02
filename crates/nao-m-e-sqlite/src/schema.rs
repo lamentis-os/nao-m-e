@@ -29,18 +29,6 @@ CREATE TABLE episodes (
         CHECK (typeof(payload) = 'blob' AND length(payload) > 0)
 ) STRICT, WITHOUT ROWID;
 
-CREATE TABLE activations (
-    episode_sequence BLOB PRIMARY KEY
-        CHECK (
-            typeof(episode_sequence) = 'blob'
-            AND length(episode_sequence) = 8
-        ),
-    activation_ppm INTEGER NOT NULL
-        CHECK (activation_ppm BETWEEN 1 AND 1000000),
-    FOREIGN KEY (episode_sequence) REFERENCES episodes(sequence)
-        ON UPDATE RESTRICT ON DELETE RESTRICT
-) STRICT, WITHOUT ROWID;
-
 CREATE TABLE relevance_edges (
     from_sequence BLOB NOT NULL
         CHECK (
@@ -230,10 +218,7 @@ mod tests {
             .unwrap()
             .collect::<Result<_>>()
             .unwrap();
-        assert_eq!(
-            tables,
-            ["activations", "episodes", "memory_meta", "relevance_edges"]
-        );
+        assert_eq!(tables, ["episodes", "memory_meta", "relevance_edges"]);
     }
 
     #[test]
@@ -269,8 +254,8 @@ mod tests {
         let mutations = [
             SCHEMA.replacen("payload BLOB NOT NULL", "payload TEXT NOT NULL", 1),
             SCHEMA.replacen(
-                "CHECK (activation_ppm BETWEEN 1 AND 1000000)",
-                "CHECK (activation_ppm BETWEEN 0 AND 1000000)",
+                "CHECK (weight_ppm BETWEEN 1 AND 1000000)",
+                "CHECK (weight_ppm BETWEEN 0 AND 1000000)",
                 1,
             ),
             SCHEMA.replacen(
@@ -296,7 +281,7 @@ mod tests {
     fn validation_rejects_additional_persistent_objects() {
         for object in [
             "CREATE TABLE extra (value INTEGER) STRICT",
-            "CREATE INDEX extra_index ON activations(activation_ppm)",
+            "CREATE INDEX extra_index ON relevance_edges(weight_ppm)",
             "CREATE VIEW extra_view AS SELECT * FROM memory_meta",
             "CREATE TRIGGER extra_trigger AFTER UPDATE ON memory_meta BEGIN SELECT 1; END",
         ] {
@@ -308,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn constraints_enforce_canonical_keys_sparse_activation_and_edges() {
+    fn constraints_enforce_canonical_keys_and_edges() {
         let (_directory, mut connection) = open_temporary_database();
         configure(&connection);
         create_schema(&mut connection, MemoryId::new(1).unwrap()).unwrap();
@@ -341,20 +326,6 @@ mod tests {
             .execute(
                 "INSERT INTO episodes (sequence, payload) VALUES (?1, ?2)",
                 params![one.as_slice(), [1_u8].as_slice()],
-            )
-            .unwrap();
-        assert!(
-            connection
-                .execute(
-                    "INSERT INTO activations (episode_sequence, activation_ppm) VALUES (?1, 0)",
-                    [zero.as_slice()],
-                )
-                .is_err()
-        );
-        connection
-            .execute(
-                "INSERT INTO activations (episode_sequence, activation_ppm) VALUES (?1, 1)",
-                [zero.as_slice()],
             )
             .unwrap();
         assert!(

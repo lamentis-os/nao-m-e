@@ -84,8 +84,7 @@ before its schema and initial snapshot are committed.
   8-byte big-endian unsigned integers.
 - Timestamps in an episode payload are fixed-width 8-byte big-endian
   two's-complement signed integers containing the unchanged `i64` value.
-- Activation and relevance weights are SQLite integers containing parts per
-  million.
+- Relevance weights are SQLite integers containing parts per million.
 - An `AtomId` is reconstructed from the database `MemoryId` and an episode
   sequence. Its diagnostic display and Rust memory layout are never stored.
 
@@ -145,7 +144,7 @@ and the unsaved in-memory state remains available to the caller.
 
 ## Schema
 
-The following four tables are the complete application schema. Every table is
+The following three tables are the complete application schema. Every table is
 both `STRICT` and `WITHOUT ROWID`. All foreign-key actions are restrictive
 because episode rows are append-only.
 
@@ -171,18 +170,6 @@ CREATE TABLE episodes (
         CHECK (typeof(sequence) = 'blob' AND length(sequence) = 8),
     payload BLOB NOT NULL
         CHECK (typeof(payload) = 'blob' AND length(payload) > 0)
-) STRICT, WITHOUT ROWID;
-
-CREATE TABLE activations (
-    episode_sequence BLOB PRIMARY KEY
-        CHECK (
-            typeof(episode_sequence) = 'blob'
-            AND length(episode_sequence) = 8
-        ),
-    activation_ppm INTEGER NOT NULL
-        CHECK (activation_ppm BETWEEN 1 AND 1000000),
-    FOREIGN KEY (episode_sequence) REFERENCES episodes(sequence)
-        ON UPDATE RESTRICT ON DELETE RESTRICT
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE relevance_edges (
@@ -217,7 +204,7 @@ COMMIT;
 
 `memory_meta` contains exactly one row with `singleton = 1`. Creation inserts a
 randomly generated non-zero memory ID and snapshot revision `0`. `:memory_id`
-denotes the bound canonical 16-byte BLOB. The application ID, all four table
+denotes the bound canonical 16-byte BLOB. The application ID, all three table
 definitions, and this singleton row are committed together or not at all.
 
 Episode rows are append-only and their sequences form the exact prefix
@@ -225,19 +212,17 @@ Episode rows are append-only and their sequences form the exact prefix
 sequence. There are no statement or term tables and no content dictionaries or
 content deduplication.
 
-Activations are sparse. A missing row is the canonical representation of zero;
-a stored row therefore contains only a value in `1..=SCALE`. Relevance is also
-sparse and stores only positive edges. The schema rejects invalid storage
-classes, lengths, ranges, duplicate keys, self-edges, and missing endpoints.
-The adapter additionally validates the cross-row relevance budget that SQL does
-not enforce efficiently.
+Relevance is sparse and stores only positive edges. The schema rejects invalid
+storage classes, lengths, ranges, duplicate keys, self-edges, and missing
+endpoints. The adapter additionally validates the cross-row relevance budget
+that SQL does not enforce efficiently.
 
-The application schema is closed. It contains exactly these four user tables
+The application schema is closed. It contains exactly these three user tables
 and no additional persistent user table, view, trigger, or user-defined index.
 SQLite-owned internal objects and automatic indexes are not user extensions.
 On `open()` and before every `save()`, the adapter validates the complete
 `main.sqlite_schema` object inventory and compares whitespace-normalized
-`CREATE TABLE` SQL with the four canonical definitions above. The canonical
+`CREATE TABLE` SQL with the three canonical definitions above. The canonical
 text includes every column, type, constraint, primary key, foreign key,
 `STRICT`, and `WITHOUT ROWID` clause. Whitespace-only formatting differences
 may be accepted; any object, token, or constraint drift is rejected.
@@ -254,7 +239,7 @@ The staging connection receives the required session and durability settings.
 One immediate transaction commits the application ID, schema, metadata, and
 empty snapshot. Before publication, the adapter verifies the application ID,
 supported format, canonical closed schema, singleton metadata, revision zero,
-empty episode and sparse-state tables, `PRAGMA quick_check`, and
+empty episode and relevance tables, `PRAGMA quick_check`, and
 `PRAGMA foreign_key_check`. It then closes the SQLite connection, flushes the
 staging file, and calls `sync_all()` on that file.
 
@@ -283,7 +268,7 @@ classified as `UnsupportedFormatVersion`. The remaining checks are:
 
 1. `memory_meta` contains exactly one row with a non-zero canonical memory ID
    and a non-negative revision.
-2. The application schema is the canonical closed four-table schema.
+2. The application schema is the canonical closed three-table schema.
 3. `PRAGMA quick_check` returns exactly one row containing `ok`, and
    `PRAGMA foreign_key_check` returns no violations.
 4. Episode sequences are exactly `0..N-1` without gaps, and every payload is a
@@ -291,9 +276,7 @@ classified as `UnsupportedFormatVersion`. The remaining checks are:
 5. Stored context is already strictly increasing and duplicate-free. Every
    reconstructed episode is accepted by the core without changing its content,
    and the returned `AtomId` has the expected sequence and memory ID.
-6. Every activation row references an episode and contains `1..=SCALE`.
-   Episodes without a row retain their initial zero activation.
-7. Relevance endpoints exist, edges are unique and non-reflexive, and each
+6. Relevance endpoints exist, edges are unique and non-reflexive, and each
    source's total outgoing weight is at most `SCALE`.
 
 Rows are consumed in canonical key order. Reconstruction occurs only in local
@@ -302,16 +285,14 @@ state:
 1. Create a `MemoryV0` with the stored `MemoryId`.
 2. Decode and insert episodes in sequence order, checking every returned
    `AtomId`.
-3. Apply each sparse activation row once to its initially zero atom.
-4. Install relevance edges in source and target order through the core API.
+3. Install relevance edges in source and target order through the core API.
 
 Any storage-level or core rejection invalidates the complete snapshot. The
 adapter does not expose the reconstructed `MemoryV0` until all rows and all
-invariants have been validated. A late activation or relevance error therefore
-discards the local reconstruction rather than returning a partial memory. If a
-snapshot contains multiple independent violations, which violation is reported
-first is unspecified. The transition scratch buffer is not stored because
-every logical `step()` overwrites it before use.
+invariants have been validated. A late relevance error therefore discards the
+local reconstruction rather than returning a partial memory. If a snapshot
+contains multiple independent violations, which violation is reported first is
+unspecified.
 
 ## Saving and writer exclusion
 
@@ -332,10 +313,8 @@ episode count. `save()` starts `BEGIN IMMEDIATE` and performs one transaction:
    identity and expected revision were checked inside that same transaction.
 6. Append only episodes at or beyond the remembered count, encoding one
    complete payload BLOB per episode.
-7. Replace the complete sparse activation table, inserting only non-zero
-   activations.
-8. Replace the complete sparse relevance table.
-9. Commit, then update the store's remembered revision and episode count.
+7. Replace the complete sparse relevance table.
+8. Commit, then update the store's remembered revision and episode count.
 
 Every successful save increments the revision exactly once, including a save
 with no logical state change. The append-boundary query uses the ordered episode
@@ -360,17 +339,16 @@ errors remain available through `std::error::Error::source`.
 `StoreIntegrityError` reports application mismatch, missing metadata,
 unsupported format version, failed quick check, foreign-key violations,
 invalid fixed-width or payload encoding, invalid memory ID, invalid metadata,
-non-contiguous episode sequences, invalid episodes, invalid activation rows, or
-invalid relevance. A non-canonical schema is invalid metadata. Both error enums
-are non-exhaustive so later releases can report corruption more precisely
+non-contiguous episode sequences, invalid episodes, or invalid relevance. A
+non-canonical schema is invalid metadata. Both error enums are non-exhaustive
+so later releases can report corruption more precisely
 without making callers treat the variants as a closed format definition.
 
 The adapter fails closed. It does not migrate an unsupported format, accept a
 non-canonical schema or payload, renumber episodes, canonicalize malformed
 stored context, drop invalid rows, clamp stored values, reduce relevance
-weights, or expose a partially reconstructed memory. Sparse activation absence
-alone is canonical zero, not corruption. Direct SQL modification is not a
-supported API.
+weights, or expose a partially reconstructed memory. Direct SQL modification
+is not a supported API.
 
 ## CLI boundary
 

@@ -135,13 +135,6 @@ pub enum StoreIntegrityError {
         /// Violated episode invariant.
         detail: &'static str,
     },
-    /// A persisted positive activation is invalid.
-    InvalidActivation {
-        /// Sequence of the affected episode.
-        sequence: u64,
-        /// Violated activation invariant.
-        detail: &'static str,
-    },
     /// A relevance edge is invalid.
     InvalidRelevance {
         /// Source sequence.
@@ -183,12 +176,6 @@ impl fmt::Display for StoreIntegrityError {
             ),
             Self::InvalidEpisode { sequence, detail } => {
                 write!(formatter, "invalid episode {sequence}: {detail}")
-            }
-            Self::InvalidActivation { sequence, detail } => {
-                write!(
-                    formatter,
-                    "invalid activation for episode {sequence}: {detail}"
-                )
             }
             Self::InvalidRelevance { from, to, detail } => {
                 write!(formatter, "invalid relevance edge {from}->{to}: {detail}")
