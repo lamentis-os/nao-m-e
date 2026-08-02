@@ -177,6 +177,22 @@ episode timestamps do not affect retention or propagation.
 are ordered by descending activation and then ascending `AtomId`; within one
 memory, ties therefore preserve insertion order. A zero limit returns no hits.
 
+`recall_from(source, limit)` performs a read-only, source-conditioned one-step
+projection. It validates `source` even when `limit` is zero, then treats that
+source as fully active and every other atom as inactive. Only the source's
+direct outgoing relevance row is scanned. For each target, the projected
+activation score is:
+
+```text
+score[target] = floor(weight[source,target] * PROPAGATION_GAIN / SCALE)
+```
+
+The source itself and targets whose score rounds to zero are excluded. At most
+`limit` hits are returned by descending projected activation and then ascending
+`AtomId`. Stored activation is not read as projection input. Neither activation
+nor relevance is mutated. Incoming edges, other source rows, retention, and
+multi-step paths do not contribute.
+
 Resetting activation leaves atoms and relevance edges unchanged.
 
 ## Kernel boundary
