@@ -97,6 +97,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 ```
 
+`save()` appends only new episodes and reconciles small relevance changes
+without rewriting equal rows; wholesale graph changes use a bounded bulk
+replacement. `open()` still reconstructs and validates the complete snapshot
+before exposing memory state.
+
 ## Command-line interface
 
 Install the private workspace binary from a checkout:

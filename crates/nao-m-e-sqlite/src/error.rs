@@ -102,11 +102,6 @@ pub enum StoreIntegrityError {
         /// Diagnostic returned by SQLite.
         detail: String,
     },
-    /// SQLite reported at least one foreign-key violation.
-    ForeignKeyViolation {
-        /// Compact diagnostic identifying the violation.
-        detail: String,
-    },
     /// A column did not contain its canonical fixed-width encoding.
     InvalidEncoding {
         /// Table containing the invalid value.
@@ -161,9 +156,6 @@ impl fmt::Display for StoreIntegrityError {
             }
             Self::QuickCheckFailed { detail } => {
                 write!(formatter, "SQLite quick check failed: {detail}")
-            }
-            Self::ForeignKeyViolation { detail } => {
-                write!(formatter, "SQLite foreign-key check failed: {detail}")
             }
             Self::InvalidEncoding { table, column } => {
                 write!(formatter, "invalid encoding in {table}.{column}")

@@ -240,8 +240,8 @@ One immediate transaction commits the application ID, schema, metadata, and
 empty snapshot. Before publication, the adapter verifies the application ID,
 supported format, canonical closed schema, singleton metadata, revision zero,
 empty episode and relevance tables, `PRAGMA quick_check`, and
-`PRAGMA foreign_key_check`. It then closes the SQLite connection, flushes the
-staging file, and calls `sync_all()` on that file.
+complete core reconstruction. It then closes the SQLite connection, flushes
+the staging file, and calls `sync_all()` on that file.
 
 The validated staging file is published to the requested target with a
 no-clobber operation such as `persist_noclobber`. A pre-existing target, or one
@@ -269,8 +269,7 @@ classified as `UnsupportedFormatVersion`. The remaining checks are:
 1. `memory_meta` contains exactly one row with a non-zero canonical memory ID
    and a non-negative revision.
 2. The application schema is the canonical closed three-table schema.
-3. `PRAGMA quick_check` returns exactly one row containing `ok`, and
-   `PRAGMA foreign_key_check` returns no violations.
+3. `PRAGMA quick_check` returns exactly one row containing `ok`.
 4. Episode sequences are exactly `0..N-1` without gaps, and every payload is a
    canonical, exactly consumed whole-episode encoding.
 5. Stored context is already strictly increasing and duplicate-free. Every
@@ -313,13 +312,31 @@ episode count. `save()` starts `BEGIN IMMEDIATE` and performs one transaction:
    identity and expected revision were checked inside that same transaction.
 6. Append only episodes at or beyond the remembered count, encoding one
    complete payload BLOB per episode.
-7. Replace the complete sparse relevance table.
+7. Compare persisted and in-memory relevance in canonical source/target order,
+   then delete absent edges, update changed weights, and insert new edges.
 8. Commit, then update the store's remembered revision and episode count.
 
 Every successful save increments the revision exactly once, including a save
 with no logical state change. The append-boundary query uses the ordered episode
 primary key and does not count or scan the immutable prefix. Direct SQL edits
 remain unsupported; the next `open()` performs complete fail-closed validation.
+
+Relevance reconciliation performs one ordered `O(E)` comparison because
+`memory_mut()` permits unrestricted graph mutation and the adapter deliberately
+does not duplicate the complete persisted graph or put persistence dirty
+tracking into the core. A bounded delta plan retains small change sets until
+the SQLite read cursor is closed, then performs `O(D)` row mutations for `D`
+inserted, updated, or deleted edges; equal rows are not rewritten on this path.
+If the delta exceeds that fixed internal bound, the adapter discards the plan
+and replaces the complete relevance table after validation. This keeps
+transient reconciliation memory bounded and avoids pathological row-by-row DML
+for a wholesale graph replacement.
+
+Every persisted relevance record encountered by the comparison is decoded and
+validated against the previously persisted episode prefix and cumulative
+source budget before any relevance DML begins. An invalid persisted graph
+therefore fails the save and rolls back the transaction rather than being
+silently repaired.
 
 If any operation fails before commit, the transaction rolls back and the
 previous database snapshot remains visible. The in-memory changes remain
@@ -337,11 +354,11 @@ platform error category is not part of the portable contract. Wrapped source
 errors remain available through `std::error::Error::source`.
 
 `StoreIntegrityError` reports application mismatch, missing metadata,
-unsupported format version, failed quick check, foreign-key violations,
-invalid fixed-width or payload encoding, invalid memory ID, invalid metadata,
-non-contiguous episode sequences, invalid episodes, or invalid relevance. A
-non-canonical schema is invalid metadata. Both error enums are non-exhaustive
-so later releases can report corruption more precisely
+unsupported format version, failed quick check, invalid fixed-width or payload
+encoding, invalid memory ID, invalid metadata, non-contiguous episode
+sequences, invalid episodes, or invalid relevance. A non-canonical schema is
+invalid metadata. Both error enums are non-exhaustive so later releases can
+report corruption more precisely
 without making callers treat the variants as a closed format definition.
 
 The adapter fails closed. It does not migrate an unsupported format, accept a

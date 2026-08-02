@@ -51,6 +51,7 @@ CREATE TABLE relevance_edges (
 "#;
 
 static CANONICAL_SCHEMA: OnceLock<Vec<SchemaObject>> = OnceLock::new();
+const SCHEMA_TABLE_NAMES: [&str; 3] = ["memory_meta", "episodes", "relevance_edges"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SchemaObject {
@@ -74,9 +75,13 @@ pub(crate) fn configure_session(connection: &Connection) -> Result<()> {
 
 pub(crate) fn configure_durability(connection: &Connection) -> Result<()> {
     let journal_mode: String =
-        connection.query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
+        connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
     if !journal_mode.eq_ignore_ascii_case("delete") {
-        return Err(Error::InvalidQuery);
+        let configured: String =
+            connection.query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
+        if !configured.eq_ignore_ascii_case("delete") {
+            return Err(Error::InvalidQuery);
+        }
     }
 
     connection.pragma_update(None, "synchronous", "EXTRA")?;
@@ -105,17 +110,30 @@ pub(crate) fn create_schema(connection: &mut Connection, memory_id: MemoryId) ->
 }
 
 pub(crate) fn validate_schema(connection: &Connection) -> Result<bool> {
-    Ok(read_schema_objects(connection)? == *canonical_schema_objects()?)
+    Ok(read_schema_objects(connection)? == *canonical_schema_objects())
 }
 
-fn canonical_schema_objects() -> Result<&'static Vec<SchemaObject>> {
-    if let Some(schema) = CANONICAL_SCHEMA.get() {
-        return Ok(schema);
-    }
-    let connection = Connection::open_in_memory()?;
-    connection.execute_batch(SCHEMA)?;
-    let schema = read_schema_objects(&connection)?;
-    Ok(CANONICAL_SCHEMA.get_or_init(|| schema))
+fn canonical_schema_objects() -> &'static Vec<SchemaObject> {
+    CANONICAL_SCHEMA.get_or_init(|| {
+        let definitions: Vec<_> = SCHEMA
+            .split(';')
+            .map(str::trim)
+            .filter(|definition| !definition.is_empty())
+            .collect();
+        assert_eq!(definitions.len(), SCHEMA_TABLE_NAMES.len());
+        let mut objects: Vec<_> = SCHEMA_TABLE_NAMES
+            .into_iter()
+            .zip(definitions)
+            .map(|(name, definition)| SchemaObject {
+                object_type: "table".to_owned(),
+                name: name.to_owned(),
+                table_name: name.to_owned(),
+                normalized_sql: Some(normalize_sql(definition)),
+            })
+            .collect();
+        objects.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        objects
+    })
 }
 
 fn read_schema_objects(connection: &Connection) -> Result<Vec<SchemaObject>> {

@@ -186,7 +186,7 @@ fn full_snapshot_round_trips_exactly_and_continues_the_sequence() {
 }
 
 #[test]
-fn repeated_saves_persist_relevance_replacement() {
+fn repeated_saves_persist_relevance_deltas() {
     let directory = tempdir().expect("temporary directory is available");
     let path = database_path(&directory);
     let mut store = SqliteStore::create(&path).expect("new store is created");
