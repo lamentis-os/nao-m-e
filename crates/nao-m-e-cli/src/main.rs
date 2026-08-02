@@ -9,14 +9,14 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use nao_m_e::{
-    Activation, AtomId, EpisodeAtom, EpisodeDraft, InfluenceWeight, MAX_FEEDBACK_TARGETS, MemoryId,
-    MemoryV0, PredicateId, SourceId, Statement, TermId, TimestampMs,
+    AtomId, EpisodeAtom, EpisodeDraft, InfluenceWeight, MAX_FEEDBACK_TARGETS, MemoryId, MemoryV0,
+    PredicateId, SourceId, Statement, TermId, TimestampMs,
 };
 use nao_m_e_sqlite::SqliteStore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const SCHEMA_VERSION: u32 = 1;
+const CLI_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_RECALL_LIMIT: usize = 10;
 
 const ROOT_HELP: &str = "NAO-M-E symbolic memory command-line interface
@@ -24,13 +24,12 @@ const ROOT_HELP: &str = "NAO-M-E symbolic memory command-line interface
 Usage:
   nao-m-e init <DATABASE>
   nao-m-e run <DATABASE> --input <FILE|->
-  nao-m-e recall <DATABASE> [--limit <N>]
-  nao-m-e recall <DATABASE> --sequence <N>
+  nao-m-e recall <DATABASE> --from-sequence <N> [--limit <N>]
 
 Commands:
   init      Create a new SQLite memory store without replacing an existing file
   run       Apply one JSON operation batch and save it atomically
-  recall    Return ranked active episodes or inspect one episode by sequence
+  recall    Return direct source-conditioned episodes without changing state
 
 Options:
   -h, --help     Show help
@@ -51,13 +50,13 @@ Usage:
 Use '-' as the input path to read JSON from standard input.
 ";
 
-const RECALL_HELP: &str = "Return ranked active episodes or inspect one episode by sequence.
+const RECALL_HELP: &str = "Return direct source-conditioned episodes without changing state.
 
 Usage:
-  nao-m-e recall <DATABASE> [--limit <N>]
-  nao-m-e recall <DATABASE> --sequence <N>
+  nao-m-e recall <DATABASE> --from-sequence <N>
+  nao-m-e recall <DATABASE> --from-sequence <N> --limit <N>
 
-The default recall limit is 10. The two modes are mutually exclusive.
+The default recall limit is 10.
 ";
 
 fn main() -> ExitCode {
@@ -91,14 +90,18 @@ enum ParsedArgs {
 }
 
 enum Command {
-    Init { database: PathBuf },
-    Run { database: PathBuf, input: PathBuf },
-    Recall { database: PathBuf, mode: RecallMode },
-}
-
-enum RecallMode {
-    Top { limit: usize },
-    Sequence { sequence: u64 },
+    Init {
+        database: PathBuf,
+    },
+    Run {
+        database: PathBuf,
+        input: PathBuf,
+    },
+    Recall {
+        database: PathBuf,
+        source_sequence: u64,
+        limit: usize,
+    },
 }
 
 fn parse_args(args: Vec<OsString>) -> Result<ParsedArgs, String> {
@@ -154,24 +157,31 @@ fn parse_recall_args(args: &[OsString]) -> Result<ParsedArgs, String> {
         return Err("`recall` requires a database path".to_owned());
     };
 
-    let mode = match &args[1..] {
-        [] => RecallMode::Top {
-            limit: DEFAULT_RECALL_LIMIT,
-        },
-        [option, value] if option.as_os_str() == OsStr::new("--limit") => RecallMode::Top {
-            limit: parse_number(value, "recall limit")?,
-        },
-        [option, value] if option.as_os_str() == OsStr::new("--sequence") => RecallMode::Sequence {
-            sequence: parse_number(value, "episode sequence")?,
-        },
+    let (source_sequence, limit) = match &args[1..] {
+        [option, source] if option.as_os_str() == OsStr::new("--from-sequence") => (
+            parse_number(source, "source sequence")?,
+            DEFAULT_RECALL_LIMIT,
+        ),
+        [source_option, source, limit_option, limit]
+            if source_option.as_os_str() == OsStr::new("--from-sequence")
+                && limit_option.as_os_str() == OsStr::new("--limit") =>
+        {
+            (
+                parse_number(source, "source sequence")?,
+                parse_number(limit, "recall limit")?,
+            )
+        }
         _ => {
-            return Err("`recall` accepts either `--limit <N>` or `--sequence <N>`".to_owned());
+            return Err(
+                "`recall` requires <DATABASE> --from-sequence <N> [--limit <N>]".to_owned(),
+            );
         }
     };
 
     Ok(ParsedArgs::Execute(Command::Recall {
         database: PathBuf::from(database),
-        mode,
+        source_sequence,
+        limit,
     }))
 }
 
@@ -194,7 +204,11 @@ fn execute(command: Command) -> CliResult<Vec<u8>> {
     match command {
         Command::Init { database } => execute_init(&database),
         Command::Run { database, input } => execute_run(&database, &input),
-        Command::Recall { database, mode } => execute_recall(&database, mode),
+        Command::Recall {
+            database,
+            source_sequence,
+            limit,
+        } => execute_recall(&database, source_sequence, limit),
     }
 }
 
@@ -202,7 +216,7 @@ fn execute_init(database: &Path) -> CliResult<Vec<u8>> {
     let store = SqliteStore::create(database)
         .map_err(|error| format!("could not create `{}`: {error}", database.display()))?;
     let response = InitResponse {
-        schema_version: SCHEMA_VERSION,
+        schema_version: CLI_SCHEMA_VERSION,
         memory_id: encode_memory_id(store.memory_id()),
         episode_count: 0,
     };
@@ -211,9 +225,9 @@ fn execute_init(database: &Path) -> CliResult<Vec<u8>> {
 
 fn execute_run(database: &Path, input: &Path) -> CliResult<Vec<u8>> {
     let scenario = read_scenario(input)?;
-    if scenario.schema_version != SCHEMA_VERSION {
+    if scenario.schema_version != CLI_SCHEMA_VERSION {
         return Err(format!(
-            "unsupported scenario schema_version {}; expected {SCHEMA_VERSION}",
+            "unsupported scenario schema_version {}; expected {CLI_SCHEMA_VERSION}",
             scenario.schema_version
         ));
     }
@@ -251,7 +265,7 @@ fn execute_run(database: &Path, input: &Path) -> CliResult<Vec<u8>> {
     }
 
     let response = RunResponse {
-        schema_version: SCHEMA_VERSION,
+        schema_version: CLI_SCHEMA_VERSION,
         memory_id: encode_memory_id(store.memory_id()),
         operations_applied: u64::try_from(operation_count)
             .map_err(|_| "operation count exceeds the JSON protocol range".to_owned())?,
@@ -270,50 +284,28 @@ fn execute_run(database: &Path, input: &Path) -> CliResult<Vec<u8>> {
     Ok(output)
 }
 
-fn execute_recall(database: &Path, mode: RecallMode) -> CliResult<Vec<u8>> {
+fn execute_recall(database: &Path, source_sequence: u64, limit: usize) -> CliResult<Vec<u8>> {
     let store = SqliteStore::open(database)
         .map_err(|error| format!("could not open `{}`: {error}", database.display()))?;
-    let memory_id = encode_memory_id(store.memory_id());
-
-    match mode {
-        RecallMode::Top { limit } => {
-            let hits = store
-                .memory()
-                .top_k(limit)
-                .into_iter()
-                .map(|hit| {
-                    let episode = store
-                        .memory()
-                        .episode(hit.atom_id)
-                        .expect("recall hits always reference stored episodes");
-                    RecallEpisode::from_atom(episode, hit.activation.as_ppm())
-                })
-                .collect();
-            serialize_response(&RecallResponse {
-                schema_version: SCHEMA_VERSION,
-                memory_id,
-                hits,
-            })
-        }
-        RecallMode::Sequence { sequence } => {
-            let id = AtomId::from_parts(store.memory_id(), sequence);
+    let source = AtomId::from_parts(store.memory_id(), source_sequence);
+    let hits = store
+        .memory()
+        .recall_from(source, limit)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|hit| {
             let episode = store
                 .memory()
-                .episode(id)
-                .ok_or_else(|| format!("unknown episode sequence {sequence}"))?;
-            let activation = store
-                .memory()
-                .activation(id)
-                .expect("stored episodes always have activation state");
-            serialize_response(&SequenceResponse {
-                schema_version: SCHEMA_VERSION,
-                memory_id,
-                sequence,
-                activation_ppm: activation.as_ppm(),
-                episode: EpisodeDocument::from(episode),
-            })
-        }
-    }
+                .episode(hit.atom_id)
+                .expect("recall hits always reference stored episodes");
+            RecallEpisode::from_atom(episode, hit.activation.as_ppm())
+        })
+        .collect();
+    serialize_response(&RecallResponse {
+        schema_version: CLI_SCHEMA_VERSION,
+        memory_id: encode_memory_id(store.memory_id()),
+        hits,
+    })
 }
 
 fn read_scenario(input: &Path) -> CliResult<ScenarioInput> {
@@ -378,13 +370,6 @@ fn apply_operation(
                 .remove_relevance(from, to)
                 .map_err(|error| error.to_string())?;
         }
-        OperationInput::Stimulate { atom, amount_ppm } => {
-            let atom = resolve_atom(atom, memory, baseline_episode_count, labels)?;
-            let amount = Activation::from_ppm(amount_ppm).map_err(|error| error.to_string())?;
-            memory
-                .stimulate(atom, amount)
-                .map_err(|error| error.to_string())?;
-        }
         OperationInput::ApplyFeedback {
             source,
             targets,
@@ -410,15 +395,6 @@ fn apply_operation(
                 .apply_feedback(source, &targets, helpful)
                 .map_err(|error| error.to_string())?;
         }
-        OperationInput::Step { count } => {
-            if count == 0 {
-                return Err("step count must be positive".to_owned());
-            }
-            for _ in 0..count {
-                memory.step();
-            }
-        }
-        OperationInput::ResetActivations {} => memory.reset_activations(),
     }
     Ok(())
 }
@@ -495,19 +471,11 @@ enum OperationInput {
         from: AtomReferenceInput,
         to: AtomReferenceInput,
     },
-    Stimulate {
-        atom: AtomReferenceInput,
-        amount_ppm: u32,
-    },
     ApplyFeedback {
         source: AtomReferenceInput,
         targets: Vec<AtomReferenceInput>,
         feedback: u8,
     },
-    Step {
-        count: u32,
-    },
-    ResetActivations {},
 }
 
 impl OperationInput {
@@ -516,10 +484,7 @@ impl OperationInput {
             Self::InsertEpisode { .. } => "insert_episode",
             Self::SetRelevance { .. } => "set_relevance",
             Self::RemoveRelevance { .. } => "remove_relevance",
-            Self::Stimulate { .. } => "stimulate",
             Self::ApplyFeedback { .. } => "apply_feedback",
-            Self::Step { .. } => "step",
-            Self::ResetActivations {} => "reset_activations",
         }
     }
 }
@@ -628,15 +593,6 @@ struct RecallResponse {
     schema_version: u32,
     memory_id: String,
     hits: Vec<RecallEpisode>,
-}
-
-#[derive(Serialize)]
-struct SequenceResponse {
-    schema_version: u32,
-    memory_id: String,
-    sequence: u64,
-    activation_ppm: u32,
-    episode: EpisodeDocument,
 }
 
 #[derive(Serialize)]

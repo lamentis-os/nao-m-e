@@ -1059,6 +1059,203 @@ fn top_k_matches_full_ranking_for_every_limit() {
 }
 
 #[test]
+fn recall_from_projects_only_the_source_row_without_mutating_state() {
+    let mut memory = new_memory(1);
+    let source = insert(&mut memory, 1);
+    let strongest = insert(&mut memory, 2);
+    let weaker = insert(&mut memory, 3);
+    let weakest = insert(&mut memory, 4);
+    let incoming = insert(&mut memory, 5);
+    let downstream = insert(&mut memory, 6);
+    memory
+        .set_relevance(source, strongest, weight(600_000))
+        .expect("strongest direct edge fits");
+    memory
+        .set_relevance(source, weaker, weight(250_000))
+        .expect("weaker direct edge fits");
+    memory
+        .set_relevance(source, weakest, weight(150_000))
+        .expect("weakest direct edge fits");
+    memory
+        .set_relevance(incoming, source, weight(SCALE))
+        .expect("incoming edge fits");
+    memory
+        .set_relevance(strongest, downstream, weight(SCALE))
+        .expect("downstream edge fits");
+    for (id, value) in [
+        (source, 123_456),
+        (strongest, 10),
+        (weaker, SCALE),
+        (weakest, 900_000),
+        (incoming, 800_000),
+        (downstream, 700_000),
+    ] {
+        memory
+            .stimulate(id, activation(value))
+            .expect("stored activation applies");
+    }
+    let activations_before: Vec<_> = memory
+        .episodes()
+        .map(|episode| {
+            (
+                episode.id(),
+                memory.activation(episode.id()).expect("known atom"),
+            )
+        })
+        .collect();
+    let relevance_before = relevance_snapshot(&memory);
+
+    assert_eq!(
+        memory
+            .recall_from(source, usize::MAX)
+            .expect("source is known"),
+        vec![
+            nao_m_e::RecallHit {
+                atom_id: strongest,
+                activation: activation(240_000),
+            },
+            nao_m_e::RecallHit {
+                atom_id: weaker,
+                activation: activation(100_000),
+            },
+            nao_m_e::RecallHit {
+                atom_id: weakest,
+                activation: activation(60_000),
+            },
+        ]
+    );
+    assert_eq!(
+        memory
+            .episodes()
+            .map(|episode| {
+                (
+                    episode.id(),
+                    memory.activation(episode.id()).expect("known atom"),
+                )
+            })
+            .collect::<Vec<_>>(),
+        activations_before
+    );
+    assert_eq!(relevance_snapshot(&memory), relevance_before);
+}
+
+#[test]
+fn recall_from_excludes_rounded_zero_and_matches_full_ranking_for_every_limit() {
+    let mut memory = new_memory(1);
+    let source = insert(&mut memory, 1);
+    let strongest = insert(&mut memory, 2);
+    let first_tie = insert(&mut memory, 3);
+    let second_tie = insert(&mut memory, 4);
+    let one_ppm_edge = insert(&mut memory, 5);
+    let two_ppm_edge = insert(&mut memory, 6);
+    let three_ppm_edge = insert(&mut memory, 7);
+    memory
+        .set_relevance(source, strongest, weight(400_000))
+        .expect("strongest edge fits");
+    memory
+        .set_relevance(source, first_tie, weight(250_000))
+        .expect("first tied edge fits");
+    memory
+        .set_relevance(source, second_tie, weight(250_000))
+        .expect("second tied edge fits");
+    memory
+        .set_relevance(source, one_ppm_edge, weight(1))
+        .expect("one-ppm edge fits");
+    memory
+        .set_relevance(source, two_ppm_edge, weight(2))
+        .expect("two-ppm edge fits");
+    memory
+        .set_relevance(source, three_ppm_edge, weight(3))
+        .expect("three-ppm edge fits");
+
+    let complete = memory
+        .recall_from(source, usize::MAX)
+        .expect("source is known");
+    assert_eq!(
+        complete,
+        vec![
+            nao_m_e::RecallHit {
+                atom_id: strongest,
+                activation: activation(160_000),
+            },
+            nao_m_e::RecallHit {
+                atom_id: first_tie,
+                activation: activation(100_000),
+            },
+            nao_m_e::RecallHit {
+                atom_id: second_tie,
+                activation: activation(100_000),
+            },
+            nao_m_e::RecallHit {
+                atom_id: three_ppm_edge,
+                activation: activation(1),
+            },
+        ]
+    );
+    assert!(!complete.iter().any(|hit| hit.atom_id == one_ppm_edge));
+    assert!(!complete.iter().any(|hit| hit.atom_id == two_ppm_edge));
+
+    for limit in 0..=complete.len() + 1 {
+        assert_eq!(
+            memory.recall_from(source, limit).expect("source is known"),
+            complete.iter().copied().take(limit).collect::<Vec<_>>(),
+            "limit {limit}"
+        );
+    }
+}
+
+#[test]
+fn recall_from_validates_the_source_before_the_limit_and_handles_isolated_sources() {
+    let memory = {
+        let mut memory = new_memory(1);
+        insert(&mut memory, 1);
+        memory
+    };
+    let known = memory.episodes().next().expect("one atom exists").id();
+    let absent = AtomId::from_parts(memory.memory_id(), u64::MAX);
+    let foreign = AtomId::from_parts(memory_id(2), 0);
+
+    assert_eq!(memory.recall_from(known, 0), Ok(Vec::new()));
+    assert_eq!(memory.recall_from(known, usize::MAX), Ok(Vec::new()));
+    assert_eq!(
+        memory.recall_from(absent, 0),
+        Err(GraphError::UnknownAtom(absent))
+    );
+    assert_eq!(
+        memory.recall_from(foreign, 0),
+        Err(GraphError::UnknownAtom(foreign))
+    );
+}
+
+#[test]
+fn feedback_updates_source_conditioned_recall_without_a_step() {
+    let mut memory = new_memory(1);
+    let source = insert(&mut memory, 1);
+    let target = insert(&mut memory, 2);
+
+    memory
+        .apply_feedback(source, &[target], true)
+        .expect("positive feedback applies");
+    assert_eq!(
+        memory.recall_from(source, 1).expect("source is known"),
+        vec![nao_m_e::RecallHit {
+            atom_id: target,
+            activation: activation(400),
+        }]
+    );
+
+    memory
+        .apply_feedback(source, &[target], false)
+        .expect("negative feedback applies");
+    assert!(
+        memory
+            .recall_from(source, 1)
+            .expect("source is known")
+            .is_empty()
+    );
+}
+
+#[test]
 fn step_buffers_remain_aligned_after_insertion_and_reset() {
     let mut memory = new_memory(1);
     let first = insert(&mut memory, 1);

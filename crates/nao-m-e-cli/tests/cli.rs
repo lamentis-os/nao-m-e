@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use nao_m_e::{AtomId, MAX_FEEDBACK_TARGETS};
+use nao_m_e::{Activation, AtomId, InfluenceWeight, MAX_FEEDBACK_TARGETS};
 use nao_m_e_sqlite::SqliteStore;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -61,23 +61,16 @@ fn run_stdin(database: &Path, scenario: &Value) -> Output {
     invoke(command, Some(&scenario.to_string()))
 }
 
-fn recall_limit(database: &Path, limit: usize) -> Value {
+fn recall_source(database: &Path, source_sequence: u64, limit: Option<usize>) -> Output {
     let mut command = cli();
     command
         .arg("recall")
         .arg(database)
-        .arg("--limit")
-        .arg(limit.to_string());
-    assert_success(invoke(command, None))
-}
-
-fn recall_sequence(database: &Path, sequence: u64) -> Output {
-    let mut command = cli();
-    command
-        .arg("recall")
-        .arg(database)
-        .arg("--sequence")
-        .arg(sequence.to_string());
+        .arg("--from-sequence")
+        .arg(source_sequence.to_string());
+    if let Some(limit) = limit {
+        command.arg("--limit").arg(limit.to_string());
+    }
     invoke(command, None)
 }
 
@@ -110,6 +103,7 @@ fn help_version_and_usage_have_stable_exit_categories() {
         &["--help"][..],
         &["init", "--help"][..],
         &["run", "--help"][..],
+        &["recall", "--help"][..],
     ] {
         let mut command = cli();
         command.args(arguments);
@@ -135,9 +129,7 @@ fn help_version_and_usage_have_stable_exit_categories() {
         .arg("recall")
         .arg("memory.sqlite3")
         .arg("--limit")
-        .arg("1")
-        .arg("--sequence")
-        .arg("0");
+        .arg("1");
     let output = invoke(conflicting, None);
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
@@ -149,7 +141,7 @@ fn init_creates_a_valid_store_and_never_clobbers_it() {
     let database = directory.path().join("memory.sqlite3");
 
     let response = init(&database);
-    assert_eq!(response["schema_version"], 1);
+    assert_eq!(response["schema_version"], 2);
     assert_eq!(response["episode_count"], 0);
     let memory_id = response["memory_id"]
         .as_str()
@@ -171,7 +163,7 @@ fn init_creates_a_valid_store_and_never_clobbers_it() {
     assert_eq!(
         response,
         json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "memory_id": memory_id,
             "episode_count": 0
         })
@@ -193,7 +185,7 @@ fn separate_file_and_stdin_batches_append_monotonic_sequences() {
     init(&database);
 
     let file_batch = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "operations": [insert(Some("first"), 1), insert(None, 2)]
     });
     fs::write(&input, file_batch.to_string()).expect("batch file is written");
@@ -207,7 +199,7 @@ fn separate_file_and_stdin_batches_append_monotonic_sequences() {
     assert_eq!(response["inserted"][1]["sequence"], 1);
 
     let stdin_batch = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "operations": [insert(Some("third"), 3)]
     });
     let response = assert_success(run_stdin(&database, &stdin_batch));
@@ -219,14 +211,14 @@ fn separate_file_and_stdin_batches_append_monotonic_sequences() {
 }
 
 #[test]
-fn batch_dynamics_round_trip_through_ranked_recall() {
+fn source_recall_default_and_limit_return_exact_ranked_json() {
     let directory = TempDir::new().expect("temporary directory");
     let database = directory.path().join("memory.sqlite3");
     let memory_id = init(&database)["memory_id"].clone();
 
-    let failure = json!({
+    let source = json!({
         "op": "insert_episode",
-        "label": "failure",
+        "label": "source",
         "episode": {
             "occurred_at_ms": 1000,
             "recorded_at_ms": 1001,
@@ -239,9 +231,9 @@ fn batch_dynamics_round_trip_through_ranked_recall() {
             "observation": {"predicate_id": 20, "term_ids": [1001, 3001]}
         }
     });
-    let recovery = json!({
+    let strongest = json!({
         "op": "insert_episode",
-        "label": "recovery",
+        "label": "strongest",
         "episode": {
             "occurred_at_ms": 2000,
             "recorded_at_ms": 2001,
@@ -252,62 +244,56 @@ fn batch_dynamics_round_trip_through_ranked_recall() {
         }
     });
     let scenario = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "operations": [
-            failure,
-            recovery,
+            source,
+            strongest,
+            insert(Some("middle"), 3),
+            insert(Some("weakest"), 4),
             {
                 "op": "set_relevance",
-                "from": {"label": "failure"},
-                "to": {"label": "recovery"},
+                "from": {"label": "source"},
+                "to": {"label": "strongest"},
                 "weight_ppm": 600000
             },
             {
-                "op": "stimulate",
-                "atom": {"label": "failure"},
-                "amount_ppm": 1000000
+                "op": "set_relevance",
+                "from": {"label": "source"},
+                "to": {"label": "middle"},
+                "weight_ppm": 250000
             },
-            {"op": "step", "count": 1}
+            {
+                "op": "set_relevance",
+                "from": {"label": "source"},
+                "to": {"label": "weakest"},
+                "weight_ppm": 150000
+            }
         ]
     });
     let run = assert_success(run_stdin(&database, &scenario));
     assert_eq!(
         run,
         json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "memory_id": memory_id.clone(),
-            "operations_applied": 5,
-            "episode_count": 2,
+            "operations_applied": 7,
+            "episode_count": 4,
             "inserted": [
-                {"label": "failure", "sequence": 0},
-                {"label": "recovery", "sequence": 1}
+                {"label": "source", "sequence": 0},
+                {"label": "strongest", "sequence": 1},
+                {"label": "middle", "sequence": 2},
+                {"label": "weakest", "sequence": 3}
             ]
         })
     );
 
-    let recall = recall_limit(&database, 10);
+    let recall = assert_success(recall_source(&database, 0, None));
     assert_eq!(
         recall,
         json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "memory_id": memory_id,
             "hits": [
-                {
-                    "sequence": 0,
-                    "activation_ppm": 500000,
-                    "episode": {
-                        "occurred_at_ms": 1000,
-                        "recorded_at_ms": 1001,
-                        "source_id": 7,
-                        "context": [
-                            {"predicate_id": 10, "term_ids": [1]},
-                            {"predicate_id": 11, "term_ids": [2]}
-                        ],
-                        "observation": {"predicate_id": 20, "term_ids": [1001, 3001]},
-                        "action": null,
-                        "outcome": null
-                    }
-                },
                 {
                     "sequence": 1,
                     "activation_ppm": 240000,
@@ -320,10 +306,113 @@ fn batch_dynamics_round_trip_through_ranked_recall() {
                         "action": {"predicate_id": 30, "term_ids": [1001]},
                         "outcome": {"predicate_id": 40, "term_ids": [1001]}
                     }
+                },
+                {
+                    "sequence": 2,
+                    "activation_ppm": 100000,
+                    "episode": {
+                        "occurred_at_ms": 3,
+                        "recorded_at_ms": 4,
+                        "source_id": 3,
+                        "context": [],
+                        "observation": {"predicate_id": 13, "term_ids": [103]},
+                        "action": null,
+                        "outcome": null
+                    }
+                },
+                {
+                    "sequence": 3,
+                    "activation_ppm": 60000,
+                    "episode": {
+                        "occurred_at_ms": 4,
+                        "recorded_at_ms": 5,
+                        "source_id": 4,
+                        "context": [],
+                        "observation": {"predicate_id": 14, "term_ids": [104]},
+                        "action": null,
+                        "outcome": null
+                    }
                 }
             ]
         })
     );
+
+    let limited = assert_success(recall_source(&database, 0, Some(2)));
+    let mut expected_limited = recall;
+    expected_limited["hits"]
+        .as_array_mut()
+        .expect("expected hits are an array")
+        .truncate(2);
+    assert_eq!(limited, expected_limited);
+}
+
+#[test]
+fn source_recall_rejects_an_unknown_source_without_success_output() {
+    let directory = TempDir::new().expect("temporary directory");
+    let database = directory.path().join("memory.sqlite3");
+    init(&database);
+    assert_success(run_stdin(
+        &database,
+        &json!({"schema_version": 2, "operations": [insert(None, 1)]}),
+    ));
+
+    let stderr = assert_runtime_failure(recall_source(&database, 99, None));
+    assert!(
+        stderr.contains("unknown atom"),
+        "unexpected diagnostic: {stderr}"
+    );
+}
+
+#[test]
+fn source_recall_ignores_stored_activation_and_does_not_advance_the_revision() {
+    let directory = TempDir::new().expect("temporary directory");
+    let database = directory.path().join("memory.sqlite3");
+    init(&database);
+    assert_success(run_stdin(
+        &database,
+        &json!({
+            "schema_version": 2,
+            "operations": [
+                insert(Some("source"), 1),
+                insert(Some("direct"), 2),
+                insert(Some("ambient"), 3)
+            ]
+        }),
+    ));
+
+    let mut writer = SqliteStore::open(&database).expect("writer opens");
+    let source = AtomId::from_parts(writer.memory_id(), 0);
+    let direct = AtomId::from_parts(writer.memory_id(), 1);
+    let ambient = AtomId::from_parts(writer.memory_id(), 2);
+    writer
+        .memory_mut()
+        .set_relevance(source, direct, InfluenceWeight::from_ppm(600_000).unwrap())
+        .unwrap();
+    writer
+        .memory_mut()
+        .stimulate(ambient, Activation::ONE)
+        .unwrap();
+    writer.save().expect("ambient activation is persisted");
+
+    let recall = assert_success(recall_source(&database, 0, None));
+    assert_eq!(recall["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(recall["hits"][0]["sequence"], 1);
+    assert_eq!(recall["hits"][0]["activation_ppm"], 240_000);
+
+    writer
+        .memory_mut()
+        .set_relevance(source, ambient, InfluenceWeight::from_ppm(250_000).unwrap())
+        .unwrap();
+    writer
+        .save()
+        .expect("read-only recall did not advance the snapshot revision");
+
+    let after = assert_success(recall_source(&database, 0, None));
+    assert_eq!(after["hits"].as_array().unwrap().len(), 2);
+    assert_eq!(after["hits"][0]["sequence"], 1);
+    assert_eq!(after["hits"][0]["activation_ppm"], 240_000);
+    assert_eq!(after["hits"][1]["sequence"], 2);
+    assert_eq!(after["hits"][1]["activation_ppm"], 100_000);
 }
 
 #[test]
@@ -333,7 +422,7 @@ fn feedback_uses_the_explicit_target_list_and_persists_exact_updates() {
     let memory_id = init(&database)["memory_id"].clone();
 
     let setup = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "operations": [
             insert(Some("source"), 1),
             insert(Some("first"), 2),
@@ -348,16 +437,12 @@ fn feedback_uses_the_explicit_target_list_and_persists_exact_updates() {
         ]
     });
     assert_success(run_stdin(&database, &setup));
-    assert!(
-        recall_limit(&database, 10)["hits"]
-            .as_array()
-            .expect("recall hits are an array")
-            .is_empty(),
-        "feedback targets need not be current top-k hits"
-    );
+    let prior_hits = assert_success(recall_source(&database, 0, None));
+    assert_eq!(prior_hits["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(prior_hits["hits"][0]["sequence"], 3);
 
     let positive = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "operations": [{
             "op": "apply_feedback",
             "source": {"sequence": 0},
@@ -373,7 +458,7 @@ fn feedback_uses_the_explicit_target_list_and_persists_exact_updates() {
     assert_eq!(
         assert_success(run_stdin(&database, &positive)),
         json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "memory_id": memory_id.clone(),
             "operations_applied": 1,
             "episode_count": 4,
@@ -415,7 +500,7 @@ fn feedback_uses_the_explicit_target_list_and_persists_exact_updates() {
     assert_eq!(
         assert_success(run_stdin(&database, &negative)),
         json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "memory_id": memory_id,
             "operations_applied": 1,
             "episode_count": 4,
@@ -437,6 +522,68 @@ fn feedback_uses_the_explicit_target_list_and_persists_exact_updates() {
 }
 
 #[test]
+fn feedback_changes_the_next_source_conditioned_query() {
+    let directory = TempDir::new().expect("temporary directory");
+    let database = directory.path().join("memory.sqlite3");
+    let memory_id = init(&database)["memory_id"].clone();
+    assert_success(run_stdin(
+        &database,
+        &json!({
+            "schema_version": 2,
+            "operations": [insert(Some("source"), 1), insert(Some("target"), 2)]
+        }),
+    ));
+
+    assert!(
+        assert_success(recall_source(&database, 0, None))["hits"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let feedback = |value| {
+        json!({
+            "schema_version": 2,
+            "operations": [{
+                "op": "apply_feedback",
+                "source": {"sequence": 0},
+                "targets": [{"sequence": 1}],
+                "feedback": value
+            }]
+        })
+    };
+    assert_success(run_stdin(&database, &feedback(1)));
+    assert_eq!(
+        assert_success(recall_source(&database, 0, None)),
+        json!({
+            "schema_version": 2,
+            "memory_id": memory_id,
+            "hits": [{
+                "sequence": 1,
+                "activation_ppm": 400,
+                "episode": {
+                    "occurred_at_ms": 2,
+                    "recorded_at_ms": 3,
+                    "source_id": 2,
+                    "context": [],
+                    "observation": {"predicate_id": 12, "term_ids": [102]},
+                    "action": null,
+                    "outcome": null
+                }
+            }]
+        })
+    );
+
+    assert_success(run_stdin(&database, &feedback(0)));
+    assert!(
+        assert_success(recall_source(&database, 0, None))["hits"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn feedback_target_order_produces_the_same_relevance_graph() {
     let directory = TempDir::new().expect("temporary directory");
     let base = directory.path().join("base.sqlite3");
@@ -446,7 +593,7 @@ fn feedback_target_order_produces_the_same_relevance_graph() {
     assert_success(run_stdin(
         &base,
         &json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "operations": [
                 insert(Some("source"), 1),
                 insert(Some("first"), 2),
@@ -466,7 +613,7 @@ fn feedback_target_order_produces_the_same_relevance_graph() {
 
     let feedback = |targets: [u64; 2]| {
         json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "operations": [{
                 "op": "apply_feedback",
                 "source": {"sequence": 0},
@@ -497,14 +644,14 @@ fn feedback_target_limit_accepts_the_boundary_and_rejects_excess() {
     assert_success(run_stdin(
         &database,
         &json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "operations": [insert(None, 1), insert(None, 2)]
         }),
     ));
 
     let target = json!({"sequence": 1});
     let at_limit = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "operations": [{
             "op": "apply_feedback",
             "source": {"sequence": 0},
@@ -515,7 +662,7 @@ fn feedback_target_limit_accepts_the_boundary_and_rejects_excess() {
     assert_success(run_stdin(&database, &at_limit));
 
     let over_limit = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "operations": [{
             "op": "apply_feedback",
             "source": {"sequence": 0},
@@ -546,13 +693,13 @@ fn feedback_validation_is_strict_and_batch_failures_roll_back() {
     assert_success(run_stdin(
         &database,
         &json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "operations": [insert(None, 1), insert(None, 2)]
         }),
     ));
 
     let invalid_feedback = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "operations": [{
             "op": "apply_feedback",
             "source": {"sequence": 99},
@@ -566,7 +713,7 @@ fn feedback_validation_is_strict_and_batch_failures_roll_back() {
     for (scenario, expected) in [
         (
             json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "operations": [{
                     "op": "apply_feedback",
                     "source": {"sequence": 99},
@@ -578,7 +725,7 @@ fn feedback_validation_is_strict_and_batch_failures_roll_back() {
         ),
         (
             json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "operations": [{
                     "op": "apply_feedback",
                     "source": {"sequence": 0},
@@ -614,13 +761,13 @@ fn feedback_validation_is_strict_and_batch_failures_roll_back() {
             "feedback": 1
         }),
     ] {
-        let scenario = json!({"schema_version": 1, "operations": [operation]});
+        let scenario = json!({"schema_version": 2, "operations": [operation]});
         let stderr = assert_runtime_failure(run_stdin(&database, &scenario));
         assert!(stderr.contains("operations[0] is invalid"));
     }
 
     let rollback = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "operations": [
             {
                 "op": "apply_feedback",
@@ -647,13 +794,13 @@ fn feedback_validation_is_strict_and_batch_failures_roll_back() {
 }
 
 #[test]
-fn persisted_sequences_support_edge_removal_reset_and_inactive_lookup() {
+fn persisted_sequences_support_edge_removal_and_source_recall() {
     let directory = TempDir::new().expect("temporary directory");
     let database = directory.path().join("memory.sqlite3");
-    let memory_id = init(&database)["memory_id"].clone();
+    init(&database);
 
     let setup = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "operations": [
             insert(Some("from"), 1),
             insert(Some("to"), 2),
@@ -662,53 +809,29 @@ fn persisted_sequences_support_edge_removal_reset_and_inactive_lookup() {
                 "from": {"label": "from"},
                 "to": {"label": "to"},
                 "weight_ppm": 250000
-            },
-            {
-                "op": "stimulate",
-                "atom": {"label": "from"},
-                "amount_ppm": 750000
             }
         ]
     });
     assert_success(run_stdin(&database, &setup));
+    let before = assert_success(recall_source(&database, 0, None));
+    assert_eq!(before["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(before["hits"][0]["sequence"], 1);
+    assert_eq!(before["hits"][0]["activation_ppm"], 100_000);
 
     let cleanup = json!({
-        "schema_version": 1,
-        "operations": [
-            {
-                "op": "remove_relevance",
-                "from": {"sequence": 0},
-                "to": {"sequence": 1}
-            },
-            {"op": "reset_activations"}
-        ]
+        "schema_version": 2,
+        "operations": [{
+            "op": "remove_relevance",
+            "from": {"sequence": 0},
+            "to": {"sequence": 1}
+        }]
     });
     assert_success(run_stdin(&database, &cleanup));
     assert!(
-        recall_limit(&database, 10)["hits"]
+        assert_success(recall_source(&database, 0, None))["hits"]
             .as_array()
             .unwrap()
             .is_empty()
-    );
-
-    let episode = assert_success(recall_sequence(&database, 0));
-    assert_eq!(
-        episode,
-        json!({
-            "schema_version": 1,
-            "memory_id": memory_id,
-            "sequence": 0,
-            "activation_ppm": 0,
-            "episode": {
-                "occurred_at_ms": 1,
-                "recorded_at_ms": 2,
-                "source_id": 1,
-                "context": [],
-                "observation": {"predicate_id": 11, "term_ids": [101]},
-                "action": null,
-                "outcome": null
-            }
-        })
     );
 
     let store = SqliteStore::open(&database).unwrap();
@@ -724,7 +847,7 @@ fn an_operation_failure_discards_the_whole_in_memory_batch() {
     init(&database);
 
     let invalid = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "operations": [insert(Some("duplicate"), 1), insert(Some("duplicate"), 2)]
     });
     let stderr = assert_runtime_failure(run_stdin(&database, &invalid));
@@ -737,11 +860,11 @@ fn an_operation_failure_discards_the_whole_in_memory_batch() {
             .len(),
         0
     );
-    assert_runtime_failure(recall_sequence(&database, 0));
+    assert_runtime_failure(recall_source(&database, 0, None));
 
     let response = assert_success(run_stdin(
         &database,
-        &json!({"schema_version": 1, "operations": [insert(None, 3)]}),
+        &json!({"schema_version": 2, "operations": [insert(None, 3)]}),
     ));
     assert_eq!(response["inserted"][0]["sequence"], 0);
 }
@@ -753,11 +876,10 @@ fn malformed_and_invalid_scenarios_fail_closed() {
     init(&database);
 
     let invalid = [
-        json!({"schema_version": 2, "operations": [insert(None, 1)]}),
-        json!({"schema_version": 1, "operations": [insert(Some(""), 1)]}),
-        json!({"schema_version": 1, "operations": [], "extra": true}),
+        json!({"schema_version": 2, "operations": [insert(Some(""), 1)]}),
+        json!({"schema_version": 2, "operations": [], "extra": true}),
         json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "operations": [{
                 "op": "insert_episode",
                 "episode": {
@@ -769,26 +891,19 @@ fn malformed_and_invalid_scenarios_fail_closed() {
             }]
         }),
         json!({
-            "schema_version": 1,
-            "operations": [{
-                "op": "stimulate",
-                "atom": {"sequence": 0},
-                "amount_ppm": 1
-            }]
-        }),
-        json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "operations": [
                 insert(Some("new"), 1),
                 {
-                    "op": "stimulate",
-                    "atom": {"sequence": 0},
-                    "amount_ppm": 1
+                    "op": "set_relevance",
+                    "from": {"sequence": 0},
+                    "to": {"label": "new"},
+                    "weight_ppm": 1
                 }
             ]
         }),
         json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "operations": [{
                 "op": "set_relevance",
                 "from": {"label": "later"},
@@ -797,30 +912,7 @@ fn malformed_and_invalid_scenarios_fail_closed() {
             }, insert(Some("later"), 1)]
         }),
         json!({
-            "schema_version": 1,
-            "operations": [{"op": "step", "count": 0}]
-        }),
-        json!({
-            "schema_version": 1,
-            "operations": [{
-                "op": "stimulate",
-                "atom": {"sequence": 0, "extra": true},
-                "amount_ppm": 1
-            }]
-        }),
-        json!({
-            "schema_version": 1,
-            "operations": [
-                insert(Some("new"), 1),
-                {
-                    "op": "stimulate",
-                    "atom": {"label": "new"},
-                    "amount_ppm": 1000001
-                }
-            ]
-        }),
-        json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "operations": [
                 insert(Some("a"), 1),
                 insert(Some("b"), 2),
@@ -833,7 +925,7 @@ fn malformed_and_invalid_scenarios_fail_closed() {
             ]
         }),
         json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "operations": [
                 insert(Some("a"), 1),
                 insert(Some("b"), 2),
@@ -864,11 +956,12 @@ fn malformed_and_invalid_scenarios_fail_closed() {
         json!({"label": "missing", "extra": true}),
     ] {
         let scenario = json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "operations": [{
-                "op": "stimulate",
-                "atom": atom,
-                "amount_ppm": 1
+                "op": "set_relevance",
+                "from": atom,
+                "to": {"sequence": 0},
+                "weight_ppm": 1
             }]
         });
         let stderr = assert_runtime_failure(run_stdin(&database, &scenario));
@@ -876,7 +969,7 @@ fn malformed_and_invalid_scenarios_fail_closed() {
     }
 
     let unknown_operation = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "operations": [{"op": "unknown"}]
     });
     let stderr = assert_runtime_failure(run_stdin(&database, &unknown_operation));
@@ -888,13 +981,47 @@ fn malformed_and_invalid_scenarios_fail_closed() {
 }
 
 #[test]
-fn valid_fixed_point_boundaries_and_default_recall_are_supported() {
+fn v1_scenarios_and_removed_activation_operations_are_rejected() {
+    let directory = TempDir::new().expect("temporary directory");
+    let database = directory.path().join("memory.sqlite3");
+    init(&database);
+
+    let v1 = json!({"schema_version": 1, "operations": [insert(None, 1)]});
+    let stderr = assert_runtime_failure(run_stdin(&database, &v1));
+    assert!(stderr.contains("unsupported scenario schema_version 1; expected 2"));
+
+    for operation in [
+        json!({
+            "op": "stimulate",
+            "atom": {"sequence": 0},
+            "amount_ppm": 1
+        }),
+        json!({"op": "step", "count": 1}),
+        json!({"op": "reset_activations"}),
+    ] {
+        let scenario = json!({"schema_version": 2, "operations": [operation]});
+        let stderr = assert_runtime_failure(run_stdin(&database, &scenario));
+        assert!(stderr.contains("operations[0] is invalid"));
+    }
+
+    assert_eq!(
+        SqliteStore::open(&database)
+            .unwrap()
+            .memory()
+            .episodes()
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn maximum_weight_produces_the_exact_source_recall_score() {
     let directory = TempDir::new().expect("temporary directory");
     let database = directory.path().join("memory.sqlite3");
     init(&database);
 
     let scenario = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "operations": [
             insert(Some("from"), 1),
             insert(Some("to"), 2),
@@ -903,20 +1030,15 @@ fn valid_fixed_point_boundaries_and_default_recall_are_supported() {
                 "from": {"label": "from"},
                 "to": {"label": "to"},
                 "weight_ppm": 1000000
-            },
-            {
-                "op": "stimulate",
-                "atom": {"label": "from"},
-                "amount_ppm": 0
             }
         ]
     });
     assert_success(run_stdin(&database, &scenario));
 
-    let mut recall = cli();
-    recall.arg("recall").arg(&database);
-    let response = assert_success(invoke(recall, None));
-    assert!(response["hits"].as_array().unwrap().is_empty());
+    let response = assert_success(recall_source(&database, 0, None));
+    assert_eq!(response["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(response["hits"][0]["sequence"], 1);
+    assert_eq!(response["hits"][0]["activation_ppm"], 400_000);
 
     let store = SqliteStore::open(&database).unwrap();
     let from = AtomId::from_parts(store.memory_id(), 0);
@@ -935,7 +1057,7 @@ fn integer_boundaries_round_trip_exactly() {
     init(&database);
 
     let scenario = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "operations": [{
             "op": "insert_episode",
             "episode": {
@@ -951,19 +1073,13 @@ fn integer_boundaries_round_trip_exactly() {
     });
     assert_success(run_stdin(&database, &scenario));
 
-    let response = assert_success(recall_sequence(&database, 0));
-    let episode = &response["episode"];
-    assert_eq!(episode["occurred_at_ms"].as_i64(), Some(i64::MIN));
-    assert_eq!(episode["recorded_at_ms"].as_i64(), Some(i64::MAX));
-    assert_eq!(episode["source_id"].as_u64(), Some(u64::MAX));
-    assert_eq!(
-        episode["observation"]["predicate_id"].as_u64(),
-        Some(u64::MAX - 1)
-    );
-    assert_eq!(
-        episode["observation"]["term_ids"][0].as_u64(),
-        Some(u64::MAX)
-    );
+    let store = SqliteStore::open(&database).expect("boundary snapshot reopens");
+    let atom = store.memory().episodes().next().expect("episode is stored");
+    assert_eq!(atom.occurred_at().get(), i64::MIN);
+    assert_eq!(atom.recorded_at().get(), i64::MAX);
+    assert_eq!(atom.source().get(), u64::MAX);
+    assert_eq!(atom.observation().predicate().get(), u64::MAX - 1);
+    assert_eq!(atom.observation().arguments()[0].get(), u64::MAX);
 }
 
 #[test]
@@ -977,4 +1093,19 @@ fn syntax_errors_use_exit_two_without_success_output() {
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("requires <DATABASE>"));
+
+    let database = database.to_str().expect("temporary path is UTF-8");
+    for arguments in [
+        vec!["recall", database],
+        vec!["recall", database, "--limit", "1"],
+        vec!["recall", database, "--sequence", "0"],
+        vec!["recall", database, "--from-sequence", "0", "--limit"],
+        vec!["recall", database, "--limit", "1", "--from-sequence", "0"],
+    ] {
+        let mut command = cli();
+        command.args(arguments);
+        let output = invoke(command, None);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
 }

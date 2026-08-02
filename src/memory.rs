@@ -40,12 +40,12 @@ impl RelevanceEdge {
     }
 }
 
-/// A non-zero activation returned by recall ranking.
+/// A non-zero activation score returned by recall ranking.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecallHit {
-    /// Identifier of the active atom.
+    /// Identifier of the recalled atom.
     pub atom_id: AtomId,
-    /// Current fixed-point activation.
+    /// Current or projected fixed-point activation used for ranking.
     pub activation: Activation,
 }
 
@@ -398,9 +398,7 @@ impl MemoryV0 {
             }
 
             for (&to_index, &weight) in &outgoing.targets {
-                let numerator = u64::from(source)
-                    * u64::from(weight.as_ppm())
-                    * u64::from(PROPAGATION_GAIN_PPM);
+                let numerator = Self::propagation_numerator(source, weight);
                 self.transition_numerators[to_index] = self.transition_numerators[to_index]
                     .saturating_add(numerator)
                     .min(SCALE_CUBED);
@@ -416,23 +414,71 @@ impl MemoryV0 {
         self.debug_assert_storage();
     }
 
+    /// Ranks the direct one-step influence of `source` in isolation.
+    ///
+    /// The projection treats the source as fully active and every other atom as
+    /// inactive, scans only the source's outgoing relevance row, and leaves all
+    /// stored state unchanged. Each target score is the source's one-step
+    /// propagation contribution. Zero scores and the source itself are omitted;
+    /// equal scores are ordered by ascending atom identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GraphError::UnknownAtom`] if `source` does not belong to this
+    /// memory. The source is validated even when `limit` is zero.
+    pub fn recall_from(&self, source: AtomId, limit: usize) -> Result<Vec<RecallHit>, GraphError> {
+        let source_index = self.require_atom(source)?;
+        let Some(outgoing) = self.outgoing.get(&source_index) else {
+            return Ok(Vec::new());
+        };
+
+        let hits = outgoing
+            .targets
+            .iter()
+            .filter_map(|(&target_index, &weight)| {
+                if target_index == source_index {
+                    return None;
+                }
+
+                let score =
+                    Self::propagation_numerator(Activation::ONE.as_ppm(), weight) / SCALE_SQUARED;
+                let activation = Activation::from_clamped_ppm(
+                    u32::try_from(score).expect("isolated propagation is bounded by SCALE"),
+                );
+                (activation != Activation::ZERO).then_some(RecallHit {
+                    atom_id: self.atoms[target_index].id(),
+                    activation,
+                })
+            });
+
+        Ok(Self::rank_hits(hits, outgoing.targets.len(), limit))
+    }
+
     /// Returns at most `limit` non-zero activations, highest first.
     ///
     /// Equal activations are ordered by ascending atom identifier.
     #[must_use]
     pub fn top_k(&self, limit: usize) -> Vec<RecallHit> {
+        Self::rank_hits(self.active_hits(), self.activations.len(), limit)
+    }
+
+    fn rank_hits(
+        hits: impl Iterator<Item = RecallHit>,
+        candidate_bound: usize,
+        limit: usize,
+    ) -> Vec<RecallHit> {
         if limit == 0 {
             return Vec::new();
         }
 
-        if limit >= self.activations.len() {
-            let mut hits: Vec<_> = self.active_hits().collect();
+        if limit >= candidate_bound {
+            let mut hits: Vec<_> = hits.collect();
             Self::sort_hits(&mut hits);
             return hits;
         }
 
         let mut best = BinaryHeap::with_capacity(limit);
-        for hit in self.active_hits() {
+        for hit in hits {
             let ranked = RankedRecallHit(hit);
             if best.len() < limit {
                 best.push(Reverse(ranked));
@@ -449,6 +495,10 @@ impl MemoryV0 {
         let mut hits: Vec<_> = best.into_iter().map(|Reverse(ranked)| ranked.0).collect();
         Self::sort_hits(&mut hits);
         hits
+    }
+
+    fn propagation_numerator(source_ppm: u32, weight: InfluenceWeight) -> u64 {
+        u64::from(source_ppm) * u64::from(weight.as_ppm()) * u64::from(PROPAGATION_GAIN_PPM)
     }
 
     /// Resets activation without changing atoms or relevance edges.
