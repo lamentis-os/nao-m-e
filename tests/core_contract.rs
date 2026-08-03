@@ -518,9 +518,9 @@ fn neutral_and_negative_learned_only_traces_remain_state_but_not_candidates() {
 fn recall_unifies_structural_learned_and_combined_candidates_once() {
     let mut memory = new_memory(1);
     let source = insert_observation(&mut memory, 1, 10, &[100]);
-    let structural_only = insert_observation(&mut memory, 2, 10, &[100]);
-    let combined = insert_observation(&mut memory, 3, 10, &[200]);
-    let learned_only = insert_observation(&mut memory, 4, 20, &[300]);
+    let learned_only = insert_observation(&mut memory, 2, 20, &[300]);
+    let structural_only = insert_observation(&mut memory, 3, 10, &[100]);
+    let combined = insert_observation(&mut memory, 4, 10, &[200]);
     memory
         .set_feedback_trace(source, combined, trace(1, 1))
         .expect("combined trace inserts");
