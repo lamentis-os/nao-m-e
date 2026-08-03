@@ -215,7 +215,7 @@ pub struct EpisodeDraft {
     pub source: SourceId,
 }
 
-/// An immutable episode stored in a [`crate::MemoryV0`].
+/// An immutable episode stored in a [`crate::Memory`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EpisodeAtom {
     id: AtomId,

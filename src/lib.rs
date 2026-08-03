@@ -6,13 +6,13 @@
 //! Episode content is immutable; directed feedback traces are mutable. Cue-derived
 //! candidates, fixed-point arithmetic, and ordered storage make recall and
 //! feedback reproducible.
-//! Cross-cutting V0 semantics are specified in `docs/v0-contract.md`.
+//! Cross-cutting semantics are specified in `docs/core-contract.md`.
 
 mod memory;
 mod model;
 mod parameters;
 
-pub use memory::{FeedbackEdge, MemoryV0, RecallHit};
+pub use memory::{FeedbackEdge, Memory, RecallHit};
 pub use model::{Activation, FeedbackTrace, ValueError};
 pub use model::{AtomId, MemoryId, PredicateId, SourceId, TermId, TimestampMs};
 pub use model::{EpisodeAtom, EpisodeDraft, Statement};

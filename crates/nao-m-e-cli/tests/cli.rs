@@ -268,12 +268,12 @@ fn help_version_and_top_level_syntax_have_stable_exit_categories() {
 }
 
 #[test]
-fn init_is_silent_creates_v3_and_never_clobbers() {
+fn init_is_silent_creates_current_format_and_never_clobbers() {
     let directory = TempDir::new().expect("temporary directory");
     let database = directory.path().join("memory.sqlite3");
 
     init(&database);
-    let store = SqliteStore::open(&database).expect("created SQLite V3 store opens");
+    let store = SqliteStore::open(&database).expect("created SQLite store opens");
     assert_eq!(store.memory().episodes().len(), 0);
     drop(store);
 
@@ -286,19 +286,19 @@ fn init_is_silent_creates_v3_and_never_clobbers() {
 }
 
 #[test]
-fn commands_reject_format_version_2_before_execution_without_changing_it() {
+fn commands_reject_unsupported_format_before_execution_without_changing_it() {
     let directory = TempDir::new().expect("temporary directory");
     let database = directory.path().join("memory.sqlite3");
     init(&database);
 
-    let store = SqliteStore::open(&database).expect("created SQLite V3 store opens");
+    let store = SqliteStore::open(&database).expect("created SQLite store opens");
     let memory_id = store.memory_id().to_be_bytes();
     drop(store);
-    rewrite_format_version(&database, memory_id, 3, 2);
-    let before = fs::read(&database).expect("V2-marked store is readable");
+    rewrite_format_version(&database, memory_id, 3, 4);
+    let before = fs::read(&database).expect("unsupported-format store is readable");
 
     let stderr = failure(recall(&database, 0, None), 1);
-    assert!(stderr.contains("unsupported SQLite memory format version 2"));
+    assert!(stderr.contains("unsupported SQLite memory format version 4"));
     assert_eq!(fs::read(&database).unwrap(), before);
 }
 
@@ -438,7 +438,7 @@ fn many_add_ignores_empty_lines_is_atomic_and_assigns_input_order() {
 fn recall_emits_exact_ranked_blocks_and_honors_limit() {
     let directory = TempDir::new().expect("temporary directory");
     let database = directory.path().join("memory.sqlite3");
-    let mut store = SqliteStore::create(&database).expect("SQLite V3 is created");
+    let mut store = SqliteStore::create(&database).expect("SQLite store is created");
     let source = store.memory_mut().insert_episode(draft(0)).unwrap();
     let rich = store
         .memory_mut()
@@ -735,46 +735,6 @@ fn malformed_direct_arguments_are_syntax_errors_but_store_errors_are_runtime_err
     let missing = directory.path().join("missing.sqlite3");
     let stderr = failure(add_minimal(&missing, 1, false), 1);
     assert!(stderr.contains("could not open"));
-}
-
-#[test]
-fn old_run_json_and_recall_v2_syntax_are_rejected() {
-    let directory = TempDir::new().expect("temporary directory");
-    let database = directory.path().join("memory.sqlite3");
-    init(&database);
-
-    let mut run = cli();
-    run.arg("run").arg(&database).arg("--input").arg("-");
-    failure(
-        invoke(run, Some("{\"schema_version\":2,\"operations\":[]}")),
-        2,
-    );
-
-    let mut old_recall = cli();
-    old_recall
-        .arg("recall")
-        .arg(&database)
-        .arg("--from-sequence")
-        .arg("0");
-    failure(invoke(old_recall, None), 2);
-
-    let mut json_many = cli();
-    json_many.arg("add").arg(&database).arg("--many");
-    failure(
-        invoke(
-            json_many,
-            Some("{\"op\":\"insert_episode\",\"episode\":{}}\n"),
-        ),
-        1,
-    );
-    assert_eq!(
-        SqliteStore::open(&database)
-            .unwrap()
-            .memory()
-            .episodes()
-            .len(),
-        0
-    );
 }
 
 #[test]

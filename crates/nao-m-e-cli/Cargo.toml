@@ -1,12 +1,12 @@
 [package]
 name = "nao-m-e-cli"
-version = "0.0.1"
-edition = "2024"
-rust-version = "1.95.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 description = "Command-line interface for the NAO-M-E symbolic memory kernel"
-license = "Apache-2.0"
-repository = "https://github.com/lamentis-os/nao-m-e"
-publish = false
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
 
 [[bin]]
 name = "nao-m-e"

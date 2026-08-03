@@ -1,7 +1,7 @@
-# V0 contract
+# Core contract
 
-This document defines the cross-cutting, observable semantics of the V0 kernel.
-Symbol-specific behavior remains documented in the Rust API.
+This document defines the cross-cutting, observable semantics of the memory
+kernel. Symbol-specific behavior remains documented in the Rust API.
 
 ## State
 
@@ -61,7 +61,7 @@ An `AtomId` is the pair `(MemoryId, sequence)`, where `sequence` is an unsigned
 insertions advance the sequence, and sequences are not reused within that
 memory instance. Ordering compares `MemoryId` first and sequence second. The
 diagnostic display is `<memory-id>:<sequence>` and is not a database or wire
-format; V0 defines no combined byte representation for `AtomId`.
+format; the core defines no combined byte representation for `AtomId`.
 
 Constructing an `AtomId` does not prove that the atom exists. Read operations
 return `None` for a foreign memory identifier or absent local sequence. Recall
@@ -153,7 +153,7 @@ validates `source` even when `limit` is zero. Its candidates are the union of
 all other episodes sharing at least one cue with the source and every target in
 the source's direct outgoing feedback row. The first successful recall with a
 positive limit may build the derived index by scanning all atoms once. Warm
-candidate lookup in that `MemoryV0` then traverses only the source cues and
+candidate lookup in that `Memory` then traverses only the source cues and
 their postings plus its direct feedback row rather than globally scanning
 episodes. A target present through several cues or both paths occurs only once.
 
@@ -212,8 +212,8 @@ Incoming edges, other source rows, and multi-hop paths do not contribute.
 
 ## Kernel boundary
 
-The V0 kernel's logical state contains atoms and bounded feedback traces only.
-`MemoryV0` may also hold cue postings and cue-weight totals derived
+The kernel's logical state contains atoms and bounded feedback traces only.
+`Memory` may also hold cue postings and cue-weight totals derived
 deterministically from immutable atoms; they are neither independently mutable
 nor persistent. The kernel performs no persistence, loading, synchronization,
 or multi-writer coordination. It also performs no free-text processing,
@@ -221,4 +221,4 @@ embedding or LLM calls, time-driven decay, or autonomous learning. Feedback
 changes only through explicit trace reconstruction or caller-supplied binary
 assessments. Persistence adapters remain outside the kernel; the format and
 lifecycle of the optional SQLite adapter are specified separately in the
-[SQLite V3 contract](sqlite-v3-contract.md).
+[SQLite contract](sqlite-contract.md).

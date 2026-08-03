@@ -257,7 +257,7 @@ impl<'a> Decoder<'a> {
 
 #[cfg(test)]
 mod tests {
-    use nao_m_e::{AtomId, MemoryV0};
+    use nao_m_e::{AtomId, Memory};
 
     use super::*;
 
@@ -271,7 +271,7 @@ mod tests {
 
     fn episode(draft: EpisodeDraft) -> EpisodeAtom {
         let memory_id = MemoryId::new(1).expect("test memory ID is non-zero");
-        let mut memory = MemoryV0::new(memory_id);
+        let mut memory = Memory::new(memory_id);
         let id = memory.insert_episode(draft).expect("test episode inserts");
         assert_eq!(id, AtomId::from_parts(memory_id, 0));
         memory.episode(id).expect("inserted episode exists").clone()

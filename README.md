@@ -23,7 +23,7 @@ product.
 use std::error::Error;
 
 use nao_m_e::{
-    EpisodeDraft, MemoryId, MemoryV0, PredicateId, SourceId, Statement, TermId,
+    EpisodeDraft, Memory, MemoryId, PredicateId, SourceId, Statement, TermId,
     TimestampMs,
 };
 
@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         vec![TermId::new(10), TermId::new(11)],
     )?;
     let memory_id = MemoryId::new(0x7b4f_6be0_32c2_4be8_96b8_7394_f734_85af)?;
-    let mut memory = MemoryV0::new(memory_id);
+    let mut memory = Memory::new(memory_id);
     let episode = EpisodeDraft {
         occurred_at: TimestampMs::new(1_000),
         recorded_at: TimestampMs::new(1_001),
@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 ## SQLite snapshots
 
 `nao-m-e-sqlite` creates the durable memory ID and exposes its owned
-`MemoryV0` for normal mutations:
+`Memory` for normal mutations:
 
 ```rust
 use std::error::Error;
@@ -112,7 +112,7 @@ Install the workspace binary from a checkout:
 cargo install --locked --path crates/nao-m-e-cli
 ```
 
-CLI V3 has four commands:
+The CLI has four commands:
 
 ```text
 nao-m-e init <DATABASE>
@@ -242,7 +242,7 @@ cues. Feedback is deterministic, does not recompute recall, and does not bind
 the event to an earlier query. The next recall from the same source observes the
 resulting history. Each feedback command uses one save, and the snapshot stores
 neither a feedback receipt nor provenance for the change.
-The [V0 external-feedback contract](docs/v0-contract.md#external-feedback) is
+The [external-feedback contract](docs/core-contract.md#external-feedback) is
 authoritative for validation, the 10,000-target input limit, target
 normalization, history updates, and exact fixed-point projection.
 
@@ -267,8 +267,8 @@ completion state. Exit code `2` denotes invalid CLI syntax; model, graph,
 store, input, and output failures use exit code `1`. Help and version output
 remain plain text.
 
-CLI V3 syntax and text output are versioned independently from SQLite. This
-implementation accepts only SQLite `format_version = 3`; V1 and V2 stores are
+CLI syntax and text output are independent from the SQLite format. This
+implementation accepts only SQLite `format_version = 3`; every other format is
 rejected without automatic or heuristic migration. Predicate,
 term, source, and time values are caller-owned numeric symbols; the CLI does not
 interpret text, deduplicate episodes, or provide embeddings. `add`, `recall`,
@@ -287,8 +287,8 @@ symbolic: it stores caller-owned numeric identifiers rather than free text or
 embeddings, and it makes no LLM calls. Feedback changes accessibility; it does
 not establish truth or confidence.
 
-See the [V0 core contract](docs/v0-contract.md) and the
-[SQLite V3 contract](docs/sqlite-v3-contract.md) for exact semantics. Generate
+See the [core contract](docs/core-contract.md) and the
+[SQLite contract](docs/sqlite-contract.md) for exact semantics. Generate
 local API documentation with
 `cargo doc --workspace --no-deps --all-features --locked --open`.
 

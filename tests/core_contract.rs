@@ -1,16 +1,18 @@
+//! Executable contract tests for the public memory kernel.
+
 use nao_m_e::{
     Activation, AtomId, EpisodeDraft, FEEDBACK_HISTORY_CAPACITY, FEEDBACK_PRIOR_MASS,
-    FeedbackTrace, GraphError, LEARNED_GAIN_PPM, MAX_FEEDBACK_TARGETS, MemoryId, MemoryIdError,
-    MemoryV0, ModelError, PredicateId, SCALE, STRUCTURAL_GAIN_PPM, SourceId, Statement, TermId,
-    TimestampMs, ValueError,
+    FeedbackTrace, GraphError, LEARNED_GAIN_PPM, MAX_FEEDBACK_TARGETS, Memory, MemoryId,
+    MemoryIdError, ModelError, PredicateId, SCALE, STRUCTURAL_GAIN_PPM, SourceId, Statement,
+    TermId, TimestampMs, ValueError,
 };
 
 fn memory_id(value: u128) -> MemoryId {
     MemoryId::new(value).expect("test memory identifier is non-zero")
 }
 
-fn new_memory(id: u128) -> MemoryV0 {
-    MemoryV0::new(memory_id(id))
+fn new_memory(id: u128) -> Memory {
+    Memory::new(memory_id(id))
 }
 
 fn statement(predicate: u64, arguments: &[u64]) -> Statement {
@@ -33,7 +35,7 @@ fn draft(seed: u64) -> EpisodeDraft {
     }
 }
 
-fn insert(memory: &mut MemoryV0, seed: u64) -> AtomId {
+fn insert(memory: &mut Memory, seed: u64) -> AtomId {
     memory
         .insert_episode(draft(seed))
         .expect("identifier space is available")
@@ -51,12 +53,7 @@ fn observation_draft(seed: u64, predicate: u64, arguments: &[u64]) -> EpisodeDra
     }
 }
 
-fn insert_observation(
-    memory: &mut MemoryV0,
-    seed: u64,
-    predicate: u64,
-    arguments: &[u64],
-) -> AtomId {
+fn insert_observation(memory: &mut Memory, seed: u64, predicate: u64, arguments: &[u64]) -> AtomId {
     memory
         .insert_episode(observation_draft(seed, predicate, arguments))
         .expect("identifier space is available")
@@ -70,7 +67,7 @@ fn trace(history_bits: u16, sample_count: u8) -> FeedbackTrace {
     FeedbackTrace::from_parts(history_bits, sample_count).expect("test trace is canonical")
 }
 
-fn feedback_snapshot(memory: &MemoryV0) -> Vec<(AtomId, AtomId, FeedbackTrace)> {
+fn feedback_snapshot(memory: &Memory) -> Vec<(AtomId, AtomId, FeedbackTrace)> {
     memory
         .feedback_edges()
         .map(|edge| (edge.from(), edge.to(), edge.trace()))
@@ -156,12 +153,12 @@ fn atom_ids_round_trip_components_and_have_canonical_ordering() {
 fn replaying_the_same_atom_sequence_recreates_durable_ids() {
     let durable_id = memory_id(0xfeed);
     let original_ids = {
-        let mut original = MemoryV0::new(durable_id);
+        let mut original = Memory::new(durable_id);
         assert_eq!(original.memory_id(), durable_id);
         [insert(&mut original, 1), insert(&mut original, 2)]
     };
 
-    let mut reopened = MemoryV0::new(durable_id);
+    let mut reopened = Memory::new(durable_id);
     let reopened_ids = [insert(&mut reopened, 1), insert(&mut reopened, 2)];
     assert_eq!(reopened_ids, original_ids);
     assert_eq!(reopened_ids[0].sequence(), 0);
