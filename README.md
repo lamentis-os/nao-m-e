@@ -100,11 +100,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 `save()` appends only new episodes and reconciles small relevance changes
 without rewriting equal rows; wholesale graph changes use a bounded bulk
-replacement. `open()` reconstructs and validates the complete snapshot and
-leaves the private cue index uninitialized. The first successful recall with a
-positive limit builds it from those immutable episodes; inserts update it only
-when the process has already issued such a recall. The index is not stored in
-SQLite.
+replacement. `open()` reconstructs and validates the complete snapshot before
+exposing memory state. Cue retrieval data is derived from immutable episodes
+and is not stored in SQLite.
 
 ## Command-line interface
 

@@ -215,8 +215,7 @@ definitions, and this singleton row are committed together or not at all.
 Episode rows are append-only and their sequences form the exact prefix
 `0..N-1`. The payload holds the complete immutable episode associated with its
 sequence. There are no statement or term tables and no content dictionaries or
-content deduplication. There is likewise no persistent cue index; cue postings
-are reconstructed by the core from these canonical episode payloads.
+content deduplication.
 
 Relevance is sparse and stores only positive edges. The schema rejects invalid
 storage classes, lengths, ranges, duplicate keys, self-edges, and missing
@@ -291,11 +290,6 @@ state:
 2. Decode and insert episodes in sequence order, checking every returned
    `AtomId`.
 3. Install relevance edges in source and target order through the core API.
-
-The derived cue index may remain uninitialized after reconstruction. The first
-successful recall with a positive limit builds it from the complete canonical
-atom sequence, even if it finds no hits; later inserts in the same process
-update an already initialized index.
 
 Any storage-level or core rejection invalidates the complete snapshot. The
 adapter does not expose the reconstructed `MemoryV0` until all rows and all
@@ -389,9 +383,8 @@ snapshot before executing. Singular `add` commits one episode in one save,
 while `add --many` commits all validated input episodes in one save or none of
 them. Feedback also uses one save. Recall does not save. Add output begins only
 after its save commits and is not part of the SQLite transaction; a later
-standard-output failure cannot roll back that commit. A newly opened store can
-therefore return cue-derived recall hits without relevance edges or a schema
-migration because the core derives the index on that first recall.
+standard-output failure cannot roll back that commit. Recall can return
+cue-derived hits without relevance edges or a schema migration.
 
 ## Durability boundary
 
