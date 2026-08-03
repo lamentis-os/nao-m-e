@@ -16,6 +16,7 @@ doc = false
 [dependencies]
 nao-m-e = { path = "../.." }
 nao-m-e-sqlite = { path = "../nao-m-e-sqlite" }
+shlex = "2.0.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"

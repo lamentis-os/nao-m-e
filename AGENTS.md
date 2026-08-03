@@ -15,8 +15,9 @@ format and lifecycle are defined in `docs/sqlite-contract.md`.
 - `src/memory.rs` owns atom storage, bounded feedback traces, and recall.
 - `src/parameters.rs` owns fixed-point constants.
 - `tests/core_contract.rs` exercises the public core contract.
-- `crates/nao-m-e-sqlite` owns SQLite connection handling, format validation,
-  snapshot transactions, and adapter tests.
+- `crates/nao-m-e-sqlite` owns text-symbol normalization and allocation, SQLite
+  connection handling, format validation, snapshot transactions, and adapter
+  tests.
 - `crates/nao-m-e-cli` owns the strict CLI argument and text-output grammar,
   command execution, and cross-process CLI tests.
 
@@ -39,6 +40,9 @@ repository-level guardrails when changing the implementation:
   truth or confidence.
 - Keep persistence outside the core crate. Decode and validate a complete
   snapshot before exposing reconstructed state, and commit a save atomically.
+- Keep predicate and term text in separate append-only SQLite symbol catalogs.
+  The core and episode payloads remain numeric; every persisted predicate or
+  term reference must resolve to its catalog before a snapshot is exposed.
 - Preserve canonical fixed-width identifier encodings and reject stale writers
   rather than silently merging or overwriting their snapshots.
 

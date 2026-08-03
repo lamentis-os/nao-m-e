@@ -6,7 +6,8 @@ use nao_m_e::{
     AtomId, EpisodeAtom, EpisodeDraft, FeedbackEdge, FeedbackTrace, Memory, MemoryId, PredicateId,
     SourceId, Statement, TermId, TimestampMs,
 };
-use nao_m_e_sqlite::{SqliteStore, StoreError};
+use nao_m_e_sqlite::{SqliteStore, StoreError, StoreIntegrityError};
+use rusqlite::Connection;
 use tempfile::{TempDir, tempdir};
 
 #[derive(Debug, Eq, PartialEq)]
@@ -41,10 +42,10 @@ fn draft(seed: u64) -> EpisodeDraft {
     EpisodeDraft {
         occurred_at: TimestampMs::new(timestamp),
         recorded_at: TimestampMs::new(timestamp + 10),
-        context: vec![statement(10 + seed, &[100 + seed])],
-        observation: statement(20 + seed, &[200 + seed, 201 + seed]),
-        action: Some(statement(30 + seed, &[300 + seed])),
-        outcome: Some(statement(40 + seed, &[400 + seed])),
+        context: vec![statement(0, &[0])],
+        observation: statement(1, &[1, 2]),
+        action: Some(statement(2, &[3])),
+        outcome: Some(statement(3, &[4])),
         source: SourceId::new(50 + seed),
     }
 }
@@ -63,6 +64,32 @@ fn observation_draft(seed: u64, predicate: u64, arguments: &[u64]) -> EpisodeDra
 }
 
 fn insert(store: &mut SqliteStore, episode: EpisodeDraft) -> AtomId {
+    let statements = episode
+        .context
+        .iter()
+        .chain(std::iter::once(&episode.observation))
+        .chain(episode.action.iter())
+        .chain(episode.outcome.iter());
+    let predicate_max = statements
+        .clone()
+        .map(|statement| statement.predicate().get())
+        .max()
+        .expect("an episode always has an observation");
+    let term_max = statements
+        .flat_map(|statement| statement.arguments())
+        .map(|term| term.get())
+        .max()
+        .expect("every episode statement has arguments");
+    let predicate_values: Vec<_> = (0..=predicate_max)
+        .map(|id| format!("predicate-{id:020}"))
+        .collect();
+    let term_values: Vec<_> = (0..=term_max).map(|id| format!("term-{id:020}")).collect();
+    store
+        .intern_predicates(&predicate_values)
+        .expect("test predicate catalog stages");
+    store
+        .intern_terms(&term_values)
+        .expect("test term catalog stages");
     store
         .memory_mut()
         .insert_episode(episode)
@@ -71,6 +98,364 @@ fn insert(store: &mut SqliteStore, episode: EpisodeDraft) -> AtomId {
 
 fn trace(history_bits: u16, sample_count: u8) -> FeedbackTrace {
     FeedbackTrace::from_parts(history_bits, sample_count).expect("test feedback trace is canonical")
+}
+
+#[test]
+fn symbol_batches_normalize_stage_resolve_and_round_trip() {
+    let directory = tempdir().unwrap();
+    let path = database_path(&directory);
+    let mut store = SqliteStore::create(&path).unwrap();
+
+    let predicates = store
+        .intern_predicates(&[
+            "  KELVIN\t\nNAME  ".to_owned(),
+            "kelvin name".to_owned(),
+            "zeta".to_owned(),
+            "alpha".to_owned(),
+        ])
+        .unwrap();
+    let terms = store
+        .intern_terms(&[
+            "kelvin name".to_owned(),
+            "ＣＡＦÉ".to_owned(),
+            "café".to_owned(),
+            "İ".to_owned(),
+            "i\u{0307}".to_owned(),
+            "left\u{0085}right".to_owned(),
+            "left right".to_owned(),
+        ])
+        .unwrap();
+    assert_eq!(
+        predicates,
+        [
+            PredicateId::new(0),
+            PredicateId::new(0),
+            PredicateId::new(1),
+            PredicateId::new(2)
+        ]
+    );
+    assert_eq!(
+        terms,
+        [
+            TermId::new(0),
+            TermId::new(1),
+            TermId::new(1),
+            TermId::new(2),
+            TermId::new(2),
+            TermId::new(3),
+            TermId::new(3)
+        ]
+    );
+    assert_eq!(
+        store
+            .predicate_values(&[predicates[0], PredicateId::new(99), predicates[1]])
+            .unwrap(),
+        [
+            Some("kelvin name".to_owned()),
+            None,
+            Some("kelvin name".to_owned())
+        ]
+    );
+    assert_eq!(
+        store
+            .term_values(&[terms[0], terms[1], terms[3], terms[5]])
+            .unwrap(),
+        [
+            Some("kelvin name".to_owned()),
+            Some("café".to_owned()),
+            Some("i\u{0307}".to_owned()),
+            Some("left right".to_owned())
+        ]
+    );
+
+    let raw = Connection::open(&path).unwrap();
+    let staged_counts: (i64, i64, i64) = raw
+        .query_row(
+            "SELECT snapshot_revision,
+                    (SELECT count(*) FROM predicates),
+                    (SELECT count(*) FROM terms)
+             FROM memory_meta",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(staged_counts, (0, 0, 0));
+    drop(raw);
+
+    store
+        .memory_mut()
+        .insert_episode(observation_draft(0, predicates[0].get(), &[terms[0].get()]))
+        .unwrap();
+    store.save().unwrap();
+    drop(store);
+
+    let reopened = SqliteStore::open(&path).unwrap();
+    assert_eq!(
+        reopened.predicate_values(&[PredicateId::new(0)]).unwrap(),
+        [Some("kelvin name".to_owned())]
+    );
+    assert_eq!(
+        reopened
+            .term_values(&[
+                TermId::new(0),
+                TermId::new(1),
+                TermId::new(2),
+                TermId::new(3)
+            ])
+            .unwrap(),
+        [
+            Some("kelvin name".to_owned()),
+            Some("café".to_owned()),
+            Some("i\u{0307}".to_owned()),
+            Some("left right".to_owned())
+        ]
+    );
+}
+
+#[test]
+fn invalid_symbol_batch_is_atomic_and_resolve_chunks_large_requests() {
+    let directory = tempdir().unwrap();
+    let path = database_path(&directory);
+    let mut store = SqliteStore::create(&path).unwrap();
+
+    for (values, expected_detail) in [
+        (
+            vec!["valid".to_owned(), " \t\n ".to_owned()],
+            "normalized value is empty",
+        ),
+        (
+            vec!["valid".to_owned(), "nul\0value".to_owned()],
+            "normalized value contains a control character",
+        ),
+        (
+            vec!["valid".to_owned(), "x".repeat(4_097)],
+            "normalized UTF-8 value exceeds 4096 bytes",
+        ),
+    ] {
+        assert!(matches!(
+            store.intern_predicates(&values),
+            Err(StoreError::InvalidSymbolValue { index: 1, detail, .. })
+                if detail == expected_detail
+        ));
+    }
+
+    let repeated_before_invalid = vec![
+        "  repeated value  ".to_owned(),
+        "  repeated value  ".to_owned(),
+        "REPEATED VALUE".to_owned(),
+        "another valid value".to_owned(),
+        "late\0control".to_owned(),
+    ];
+    assert!(matches!(
+        store.intern_predicates(&repeated_before_invalid),
+        Err(StoreError::InvalidSymbolValue {
+            namespace: "predicate",
+            index: 4,
+            detail: "normalized value contains a control character"
+        })
+    ));
+
+    let values: Vec<_> = (0..1_005).map(|index| format!("symbol-{index}")).collect();
+    let ids = store.intern_predicates(&values).unwrap();
+    assert_eq!(ids.first(), Some(&PredicateId::new(0)));
+    assert_eq!(ids.last(), Some(&PredicateId::new(1_004)));
+    store.save().unwrap();
+    drop(store);
+
+    let reopened = SqliteStore::open(&path).unwrap();
+    let mut requested = ids;
+    requested.push(PredicateId::new(9_999));
+    let resolved = reopened.predicate_values(&requested).unwrap();
+    assert_eq!(resolved.len(), 1_006);
+    assert_eq!(resolved[0], Some("symbol-0".to_owned()));
+    assert_eq!(resolved[1_004], Some("symbol-1004".to_owned()));
+    assert_eq!(resolved[1_005], None);
+}
+
+#[test]
+fn symbol_byte_limit_and_lowercase_without_case_folding_are_exact() {
+    let directory = tempdir().unwrap();
+    let path = database_path(&directory);
+    let mut store = SqliteStore::create(&path).unwrap();
+
+    let exact_limit = "é".repeat(2_048);
+    let over_limit = format!("{exact_limit}x");
+    let ids = store
+        .intern_terms(&[
+            exact_limit.clone(),
+            "Straße".to_owned(),
+            "STRASSE".to_owned(),
+            "comma,value".to_owned(),
+            "comma value".to_owned(),
+        ])
+        .unwrap();
+    assert_eq!(ids, (0..5).map(TermId::new).collect::<Vec<_>>());
+    assert!(matches!(
+        store.intern_terms(&[over_limit]),
+        Err(StoreError::InvalidSymbolValue {
+            namespace: "term",
+            index: 0,
+            detail: "normalized UTF-8 value exceeds 4096 bytes"
+        })
+    ));
+    assert_eq!(
+        store.term_values(&ids).unwrap(),
+        [
+            Some(exact_limit),
+            Some("straße".to_owned()),
+            Some("strasse".to_owned()),
+            Some("comma,value".to_owned()),
+            Some("comma value".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn save_rejects_uninterned_symbols_atomically_and_can_retry() {
+    let directory = tempdir().unwrap();
+    let path = database_path(&directory);
+    let mut store = SqliteStore::create(&path).unwrap();
+    store
+        .memory_mut()
+        .insert_episode(observation_draft(0, 0, &[0]))
+        .unwrap();
+
+    assert!(matches!(
+        store.save(),
+        Err(StoreError::UnknownSymbolId {
+            namespace: "predicate",
+            id: 0
+        })
+    ));
+    let raw = Connection::open(&path).unwrap();
+    let state: (i64, i64, i64, i64) = raw
+        .query_row(
+            "SELECT snapshot_revision,
+                    (SELECT count(*) FROM predicates),
+                    (SELECT count(*) FROM terms),
+                    (SELECT count(*) FROM episodes)
+             FROM memory_meta",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(state, (0, 0, 0, 0));
+    drop(raw);
+
+    assert_eq!(
+        store.intern_predicates(&["predicate".to_owned()]).unwrap(),
+        [PredicateId::new(0)]
+    );
+    assert!(matches!(
+        store.save(),
+        Err(StoreError::UnknownSymbolId {
+            namespace: "term",
+            id: 0
+        })
+    ));
+    let raw = Connection::open(&path).unwrap();
+    let state: (i64, i64, i64, i64) = raw
+        .query_row(
+            "SELECT snapshot_revision,
+                    (SELECT count(*) FROM predicates),
+                    (SELECT count(*) FROM terms),
+                    (SELECT count(*) FROM episodes)
+             FROM memory_meta",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(state, (0, 0, 0, 0));
+    drop(raw);
+
+    assert_eq!(
+        store.intern_terms(&["term".to_owned()]).unwrap(),
+        [TermId::new(0)]
+    );
+    store.save().unwrap();
+    drop(store);
+    let reopened = SqliteStore::open(&path).unwrap();
+    assert_eq!(reopened.memory().episodes().len(), 1);
+    assert_eq!(
+        reopened.predicate_values(&[PredicateId::new(0)]).unwrap(),
+        [Some("predicate".to_owned())]
+    );
+    assert_eq!(
+        reopened.term_values(&[TermId::new(0)]).unwrap(),
+        [Some("term".to_owned())]
+    );
+}
+
+#[test]
+fn symbol_corruption_and_missing_episode_references_fail_closed() {
+    for corrupt in ["value", "reference"] {
+        let directory = tempdir().unwrap();
+        let path = database_path(&directory);
+        let mut store = SqliteStore::create(&path).unwrap();
+        let predicate = store.intern_predicates(&["predicate".to_owned()]).unwrap()[0];
+        let term = store.intern_terms(&["term".to_owned()]).unwrap()[0];
+        store
+            .memory_mut()
+            .insert_episode(observation_draft(0, predicate.get(), &[term.get()]))
+            .unwrap();
+        store.save().unwrap();
+        drop(store);
+
+        let raw = Connection::open(&path).unwrap();
+        match corrupt {
+            "value" => {
+                raw.execute("UPDATE predicates SET value = 'NOT NORMALIZED'", [])
+                    .unwrap();
+            }
+            "reference" => {
+                raw.execute("DELETE FROM terms", []).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        drop(raw);
+
+        match SqliteStore::open(&path) {
+            Err(StoreError::InvalidStore(StoreIntegrityError::InvalidSymbol { .. }))
+                if corrupt == "value" => {}
+            Err(StoreError::InvalidStore(StoreIntegrityError::InvalidEpisode { .. }))
+                if corrupt == "reference" => {}
+            Err(error) => panic!("unexpected integrity error: {error}"),
+            Ok(_) => panic!("corrupt symbol store opened"),
+        }
+    }
+}
+
+#[test]
+fn concurrent_symbol_allocators_are_serialized_by_snapshot_cas() {
+    let directory = tempdir().unwrap();
+    let path = database_path(&directory);
+    drop(SqliteStore::create(&path).unwrap());
+    let mut first = SqliteStore::open(&path).unwrap();
+    let mut stale = SqliteStore::open(&path).unwrap();
+    assert_eq!(
+        first.intern_predicates(&["first".to_owned()]).unwrap(),
+        [PredicateId::new(0)]
+    );
+    assert_eq!(
+        stale.intern_predicates(&["stale".to_owned()]).unwrap(),
+        [PredicateId::new(0)]
+    );
+    first.save().unwrap();
+    assert!(matches!(
+        stale.save(),
+        Err(StoreError::ConcurrentModification {
+            expected_revision: 0,
+            actual_revision: 1
+        })
+    ));
+    drop(first);
+    drop(stale);
+
+    let reopened = SqliteStore::open(&path).unwrap();
+    assert_eq!(
+        reopened.predicate_values(&[PredicateId::new(0)]).unwrap(),
+        [Some("first".to_owned())]
+    );
 }
 
 #[test]
@@ -145,16 +530,16 @@ fn full_snapshot_round_trips_exactly_and_continues_the_sequence() {
     let path = database_path(&directory);
     let mut store = SqliteStore::create(&path).expect("new store is created");
 
-    let low_context = statement(0, &[u64::MAX]);
-    let high_context = statement(u64::MAX, &[0, 1_u64 << 63]);
+    let low_context = statement(0, &[0]);
+    let high_context = statement(1, &[1, 2]);
     let first = insert(
         &mut store,
         EpisodeDraft {
             occurred_at: TimestampMs::new(i64::MIN),
             recorded_at: TimestampMs::new(i64::MAX),
             context: vec![high_context.clone(), low_context.clone(), high_context],
-            observation: statement(u64::MAX, &[0, 1_u64 << 63, u64::MAX]),
-            action: Some(statement(1_u64 << 63, &[u64::MAX, 0])),
+            observation: statement(2, &[0, 2, 3]),
+            action: Some(statement(3, &[3, 0])),
             outcome: Some(statement(0, &[1])),
             source: SourceId::new(u64::MAX),
         },
@@ -165,7 +550,7 @@ fn full_snapshot_round_trips_exactly_and_continues_the_sequence() {
             occurred_at: TimestampMs::new(i64::MAX),
             recorded_at: TimestampMs::new(i64::MIN),
             context: Vec::new(),
-            observation: statement(1_u64 << 63, &[u64::MAX]),
+            observation: statement(1, &[3]),
             action: None,
             outcome: None,
             source: SourceId::new(1_u64 << 63),

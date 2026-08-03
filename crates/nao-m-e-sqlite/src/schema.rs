@@ -7,12 +7,13 @@ use rusqlite::{Connection, Error, Result, TransactionBehavior, params};
 use crate::codec::encode_memory_id;
 
 pub(crate) const APPLICATION_ID: i64 = 0x4E41_4F4D;
-pub(crate) const FORMAT_VERSION: i64 = 3;
+pub(crate) const FORMAT_VERSION: i64 = 4;
+pub(crate) const MAX_SYMBOL_BYTES: usize = 4_096;
 
 const SCHEMA: &str = r#"
 CREATE TABLE memory_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    format_version INTEGER NOT NULL CHECK (format_version = 3),
+    format_version INTEGER NOT NULL CHECK (format_version = 4),
     memory_id BLOB NOT NULL
         CHECK (
             typeof(memory_id) = 'blob'
@@ -21,6 +22,32 @@ CREATE TABLE memory_meta (
         ),
     snapshot_revision INTEGER NOT NULL CHECK (snapshot_revision >= 0)
 ) STRICT, WITHOUT ROWID;
+
+CREATE TABLE predicates (
+    id BLOB PRIMARY KEY
+        CHECK (typeof(id) = 'blob' AND length(id) = 8),
+    value TEXT NOT NULL
+        CHECK (
+            typeof(value) = 'text'
+            AND length(CAST(value AS BLOB)) BETWEEN 1 AND 4096
+        )
+) STRICT, WITHOUT ROWID;
+
+CREATE UNIQUE INDEX predicates_value_unique
+    ON predicates(value COLLATE BINARY);
+
+CREATE TABLE terms (
+    id BLOB PRIMARY KEY
+        CHECK (typeof(id) = 'blob' AND length(id) = 8),
+    value TEXT NOT NULL
+        CHECK (
+            typeof(value) = 'text'
+            AND length(CAST(value AS BLOB)) BETWEEN 1 AND 4096
+        )
+) STRICT, WITHOUT ROWID;
+
+CREATE UNIQUE INDEX terms_value_unique
+    ON terms(value COLLATE BINARY);
 
 CREATE TABLE episodes (
     sequence BLOB PRIMARY KEY
@@ -53,7 +80,15 @@ CREATE TABLE feedback_edges (
 "#;
 
 static CANONICAL_SCHEMA: OnceLock<Vec<SchemaObject>> = OnceLock::new();
-const SCHEMA_TABLE_NAMES: [&str; 3] = ["memory_meta", "episodes", "feedback_edges"];
+const SCHEMA_OBJECTS: [(&str, &str, &str); 7] = [
+    ("table", "memory_meta", "memory_meta"),
+    ("table", "predicates", "predicates"),
+    ("index", "predicates_value_unique", "predicates"),
+    ("table", "terms", "terms"),
+    ("index", "terms_value_unique", "terms"),
+    ("table", "episodes", "episodes"),
+    ("table", "feedback_edges", "feedback_edges"),
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SchemaObject {
@@ -86,6 +121,20 @@ pub(crate) fn configure_durability(connection: &Connection) -> Result<()> {
         }
     }
 
+    configure_synchronous(connection)
+}
+
+pub(crate) fn verify_durability(connection: &Connection) -> Result<()> {
+    let journal_mode: String =
+        connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    if !journal_mode.eq_ignore_ascii_case("delete") {
+        return Err(Error::InvalidQuery);
+    }
+
+    configure_synchronous(connection)
+}
+
+fn configure_synchronous(connection: &Connection) -> Result<()> {
     connection.pragma_update(None, "synchronous", "EXTRA")?;
     verify_integer_pragma(connection, "synchronous", 3)
 }
@@ -122,18 +171,24 @@ fn canonical_schema_objects() -> &'static Vec<SchemaObject> {
             .map(str::trim)
             .filter(|definition| !definition.is_empty())
             .collect();
-        assert_eq!(definitions.len(), SCHEMA_TABLE_NAMES.len());
-        let mut objects: Vec<_> = SCHEMA_TABLE_NAMES
+        assert_eq!(definitions.len(), SCHEMA_OBJECTS.len());
+        let mut objects: Vec<_> = SCHEMA_OBJECTS
             .into_iter()
             .zip(definitions)
-            .map(|(name, definition)| SchemaObject {
-                object_type: "table".to_owned(),
-                name: name.to_owned(),
-                table_name: name.to_owned(),
-                normalized_sql: Some(normalize_sql(definition)),
-            })
+            .map(
+                |((object_type, name, table_name), definition)| SchemaObject {
+                    object_type: object_type.to_owned(),
+                    name: name.to_owned(),
+                    table_name: table_name.to_owned(),
+                    normalized_sql: Some(normalize_sql(definition)),
+                },
+            )
             .collect();
-        objects.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        objects.sort_unstable_by(|left, right| {
+            left.object_type
+                .cmp(&right.object_type)
+                .then_with(|| left.name.cmp(&right.name))
+        });
         objects
     })
 }
@@ -238,7 +293,28 @@ mod tests {
             .unwrap()
             .collect::<Result<_>>()
             .unwrap();
-        assert_eq!(tables, ["episodes", "feedback_edges", "memory_meta"]);
+        assert_eq!(
+            tables,
+            [
+                "episodes",
+                "feedback_edges",
+                "memory_meta",
+                "predicates",
+                "terms"
+            ]
+        );
+        let indexes: Vec<String> = connection
+            .prepare(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'index' AND sql IS NOT NULL
+                 ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(indexes, ["predicates_value_unique", "terms_value_unique"]);
     }
 
     #[test]
@@ -319,6 +395,39 @@ mod tests {
         create_schema(&mut connection, MemoryId::new(1).unwrap()).unwrap();
         let zero = [0_u8; 8];
         let one = [0_u8, 0, 0, 0, 0, 0, 0, 1];
+
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO predicates (id, value) VALUES (?1, 'bad-id')",
+                    [[0_u8; 7].as_slice()],
+                )
+                .is_err()
+        );
+        for value in [String::new(), "x".repeat(MAX_SYMBOL_BYTES + 1)] {
+            assert!(
+                connection
+                    .execute(
+                        "INSERT INTO predicates (id, value) VALUES (?1, ?2)",
+                        params![zero.as_slice(), value],
+                    )
+                    .is_err()
+            );
+        }
+        connection
+            .execute(
+                "INSERT INTO predicates (id, value) VALUES (?1, 'value')",
+                [zero.as_slice()],
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO predicates (id, value) VALUES (?1, 'value')",
+                    [one.as_slice()],
+                )
+                .is_err()
+        );
 
         assert!(
             connection
