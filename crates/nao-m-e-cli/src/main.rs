@@ -190,8 +190,21 @@ fn parse_add_args(args: &[OsString]) -> Result<ParsedArgs, String> {
         }));
     }
 
-    let (episode_options, quiet) = strip_quiet(options)?;
-    let draft = parse_episode_flags(&episode_options)?;
+    let mut quiet = false;
+    for option in options {
+        if option.as_os_str() == OsStr::new("--quiet") {
+            if quiet {
+                return Err("`--quiet` may be specified only once".to_owned());
+            }
+            quiet = true;
+        }
+    }
+    let draft = parse_episode_flags(
+        options
+            .iter()
+            .map(OsString::as_os_str)
+            .filter(|option| *option != OsStr::new("--quiet")),
+    )?;
     Ok(ParsedArgs::Execute(Command::Add {
         database: PathBuf::from(database),
         draft,
@@ -217,23 +230,7 @@ fn parse_mode_options(options: &[OsString], required: &str) -> Result<bool, Stri
     Ok(quiet)
 }
 
-fn strip_quiet(options: &[OsString]) -> Result<(Vec<OsString>, bool), String> {
-    let mut episode_options = Vec::with_capacity(options.len());
-    let mut quiet = false;
-    for option in options {
-        if option.as_os_str() == OsStr::new("--quiet") {
-            if quiet {
-                return Err("`--quiet` may be specified only once".to_owned());
-            }
-            quiet = true;
-        } else {
-            episode_options.push(option.clone());
-        }
-    }
-    Ok((episode_options, quiet))
-}
-
-fn parse_episode_flags(args: &[OsString]) -> CliResult<EpisodeDraft> {
+fn parse_episode_flags<'a>(args: impl IntoIterator<Item = &'a OsStr>) -> CliResult<EpisodeDraft> {
     let mut occurred_at = None;
     let mut recorded_at = None;
     let mut source = None;
@@ -242,17 +239,15 @@ fn parse_episode_flags(args: &[OsString]) -> CliResult<EpisodeDraft> {
     let mut context = Vec::new();
     let mut action = None;
     let mut outcome = None;
-    let mut cursor = 0;
+    let mut args = args.into_iter();
 
-    while cursor < args.len() {
-        let option = args[cursor]
+    while let Some(option) = args.next() {
+        let option = option
             .to_str()
             .ok_or_else(|| "episode options must be valid UTF-8".to_owned())?;
-        cursor += 1;
         let value = args
-            .get(cursor)
+            .next()
             .ok_or_else(|| format!("`{option}` requires a value"))?;
-        cursor += 1;
 
         match option {
             "--occurred" => set_once(
@@ -488,11 +483,7 @@ fn read_many_drafts() -> CliResult<Vec<EpisodeDraft>> {
         if line.trim().is_empty() {
             continue;
         }
-        let arguments = line
-            .split_ascii_whitespace()
-            .map(OsString::from)
-            .collect::<Vec<_>>();
-        let draft = parse_episode_flags(&arguments)
+        let draft = parse_episode_flags(line.split_ascii_whitespace().map(OsStr::new))
             .map_err(|error| format!("add --many line {line_number}: {error}"))?;
         drafts.push(draft);
     }
@@ -505,28 +496,22 @@ fn read_many_drafts() -> CliResult<Vec<EpisodeDraft>> {
 fn execute_add(database: &Path, drafts: Vec<EpisodeDraft>, quiet: bool) -> CliResult<Vec<u8>> {
     let mut store = SqliteStore::open(database)
         .map_err(|error| format!("could not open `{}`: {error}", database.display()))?;
-    let mut sequences = Vec::with_capacity(drafts.len());
+    let mut output = if quiet {
+        String::new()
+    } else {
+        String::with_capacity(drafts.len().saturating_mul(21))
+    };
     for draft in drafts {
         let atom_id = store
             .memory_mut()
             .insert_episode(draft)
             .map_err(|error| error.to_string())?;
-        sequences.push(atom_id.sequence());
+        if !quiet {
+            writeln!(output, "{}", atom_id.sequence()).expect("writing to a String cannot fail");
+        }
     }
-    let output = format_sequences(&sequences, quiet);
     save(&mut store, database)?;
-    Ok(output)
-}
-
-fn format_sequences(sequences: &[u64], quiet: bool) -> Vec<u8> {
-    if quiet {
-        return Vec::new();
-    }
-    let mut output = String::with_capacity(sequences.len().saturating_mul(21));
-    for sequence in sequences {
-        writeln!(output, "{sequence}").expect("writing to a String cannot fail");
-    }
-    output.into_bytes()
+    Ok(output.into_bytes())
 }
 
 fn execute_recall(database: &Path, source_sequence: u64, limit: usize) -> CliResult<Vec<u8>> {

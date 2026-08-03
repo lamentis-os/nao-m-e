@@ -213,16 +213,15 @@ stored activation state, and does not save or otherwise mutate the memory.
 
 Feedback is binary and successful feedback writes nothing to standard output.
 Exactly one of `--helpful` and `--unhelpful` supplies the authoritative target
-sequence list. Feedback does not recompute recall or bind the event to an
-earlier query. The core validates every sequence, rejects more than 10,000 raw
-targets, ignores the source and duplicate targets, and applies the deterministic
-rule documented in the V0 contract. A helpful event changes each effective
-target by at most 1,000 ppm and caps their aggregate direct adjustment at
-10,000 ppm. It uses free outgoing capacity first, then removes exactly the
-remaining required total from non-target edges. Unhelpful feedback reduces or
-removes only the supplied target edges. The next recall from the same source
-observes the resulting graph. Each feedback command uses one save. The snapshot
-stores neither a feedback receipt nor provenance for the change.
+sequence list. Helpful feedback strengthens direct relevance from the source to
+the effective targets; unhelpful feedback weakens or removes only those target
+edges. Feedback is deterministic and budgeted, does not recompute recall, and
+does not bind the event to an earlier query. The next recall from the same
+source observes the resulting graph. Each feedback command uses one save, and
+the snapshot stores neither a feedback receipt nor provenance for the change.
+The [V0 external-feedback contract](docs/v0-contract.md#external-feedback) is
+authoritative for validation, the 10,000-target input limit, target
+normalization, adjustment bounds, and exact fixed-point redistribution.
 
 An initialized memory and newly added episodes have no relevance edges. Recall
 from such an episode is empty until helpful feedback seeds known target

@@ -4,8 +4,8 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 use nao_m_e::{
-    AtomId, EpisodeAtom, EpisodeDraft, InfluenceWeight, PredicateId, SourceId, Statement, TermId,
-    TimestampMs,
+    AtomId, EpisodeAtom, EpisodeDraft, InfluenceWeight, MAX_FEEDBACK_TARGETS, PredicateId,
+    SourceId, Statement, TermId, TimestampMs,
 };
 use nao_m_e_sqlite::SqliteStore;
 use tempfile::TempDir;
@@ -148,6 +148,15 @@ fn assert_minimal_episode(atom: &EpisodeAtom, seed: u64) {
     assert_statement(atom.observation(), seed + 10, &[seed + 100]);
     assert_eq!(atom.action(), None);
     assert_eq!(atom.outcome(), None);
+}
+
+fn minimal_recall_block(sequence: u64, activation_ppm: u32) -> String {
+    format!(
+        "sequence {sequence}\nactivation_ppm {activation_ppm}\noccurred {sequence}\nrecorded {}\nsource {sequence}\npredicate {}\nterms {}",
+        sequence + 1,
+        sequence + 10,
+        sequence + 100
+    )
 }
 
 #[test]
@@ -355,27 +364,46 @@ fn recall_emits_exact_ranked_blocks_and_honors_limit() {
     let second_tie = store.memory_mut().insert_episode(draft(3)).unwrap();
     store
         .memory_mut()
-        .set_relevance(source, rich, InfluenceWeight::from_ppm(600_000).unwrap())
+        .set_relevance(source, rich, InfluenceWeight::from_ppm(300_000).unwrap())
         .unwrap();
     for target in [first_tie, second_tie] {
         store
             .memory_mut()
-            .set_relevance(source, target, InfluenceWeight::from_ppm(200_000).unwrap())
+            .set_relevance(source, target, InfluenceWeight::from_ppm(100_000).unwrap())
+            .unwrap();
+    }
+    for (seed, weight_ppm) in (4..=11).zip((20_000..=90_000).rev().step_by(10_000)) {
+        let target = store.memory_mut().insert_episode(draft(seed)).unwrap();
+        store
+            .memory_mut()
+            .set_relevance(
+                source,
+                target,
+                InfluenceWeight::from_ppm(weight_ppm).unwrap(),
+            )
             .unwrap();
     }
     store.save().unwrap();
     drop(store);
 
-    let expected = "sequence 1\nactivation_ppm 240000\noccurred -7\nrecorded 8\nsource 9\ncontext 11:110\ncontext 12:120,121\npredicate 20\nterms 200,201\naction 21:210\noutcome 22:220,221\n\nsequence 2\nactivation_ppm 80000\noccurred 2\nrecorded 3\nsource 2\npredicate 12\nterms 102\n\nsequence 3\nactivation_ppm 80000\noccurred 3\nrecorded 4\nsource 3\npredicate 13\nterms 103\n";
-    assert_eq!(success_text(recall(&database, 0, None)), expected);
+    let rich_block = "sequence 1\nactivation_ppm 120000\noccurred -7\nrecorded 8\nsource 9\ncontext 11:110\ncontext 12:120,121\npredicate 20\nterms 200,201\naction 21:210\noutcome 22:220,221";
+    let mut blocks = vec![rich_block.to_owned()];
+    blocks.extend(
+        [(2, 40_000), (3, 40_000)]
+            .into_iter()
+            .chain((4..=11).zip((8_000..=36_000).rev().step_by(4_000)))
+            .map(|(sequence, activation_ppm)| minimal_recall_block(sequence, activation_ppm)),
+    );
+    assert_eq!(blocks.len(), 11);
 
-    let first_two = expected
-        .rsplit_once("\n\nsequence 3")
-        .expect("third block is present")
-        .0
-        .to_owned()
-        + "\n";
-    assert_eq!(success_text(recall(&database, 0, Some(2))), first_two);
+    let expected_default = blocks[..10].join("\n\n") + "\n";
+    assert_eq!(success_text(recall(&database, 0, None)), expected_default);
+
+    let expected_eleven = blocks.join("\n\n") + "\n";
+    assert_eq!(
+        success_text(recall(&database, 0, Some(11))),
+        expected_eleven
+    );
 }
 
 #[test]
@@ -538,26 +566,40 @@ fn old_run_json_and_recall_v2_syntax_are_rejected() {
 }
 
 #[test]
-fn preexisting_sqlite_v2_store_needs_no_migration() {
+fn feedback_enforces_the_raw_target_limit_without_changing_a_rejected_snapshot() {
     let directory = TempDir::new().expect("temporary directory");
     let database = directory.path().join("memory.sqlite3");
-    let mut store = SqliteStore::create(&database).unwrap();
-    let source = store.memory_mut().insert_episode(draft(1)).unwrap();
-    let target = store.memory_mut().insert_episode(draft(2)).unwrap();
-    store
-        .memory_mut()
-        .set_relevance(source, target, InfluenceWeight::from_ppm(1_000).unwrap())
-        .unwrap();
-    store.save().unwrap();
-    drop(store);
+    init(&database);
+    assert_silent_success(add_minimal(&database, 1, true));
+    assert_silent_success(add_minimal(&database, 2, true));
 
-    assert!(
-        success_text(recall(&database, 0, None)).starts_with("sequence 1\nactivation_ppm 400\n")
-    );
-    assert_eq!(success_text(add_minimal(&database, 3, false)), "2\n");
-    assert_silent_success(feedback(&database, 0, false, "1"));
+    let maximum_targets_with_trailing_comma = "1,".repeat(MAX_FEEDBACK_TARGETS);
+    let maximum_targets = maximum_targets_with_trailing_comma
+        .strip_suffix(',')
+        .expect("the target limit is non-zero");
+    assert_silent_success(feedback(&database, 0, true, maximum_targets));
+
+    let mut revision_witness = SqliteStore::open(&database).unwrap();
+    let too_many_targets = format!("{maximum_targets},1");
+    let stderr = failure(feedback(&database, 0, false, &too_many_targets), 1);
+    assert!(stderr.contains("feedback target count"));
 
     let reopened = SqliteStore::open(&database).unwrap();
-    assert_eq!(reopened.memory().episodes().len(), 3);
-    assert_eq!(reopened.memory().relevance(source, target), None);
+    assert_eq!(reopened.memory_id(), revision_witness.memory_id());
+    assert!(
+        reopened
+            .memory()
+            .episodes()
+            .eq(revision_witness.memory().episodes())
+    );
+    assert!(
+        reopened
+            .memory()
+            .relevance_edges()
+            .eq(revision_witness.memory().relevance_edges())
+    );
+    drop(reopened);
+    revision_witness
+        .save()
+        .expect("rejected feedback did not advance the snapshot revision");
 }
