@@ -317,29 +317,73 @@ impl Activation {
     }
 }
 
-/// Positive relevance influence measured in parts per million.
+/// Bounded binary feedback history for one directed episode association.
 ///
-/// A weight controls source-conditioned accessibility; it is not a probability
-/// or confidence.
+/// Bit zero is the newest sample. Set bits represent helpful feedback and
+/// cleared bits represent unhelpful feedback. A trace always contains at least
+/// one and at most [`crate::FEEDBACK_HISTORY_CAPACITY`] samples.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct InfluenceWeight(u32);
+pub struct FeedbackTrace {
+    history_bits: u16,
+    sample_count: u8,
+}
 
-impl InfluenceWeight {
-    /// Creates a weight from one through [`crate::SCALE`].
-    pub const fn from_ppm(value: u32) -> Result<Self, ValueError> {
-        if value == 0 {
-            return Err(ValueError::ZeroWeight);
+impl FeedbackTrace {
+    /// Reconstructs a canonical, non-empty feedback trace.
+    ///
+    /// Returns `None` when `sample_count` is outside the supported range or a
+    /// bit above the declared history length is set.
+    #[must_use]
+    pub const fn from_parts(history_bits: u16, sample_count: u8) -> Option<Self> {
+        if sample_count == 0 || sample_count > crate::FEEDBACK_HISTORY_CAPACITY {
+            return None;
         }
-        if value > SCALE {
-            return Err(ValueError::OutOfRange { value });
+        if history_bits as u32 >= (1_u32 << sample_count) {
+            return None;
         }
-        Ok(Self(value))
+        Some(Self {
+            history_bits,
+            sample_count,
+        })
     }
 
-    /// Returns the parts-per-million representation.
+    /// Returns the canonical history bits, with the newest sample in bit zero.
     #[must_use]
-    pub const fn as_ppm(self) -> u32 {
-        self.0
+    pub const fn history_bits(self) -> u16 {
+        self.history_bits
+    }
+
+    /// Returns the number of represented feedback samples.
+    #[must_use]
+    pub const fn sample_count(self) -> u8 {
+        self.sample_count
+    }
+
+    /// Returns the number of helpful samples in the represented history.
+    #[must_use]
+    pub const fn helpful_count(self) -> u8 {
+        self.history_bits.count_ones() as u8
+    }
+
+    /// Returns the number of unhelpful samples in the represented history.
+    #[must_use]
+    pub const fn unhelpful_count(self) -> u8 {
+        self.sample_count - self.helpful_count()
+    }
+
+    pub(crate) const fn from_feedback(helpful: bool) -> Self {
+        Self {
+            history_bits: helpful as u16,
+            sample_count: 1,
+        }
+    }
+
+    pub(crate) fn push(&mut self, helpful: bool) {
+        self.history_bits = (self.history_bits << 1) | u16::from(helpful);
+        self.sample_count = self
+            .sample_count
+            .saturating_add(1)
+            .min(crate::FEEDBACK_HISTORY_CAPACITY);
     }
 }
 
@@ -387,8 +431,6 @@ pub enum ValueError {
         /// Rejected parts-per-million value.
         value: u32,
     },
-    /// Zero cannot represent an existing relevance edge.
-    ZeroWeight,
 }
 
 impl fmt::Display for ValueError {
@@ -397,7 +439,6 @@ impl fmt::Display for ValueError {
             Self::OutOfRange { value } => {
                 write!(formatter, "fixed-point value {value} exceeds {SCALE}")
             }
-            Self::ZeroWeight => formatter.write_str("an influence weight must be positive"),
         }
     }
 }
@@ -421,7 +462,7 @@ impl fmt::Display for MemoryError {
 
 impl Error for MemoryError {}
 
-/// Failure while recalling or changing relevance topology.
+/// Failure while recalling or changing feedback topology.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GraphError {
     /// An operation referred to an atom absent from this memory.
@@ -433,15 +474,8 @@ pub enum GraphError {
         /// Maximum accepted target entries.
         max: usize,
     },
-    /// A relevance edge attempted to connect an atom to itself.
+    /// A feedback edge attempted to connect an atom to itself.
     SelfEdge(AtomId),
-    /// Updated outgoing weights would exceed [`crate::SCALE`].
-    OutgoingWeightBudgetExceeded {
-        /// Source whose outgoing budget would be exceeded.
-        from: AtomId,
-        /// Rejected outgoing total.
-        attempted_ppm: u64,
-    },
 }
 
 impl fmt::Display for GraphError {
@@ -451,14 +485,7 @@ impl fmt::Display for GraphError {
             Self::FeedbackTargetLimitExceeded { count, max } => {
                 write!(formatter, "feedback target count {count} exceeds {max}")
             }
-            Self::SelfEdge(id) => write!(formatter, "atom {id} cannot influence itself"),
-            Self::OutgoingWeightBudgetExceeded {
-                from,
-                attempted_ppm,
-            } => write!(
-                formatter,
-                "atom {from} outgoing weight {attempted_ppm} exceeds {SCALE}",
-            ),
+            Self::SelfEdge(id) => write!(formatter, "atom {id} cannot have feedback about itself"),
         }
     }
 }

@@ -11,7 +11,7 @@ pub enum StoreError {
     Database(rusqlite::Error),
     /// Operating-system entropy was unavailable while allocating a memory ID.
     Entropy(getrandom::Error),
-    /// Persisted data did not satisfy the SQLite V2 contract.
+    /// Persisted data did not satisfy the SQLite V3 contract.
     InvalidStore(StoreIntegrityError),
     /// Another store session committed after this session was opened or saved.
     ConcurrentModification {
@@ -130,8 +130,8 @@ pub enum StoreIntegrityError {
         /// Violated episode invariant.
         detail: &'static str,
     },
-    /// A relevance edge is invalid.
-    InvalidRelevance {
+    /// A feedback edge is invalid.
+    InvalidFeedback {
         /// Source sequence.
         from: u64,
         /// Target sequence.
@@ -169,8 +169,8 @@ impl fmt::Display for StoreIntegrityError {
             Self::InvalidEpisode { sequence, detail } => {
                 write!(formatter, "invalid episode {sequence}: {detail}")
             }
-            Self::InvalidRelevance { from, to, detail } => {
-                write!(formatter, "invalid relevance edge {from}->{to}: {detail}")
+            Self::InvalidFeedback { from, to, detail } => {
+                write!(formatter, "invalid feedback edge {from}->{to}: {detail}")
             }
         }
     }

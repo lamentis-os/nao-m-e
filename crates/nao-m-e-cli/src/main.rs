@@ -64,9 +64,10 @@ Usage:
   nao-m-e recall <DATABASE> --from <SEQUENCE>
   nao-m-e recall <DATABASE> --from <SEQUENCE> --limit <N>
 
-Symbolic cue overlap provides cold candidates. Direct learned relevance can add
-candidates and boost their score. The default recall limit is 10. Hits are
-separated by one blank line. No hits produce no standard output.
+Symbolic cue overlap provides cold candidates. Direct learned feedback can add
+candidates, boost their score, or suppress structural matches. The default
+recall limit is 10. Hits are separated by one blank line. No hits produce no
+standard output.
 ";
 
 const FEEDBACK_HELP: &str = "Learn from one explicit binary assessment and save atomically.
@@ -75,8 +76,8 @@ Usage:
   nao-m-e feedback <DATABASE> --from <SEQUENCE> --helpful <SEQUENCE,...>
   nao-m-e feedback <DATABASE> --from <SEQUENCE> --unhelpful <SEQUENCE,...>
 
-Every listed target receives the same assessment. Successful feedback produces
-no standard output.
+Every effective target receives one complete bounded-history sample with the
+same assessment. Successful feedback produces no standard output.
 ";
 
 fn main() -> ExitCode {

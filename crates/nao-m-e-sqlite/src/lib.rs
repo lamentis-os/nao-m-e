@@ -4,7 +4,7 @@
 //! SQLite persistence for the deterministic `nao_m_e` memory kernel.
 //!
 //! A [`SqliteStore`] owns one [`nao_m_e::MemoryV0`]. Mutations remain in
-//! memory until an explicit [`SqliteStore::save`] commits the relevance graph
+//! memory until an explicit [`SqliteStore::save`] commits the feedback graph
 //! and any newly appended episodes.
 
 mod codec;

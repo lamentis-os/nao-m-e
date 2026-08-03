@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::path::Path;
 
-use nao_m_e::{AtomId, GraphError, InfluenceWeight, MemoryId, MemoryV0, SCALE};
+use nao_m_e::{AtomId, FeedbackTrace, MemoryId, MemoryV0};
 use rusqlite::types::ValueRef;
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, Rows, Transaction, TransactionBehavior,
@@ -23,7 +23,7 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
-    /// Creates a new empty SQLite V2 store at `path`.
+    /// Creates a new empty SQLite V3 store at `path`.
     ///
     /// The operation fails rather than opening or replacing an existing file.
     /// A non-zero memory identifier is generated from operating-system entropy
@@ -39,9 +39,9 @@ impl SqliteStore {
         Self::open(path)
     }
 
-    /// Opens and validates an existing SQLite V2 memory store.
+    /// Opens and validates an existing SQLite V3 memory store.
     ///
-    /// Missing files are not created. V1, invalid, and unsupported stores are
+    /// Missing files are not created. Earlier, invalid, and unsupported stores are
     /// rejected without returning a partial memory.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE;
@@ -79,7 +79,7 @@ impl SqliteStore {
         &mut self.memory
     }
 
-    /// Atomically persists newly appended episodes and relevance changes.
+    /// Atomically persists newly appended episodes and feedback changes.
     ///
     /// A stale store session is rejected instead of overwriting a later
     /// snapshot. On every error, the previous database snapshot remains
@@ -134,7 +134,7 @@ impl SqliteStore {
         }
 
         append_episodes(&transaction, memory, *persisted_episode_count)?;
-        reconcile_relevance(&transaction, memory, *persisted_episode_count)?;
+        reconcile_feedback(&transaction, memory, *persisted_episode_count)?;
         transaction.commit()?;
 
         *expected_revision = next_revision;
@@ -192,7 +192,7 @@ fn load_memory(connection: &mut Connection) -> Result<(MemoryV0, usize, i64), St
     verify_schema(&transaction)?;
     verify_quick_check(&transaction)?;
     let mut memory = reconstruct_memory(&transaction, memory_id)?;
-    restore_relevance(&transaction, &mut memory)?;
+    restore_feedback(&transaction, &mut memory)?;
     let episode_count = memory.episodes().len();
     transaction.commit()?;
     Ok((memory, episode_count, revision))
@@ -231,7 +231,7 @@ fn verify_schema(connection: &Connection) -> Result<(), StoreError> {
         Ok(())
     } else {
         Err(StoreIntegrityError::InvalidMetadata {
-            detail: "database schema differs from the SQLite V2 contract",
+            detail: "database schema differs from the SQLite V3 contract",
         }
         .into())
     }
@@ -351,35 +351,24 @@ fn reconstruct_memory(
     Ok(memory)
 }
 
-fn restore_relevance(connection: &Connection, memory: &mut MemoryV0) -> Result<(), StoreError> {
+fn restore_feedback(connection: &Connection, memory: &mut MemoryV0) -> Result<(), StoreError> {
     let mut statement = connection.prepare(
-        "SELECT from_sequence, to_sequence, weight_ppm
-         FROM relevance_edges
+        "SELECT from_sequence, to_sequence, history_bits, sample_count
+         FROM feedback_edges
          ORDER BY from_sequence, to_sequence",
     )?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        let edge = read_relevance_edge(row)?;
+        let edge = read_feedback_edge(row)?;
 
         let from_id = AtomId::from_parts(memory.memory_id(), edge.from);
         let to_id = AtomId::from_parts(memory.memory_id(), edge.to);
-        let weight = InfluenceWeight::from_ppm(edge.weight_ppm)
-            .expect("a decoded relevance weight is positive and bounded");
         memory
-            .set_relevance(from_id, to_id, weight)
-            .map_err(|error| StoreIntegrityError::InvalidRelevance {
+            .set_feedback_trace(from_id, to_id, edge.trace)
+            .map_err(|_| StoreIntegrityError::InvalidFeedback {
                 from: edge.from,
                 to: edge.to,
-                detail: match error {
-                    GraphError::UnknownAtom(_) => "edge endpoint is absent",
-                    GraphError::FeedbackTargetLimitExceeded { .. } => {
-                        "feedback target limit was exceeded during reconstruction"
-                    }
-                    GraphError::SelfEdge(_) => "self-edge",
-                    GraphError::OutgoingWeightBudgetExceeded { .. } => {
-                        "outgoing weight budget is exceeded"
-                    }
-                },
+                detail: "feedback edge violates core graph invariants",
             })?;
     }
     Ok(())
@@ -436,39 +425,39 @@ fn append_episodes(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RelevanceRecord {
+struct FeedbackRecord {
     from: u64,
     to: u64,
-    weight_ppm: u32,
+    trace: FeedbackTrace,
 }
 
-impl RelevanceRecord {
+impl FeedbackRecord {
     const fn key(self) -> (u64, u64) {
         (self.from, self.to)
     }
 }
 
-const MAX_BUFFERED_RELEVANCE_MUTATIONS: usize = 16_384;
+const MAX_BUFFERED_FEEDBACK_MUTATIONS: usize = 16_384;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RelevanceMutation {
-    Delete(RelevanceRecord),
-    Insert(RelevanceRecord),
-    Update(RelevanceRecord),
+enum FeedbackMutation {
+    Delete(FeedbackRecord),
+    Insert(FeedbackRecord),
+    Update(FeedbackRecord),
 }
 
 #[derive(Debug, Default)]
-struct RelevancePlan {
-    mutations: Vec<RelevanceMutation>,
+struct FeedbackPlan {
+    mutations: Vec<FeedbackMutation>,
     replace_all: bool,
 }
 
-impl RelevancePlan {
-    fn push(&mut self, mutation: RelevanceMutation) {
+impl FeedbackPlan {
+    fn push(&mut self, mutation: FeedbackMutation) {
         if self.replace_all {
             return;
         }
-        if self.mutations.len() == MAX_BUFFERED_RELEVANCE_MUTATIONS {
+        if self.mutations.len() == MAX_BUFFERED_FEEDBACK_MUTATIONS {
             self.mutations.clear();
             self.replace_all = true;
             return;
@@ -477,99 +466,57 @@ impl RelevancePlan {
     }
 }
 
-struct PersistedRelevanceValidator {
-    episode_count: u64,
-    source: Option<u64>,
-    source_total_ppm: u64,
-}
-
-impl PersistedRelevanceValidator {
-    fn new(persisted_episode_count: usize) -> Self {
-        Self {
-            episode_count: u64::try_from(persisted_episode_count)
-                .expect("an episode count always fits the atom sequence space"),
-            source: None,
-            source_total_ppm: 0,
-        }
-    }
-
-    fn validate(&mut self, edge: RelevanceRecord) -> Result<(), StoreError> {
-        if edge.from >= self.episode_count || edge.to >= self.episode_count {
-            return Err(StoreIntegrityError::InvalidRelevance {
-                from: edge.from,
-                to: edge.to,
-                detail: "edge endpoint is absent",
-            }
-            .into());
-        }
-        if self.source != Some(edge.from) {
-            self.source = Some(edge.from);
-            self.source_total_ppm = 0;
-        }
-        let attempted_total = self.source_total_ppm + u64::from(edge.weight_ppm);
-        if attempted_total > u64::from(SCALE) {
-            return Err(StoreIntegrityError::InvalidRelevance {
-                from: edge.from,
-                to: edge.to,
-                detail: "outgoing weight budget is exceeded",
-            }
-            .into());
-        }
-        self.source_total_ppm = attempted_total;
-        Ok(())
-    }
-}
-
-fn reconcile_relevance(
+fn reconcile_feedback(
     transaction: &Transaction<'_>,
     memory: &MemoryV0,
     persisted_episode_count: usize,
 ) -> Result<(), StoreError> {
-    let mut plan = RelevancePlan::default();
+    let mut plan = FeedbackPlan::default();
 
     {
         let mut statement = transaction.prepare(
-            "SELECT from_sequence, to_sequence, weight_ppm
-             FROM relevance_edges
+            "SELECT from_sequence, to_sequence, history_bits, sample_count
+             FROM feedback_edges
              ORDER BY from_sequence, to_sequence",
         )?;
         let mut rows = statement.query([])?;
-        let mut validator = PersistedRelevanceValidator::new(persisted_episode_count);
-        let mut persisted = next_relevance_edge(&mut rows, &mut validator)?;
-        let mut current = memory_relevance_records(memory);
+        let persisted_episode_count = u64::try_from(persisted_episode_count)
+            .expect("an episode count always fits the atom sequence space");
+        let mut persisted = next_feedback_edge(&mut rows, persisted_episode_count)?;
+        let mut current = memory_feedback_records(memory);
         let mut expected = current.next();
 
         loop {
             if plan.replace_all {
                 while persisted.is_some() {
-                    persisted = next_relevance_edge(&mut rows, &mut validator)?;
+                    persisted = next_feedback_edge(&mut rows, persisted_episode_count)?;
                 }
                 break;
             }
             match (persisted, expected) {
                 (Some(found), Some(wanted)) => match found.key().cmp(&wanted.key()) {
                     Ordering::Less => {
-                        plan.push(RelevanceMutation::Delete(found));
-                        persisted = next_relevance_edge(&mut rows, &mut validator)?;
+                        plan.push(FeedbackMutation::Delete(found));
+                        persisted = next_feedback_edge(&mut rows, persisted_episode_count)?;
                     }
                     Ordering::Equal => {
-                        if found.weight_ppm != wanted.weight_ppm {
-                            plan.push(RelevanceMutation::Update(wanted));
+                        if found.trace != wanted.trace {
+                            plan.push(FeedbackMutation::Update(wanted));
                         }
-                        persisted = next_relevance_edge(&mut rows, &mut validator)?;
+                        persisted = next_feedback_edge(&mut rows, persisted_episode_count)?;
                         expected = current.next();
                     }
                     Ordering::Greater => {
-                        plan.push(RelevanceMutation::Insert(wanted));
+                        plan.push(FeedbackMutation::Insert(wanted));
                         expected = current.next();
                     }
                 },
                 (Some(found), None) => {
-                    plan.push(RelevanceMutation::Delete(found));
-                    persisted = next_relevance_edge(&mut rows, &mut validator)?;
+                    plan.push(FeedbackMutation::Delete(found));
+                    persisted = next_feedback_edge(&mut rows, persisted_episode_count)?;
                 }
                 (None, Some(wanted)) => {
-                    plan.push(RelevanceMutation::Insert(wanted));
+                    plan.push(FeedbackMutation::Insert(wanted));
                     expected = current.next();
                 }
                 (None, None) => break,
@@ -578,15 +525,24 @@ fn reconcile_relevance(
     }
 
     if plan.replace_all {
-        transaction.execute("DELETE FROM relevance_edges", [])?;
+        transaction.execute("DELETE FROM feedback_edges", [])?;
         let mut insert = transaction.prepare(
-            "INSERT INTO relevance_edges (from_sequence, to_sequence, weight_ppm)
-             VALUES (?1, ?2, ?3)",
+            "INSERT INTO feedback_edges (
+                from_sequence,
+                to_sequence,
+                history_bits,
+                sample_count
+             ) VALUES (?1, ?2, ?3, ?4)",
         )?;
-        for edge in memory_relevance_records(memory) {
+        for edge in memory_feedback_records(memory) {
             let from = codec::encode_u64(edge.from);
             let to = codec::encode_u64(edge.to);
-            insert.execute((from.as_slice(), to.as_slice(), i64::from(edge.weight_ppm)))?;
+            insert.execute((
+                from.as_slice(),
+                to.as_slice(),
+                i64::from(edge.trace.history_bits()),
+                i64::from(edge.trace.sample_count()),
+            ))?;
         }
         return Ok(());
     }
@@ -596,84 +552,105 @@ fn reconcile_relevance(
     }
 
     let mut delete = transaction.prepare(
-        "DELETE FROM relevance_edges
+        "DELETE FROM feedback_edges
          WHERE from_sequence = ?1 AND to_sequence = ?2",
     )?;
     let mut insert = transaction.prepare(
-        "INSERT INTO relevance_edges (from_sequence, to_sequence, weight_ppm)
-         VALUES (?1, ?2, ?3)",
+        "INSERT INTO feedback_edges (
+            from_sequence,
+            to_sequence,
+            history_bits,
+            sample_count
+         ) VALUES (?1, ?2, ?3, ?4)",
     )?;
     let mut update = transaction.prepare(
-        "UPDATE relevance_edges SET weight_ppm = ?3
+        "UPDATE feedback_edges SET history_bits = ?3, sample_count = ?4
          WHERE from_sequence = ?1 AND to_sequence = ?2",
     )?;
     for mutation in plan.mutations {
         match mutation {
-            RelevanceMutation::Delete(edge) => {
+            FeedbackMutation::Delete(edge) => {
                 let from = codec::encode_u64(edge.from);
                 let to = codec::encode_u64(edge.to);
                 delete.execute((from.as_slice(), to.as_slice()))?;
             }
-            RelevanceMutation::Insert(edge) => {
+            FeedbackMutation::Insert(edge) => {
                 let from = codec::encode_u64(edge.from);
                 let to = codec::encode_u64(edge.to);
-                insert.execute((from.as_slice(), to.as_slice(), i64::from(edge.weight_ppm)))?;
+                insert.execute((
+                    from.as_slice(),
+                    to.as_slice(),
+                    i64::from(edge.trace.history_bits()),
+                    i64::from(edge.trace.sample_count()),
+                ))?;
             }
-            RelevanceMutation::Update(edge) => {
+            FeedbackMutation::Update(edge) => {
                 let from = codec::encode_u64(edge.from);
                 let to = codec::encode_u64(edge.to);
-                update.execute((from.as_slice(), to.as_slice(), i64::from(edge.weight_ppm)))?;
+                update.execute((
+                    from.as_slice(),
+                    to.as_slice(),
+                    i64::from(edge.trace.history_bits()),
+                    i64::from(edge.trace.sample_count()),
+                ))?;
             }
         }
     }
     Ok(())
 }
 
-fn memory_relevance_records(memory: &MemoryV0) -> impl Iterator<Item = RelevanceRecord> + '_ {
-    memory.relevance_edges().map(|edge| RelevanceRecord {
+fn memory_feedback_records(memory: &MemoryV0) -> impl Iterator<Item = FeedbackRecord> + '_ {
+    memory.feedback_edges().map(|edge| FeedbackRecord {
         from: edge.from().sequence(),
         to: edge.to().sequence(),
-        weight_ppm: edge.weight().as_ppm(),
+        trace: edge.trace(),
     })
 }
 
-fn next_relevance_edge(
+fn next_feedback_edge(
     rows: &mut Rows<'_>,
-    validator: &mut PersistedRelevanceValidator,
-) -> Result<Option<RelevanceRecord>, StoreError> {
+    persisted_episode_count: u64,
+) -> Result<Option<FeedbackRecord>, StoreError> {
     let Some(row) = rows.next()? else {
         return Ok(None);
     };
-    let edge = read_relevance_edge(row)?;
-    validator.validate(edge)?;
+    let edge = read_feedback_edge(row)?;
+    if edge.from >= persisted_episode_count || edge.to >= persisted_episode_count {
+        return Err(StoreIntegrityError::InvalidFeedback {
+            from: edge.from,
+            to: edge.to,
+            detail: "edge endpoint is absent",
+        }
+        .into());
+    }
     Ok(Some(edge))
 }
 
-fn read_relevance_edge(row: &Row<'_>) -> Result<RelevanceRecord, StoreError> {
-    let from = read_u64(row, 0, "relevance_edges", "from_sequence")?;
-    let to = read_u64(row, 1, "relevance_edges", "to_sequence")?;
+fn read_feedback_edge(row: &Row<'_>) -> Result<FeedbackRecord, StoreError> {
+    let from = read_u64(row, 0, "feedback_edges", "from_sequence")?;
+    let to = read_u64(row, 1, "feedback_edges", "to_sequence")?;
     if from == to {
-        return Err(StoreIntegrityError::InvalidRelevance {
+        return Err(StoreIntegrityError::InvalidFeedback {
             from,
             to,
             detail: "self-edge",
         }
         .into());
     }
-    let value = read_integer(row, 2, "relevance_edges", "weight_ppm")?;
-    let weight_ppm = u32::try_from(value)
+    let history_bits = read_integer(row, 2, "feedback_edges", "history_bits")?;
+    let sample_count = read_integer(row, 3, "feedback_edges", "sample_count")?;
+    let trace = u16::try_from(history_bits)
         .ok()
-        .filter(|value| (1..=SCALE).contains(value))
-        .ok_or(StoreIntegrityError::InvalidRelevance {
+        .zip(u8::try_from(sample_count).ok())
+        .and_then(|(history_bits, sample_count)| {
+            FeedbackTrace::from_parts(history_bits, sample_count)
+        })
+        .ok_or(StoreIntegrityError::InvalidFeedback {
             from,
             to,
-            detail: "weight is outside the fixed-point range",
+            detail: "feedback trace is not canonical",
         })?;
-    Ok(RelevanceRecord {
-        from,
-        to,
-        weight_ppm,
-    })
+    Ok(FeedbackRecord { from, to, trace })
 }
 
 fn read_integer(
@@ -750,6 +727,11 @@ mod tests {
         }
     }
 
+    fn trace(history_bits: u16, sample_count: u8) -> FeedbackTrace {
+        FeedbackTrace::from_parts(history_bits, sample_count)
+            .expect("test feedback trace is canonical")
+    }
+
     fn saved_store(directory: &TempDir, episode_count: u64) -> PathBuf {
         let path = directory.path().join("memory.sqlite3");
         let mut store = SqliteStore::create(&path).expect("test store is created");
@@ -776,19 +758,21 @@ mod tests {
     }
 
     #[test]
-    fn metadata_and_v1_format_fail_closed_with_specific_errors() {
-        let directory = tempdir().unwrap();
-        let path = saved_store(&directory, 0);
-        let raw = Connection::open(&path).unwrap();
-        raw.pragma_update(None, "ignore_check_constraints", true)
-            .unwrap();
-        raw.execute("UPDATE memory_meta SET format_version = 1", [])
-            .unwrap();
-        drop(raw);
-        assert!(matches!(
-            integrity_error(&path),
-            StoreIntegrityError::UnsupportedFormatVersion { found: 1 }
-        ));
+    fn metadata_and_earlier_formats_fail_closed_with_specific_errors() {
+        for unsupported in [1, 2] {
+            let directory = tempdir().unwrap();
+            let path = saved_store(&directory, 0);
+            let raw = Connection::open(&path).unwrap();
+            raw.pragma_update(None, "ignore_check_constraints", true)
+                .unwrap();
+            raw.execute("UPDATE memory_meta SET format_version = ?1", [unsupported])
+                .unwrap();
+            drop(raw);
+            assert!(matches!(
+                integrity_error(&path),
+                StoreIntegrityError::UnsupportedFormatVersion { found } if found == unsupported
+            ));
+        }
 
         let directory = tempdir().unwrap();
         let path = saved_store(&directory, 0);
@@ -810,9 +794,9 @@ mod tests {
 
     #[test]
     fn rejected_application_and_format_do_not_change_journal_mode() {
-        for unsupported_format in [false, true] {
+        for unsupported_format in [None, Some(1), Some(2)] {
             let directory = tempdir().unwrap();
-            let path = if unsupported_format {
+            let path = if unsupported_format.is_some() {
                 saved_store(&directory, 0)
             } else {
                 let path = directory.path().join("unrelated.sqlite3");
@@ -823,10 +807,10 @@ mod tests {
                 path
             };
             let raw = Connection::open(&path).unwrap();
-            if unsupported_format {
+            if let Some(version) = unsupported_format {
                 raw.pragma_update(None, "ignore_check_constraints", true)
                     .unwrap();
-                raw.execute("UPDATE memory_meta SET format_version = 1", [])
+                raw.execute("UPDATE memory_meta SET format_version = ?1", [version])
                     .unwrap();
             }
             let mode: String = raw
@@ -877,26 +861,29 @@ mod tests {
     }
 
     #[test]
-    fn relevance_budget_and_persistent_triggers_are_rejected() {
+    fn multiple_feedback_edges_per_source_are_accepted_but_persistent_triggers_are_rejected() {
         let directory = tempdir().unwrap();
         let path = saved_store(&directory, 3);
         let raw = Connection::open(&path).unwrap();
-        for (to, weight) in [(1, 600_000), (2, 600_000)] {
+        for to in [1, 2] {
             raw.execute(
-                "INSERT INTO relevance_edges VALUES (?1, ?2, ?3)",
+                "INSERT INTO feedback_edges VALUES (?1, ?2, 65535, 16)",
                 params![
                     codec::encode_u64(0).as_slice(),
-                    codec::encode_u64(to).as_slice(),
-                    weight
+                    codec::encode_u64(to).as_slice()
                 ],
             )
             .unwrap();
         }
         drop(raw);
-        assert!(matches!(
-            integrity_error(&path),
-            StoreIntegrityError::InvalidRelevance { from: 0, to: 2, .. }
-        ));
+        assert_eq!(
+            SqliteStore::open(&path)
+                .unwrap()
+                .memory()
+                .feedback_edges()
+                .count(),
+            2
+        );
 
         let directory = tempdir().unwrap();
         let path = saved_store(&directory, 0);
@@ -914,13 +901,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_relevance_endpoint_is_rejected_during_reconstruction() {
+    fn missing_feedback_endpoint_is_rejected_during_reconstruction() {
         let directory = tempdir().unwrap();
         let path = saved_store(&directory, 1);
         let raw = Connection::open(&path).unwrap();
         raw.pragma_update(None, "foreign_keys", false).unwrap();
         raw.execute(
-            "INSERT INTO relevance_edges VALUES (?1, ?2, 1)",
+            "INSERT INTO feedback_edges VALUES (?1, ?2, 1, 1)",
             params![
                 codec::encode_u64(0).as_slice(),
                 codec::encode_u64(1).as_slice()
@@ -931,67 +918,75 @@ mod tests {
 
         assert!(matches!(
             integrity_error(&path),
-            StoreIntegrityError::InvalidRelevance { from: 0, to: 1, .. }
+            StoreIntegrityError::InvalidFeedback { from: 0, to: 1, .. }
         ));
     }
 
     #[test]
-    fn relevance_save_writes_only_changed_rows() {
+    fn feedback_save_writes_only_changed_rows() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("memory.sqlite3");
         let mut store = SqliteStore::create(&path).unwrap();
         let ids: Vec<_> = (0..5)
             .map(|seed| store.memory_mut().insert_episode(draft(seed)).unwrap())
             .collect();
-        for (from, to, weight_ppm) in [
-            (ids[0], ids[2], 100),
-            (ids[1], ids[2], 200),
-            (ids[2], ids[3], 300),
-            (ids[4], ids[0], 500),
+        for (from, to, initial_trace) in [
+            (ids[0], ids[2], trace(1, 1)),
+            (ids[1], ids[2], trace(2, 2)),
+            (ids[2], ids[3], trace(3, 2)),
         ] {
             store
                 .memory_mut()
-                .set_relevance(from, to, InfluenceWeight::from_ppm(weight_ppm).unwrap())
+                .set_feedback_trace(from, to, initial_trace)
                 .unwrap();
         }
         store.save().unwrap();
         store
             .connection
             .execute_batch(
-                "CREATE TEMP TABLE relevance_mutations (kind TEXT NOT NULL);
-                 CREATE TEMP TRIGGER audit_relevance_insert
-                 AFTER INSERT ON main.relevance_edges
-                 BEGIN INSERT INTO relevance_mutations VALUES ('insert'); END;
-                 CREATE TEMP TRIGGER audit_relevance_update
-                 AFTER UPDATE ON main.relevance_edges
-                 BEGIN INSERT INTO relevance_mutations VALUES ('update'); END;
-                 CREATE TEMP TRIGGER audit_relevance_delete
-                 AFTER DELETE ON main.relevance_edges
-                 BEGIN INSERT INTO relevance_mutations VALUES ('delete'); END;",
+                "CREATE TEMP TABLE feedback_mutations (kind TEXT NOT NULL);
+                 CREATE TEMP TRIGGER audit_feedback_insert
+                 AFTER INSERT ON main.feedback_edges
+                 BEGIN INSERT INTO feedback_mutations VALUES ('insert'); END;
+                 CREATE TEMP TRIGGER audit_feedback_update
+                 AFTER UPDATE ON main.feedback_edges
+                 BEGIN INSERT INTO feedback_mutations VALUES ('update'); END;
+                 CREATE TEMP TRIGGER audit_feedback_delete
+                 AFTER DELETE ON main.feedback_edges
+                 BEGIN INSERT INTO feedback_mutations VALUES ('delete'); END;",
             )
             .unwrap();
 
+        let raw = Connection::open(&path).unwrap();
+        raw.execute(
+            "INSERT INTO feedback_edges VALUES (?1, ?2, 0, 1)",
+            params![
+                codec::encode_u64(ids[4].sequence()).as_slice(),
+                codec::encode_u64(ids[0].sequence()).as_slice()
+            ],
+        )
+        .unwrap();
+        drop(raw);
+
         store
             .memory_mut()
-            .set_relevance(ids[0], ids[2], InfluenceWeight::from_ppm(101).unwrap())
+            .set_feedback_trace(ids[0], ids[2], trace(2, 2))
             .unwrap();
         store
             .memory_mut()
-            .set_relevance(ids[0], ids[1], InfluenceWeight::from_ppm(50).unwrap())
+            .set_feedback_trace(ids[0], ids[1], trace(0, 1))
             .unwrap();
-        store.memory_mut().remove_relevance(ids[1], ids[2]).unwrap();
         store
             .memory_mut()
-            .set_relevance(ids[3], ids[0], InfluenceWeight::from_ppm(400).unwrap())
+            .set_feedback_trace(ids[3], ids[0], trace(1, 1))
             .unwrap();
-        store.memory_mut().remove_relevance(ids[4], ids[0]).unwrap();
         store.save().unwrap();
 
         let mutations: Vec<(String, i64)> = store
             .connection
             .prepare(
                 "SELECT kind, count(*)
-                 FROM relevance_mutations
+                 FROM feedback_mutations
                  GROUP BY kind
                  ORDER BY kind",
             )
@@ -1003,7 +998,7 @@ mod tests {
         assert_eq!(
             mutations,
             [
-                ("delete".to_owned(), 2),
+                ("delete".to_owned(), 1),
                 ("insert".to_owned(), 2),
                 ("update".to_owned(), 1)
             ]
@@ -1011,16 +1006,16 @@ mod tests {
 
         store
             .connection
-            .execute("DELETE FROM relevance_mutations", [])
+            .execute("DELETE FROM feedback_mutations", [])
             .unwrap();
         store
             .memory_mut()
-            .set_relevance(ids[0], ids[2], InfluenceWeight::from_ppm(101).unwrap())
+            .set_feedback_trace(ids[0], ids[2], trace(2, 2))
             .unwrap();
         store.save().unwrap();
         let mutation_count: i64 = store
             .connection
-            .query_row("SELECT count(*) FROM relevance_mutations", [], |row| {
+            .query_row("SELECT count(*) FROM feedback_mutations", [], |row| {
                 row.get(0)
             })
             .unwrap();
@@ -1028,28 +1023,28 @@ mod tests {
     }
 
     #[test]
-    fn relevance_plan_bounds_buffer_before_bulk_replacement() {
-        let mut plan = RelevancePlan::default();
-        for to in 0..=MAX_BUFFERED_RELEVANCE_MUTATIONS {
-            plan.push(RelevanceMutation::Insert(RelevanceRecord {
+    fn feedback_plan_bounds_buffer_before_bulk_replacement() {
+        let mut plan = FeedbackPlan::default();
+        for to in 0..=MAX_BUFFERED_FEEDBACK_MUTATIONS {
+            plan.push(FeedbackMutation::Insert(FeedbackRecord {
                 from: 0,
                 to: u64::try_from(to).unwrap(),
-                weight_ppm: 1,
+                trace: trace(1, 1),
             }));
         }
 
         assert!(plan.replace_all);
         assert!(plan.mutations.is_empty());
-        plan.push(RelevanceMutation::Delete(RelevanceRecord {
+        plan.push(FeedbackMutation::Delete(FeedbackRecord {
             from: 1,
             to: 2,
-            weight_ppm: 1,
+            trace: trace(0, 1),
         }));
         assert!(plan.mutations.is_empty());
     }
 
     #[test]
-    fn failed_save_rolls_back_revision_episodes_and_relevance() {
+    fn failed_save_rolls_back_revision_episodes_and_feedback() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("memory.sqlite3");
         let mut store = SqliteStore::create(&path).unwrap();
@@ -1058,13 +1053,13 @@ mod tests {
         let second = store.memory_mut().insert_episode(draft(1)).unwrap();
         store
             .memory_mut()
-            .set_relevance(first, second, InfluenceWeight::from_ppm(1).unwrap())
+            .set_feedback_trace(first, second, trace(1, 1))
             .unwrap();
         store
             .connection
             .execute_batch(
-                "CREATE TEMP TRIGGER abort_relevance_insert
-                 BEFORE INSERT ON main.relevance_edges
+                "CREATE TEMP TRIGGER abort_feedback_insert
+                 BEFORE INSERT ON main.feedback_edges
                  BEGIN SELECT RAISE(ABORT, 'test abort'); END;",
             )
             .unwrap();
@@ -1075,11 +1070,11 @@ mod tests {
 
         let reopened = SqliteStore::open(&path).unwrap();
         assert_eq!(reopened.memory().episodes().len(), 1);
-        assert_eq!(reopened.memory().relevance_edges().count(), 0);
+        assert_eq!(reopened.memory().feedback_edges().count(), 0);
     }
 
     #[test]
-    fn failed_relevance_updates_and_deletes_roll_back_the_graph() {
+    fn failed_feedback_updates_and_deletes_roll_back_the_graph() {
         for operation in ["UPDATE", "DELETE"] {
             let directory = tempdir().unwrap();
             let path = directory.path().join("memory.sqlite3");
@@ -1088,28 +1083,39 @@ mod tests {
             let second = store.memory_mut().insert_episode(draft(1)).unwrap();
             store
                 .memory_mut()
-                .set_relevance(first, second, InfluenceWeight::from_ppm(100).unwrap())
+                .set_feedback_trace(first, second, trace(1, 1))
                 .unwrap();
             store.save().unwrap();
-            let expected_revision = store.expected_revision;
 
             match operation {
                 "UPDATE" => {
                     store
                         .memory_mut()
-                        .set_relevance(first, second, InfluenceWeight::from_ppm(101).unwrap())
+                        .set_feedback_trace(first, second, trace(2, 2))
                         .unwrap();
                 }
                 "DELETE" => {
-                    store.memory_mut().remove_relevance(first, second).unwrap();
+                    let third = store.memory_mut().insert_episode(draft(2)).unwrap();
+                    store.save().unwrap();
+                    let raw = Connection::open(&path).unwrap();
+                    raw.execute(
+                        "INSERT INTO feedback_edges VALUES (?1, ?2, 0, 1)",
+                        params![
+                            codec::encode_u64(second.sequence()).as_slice(),
+                            codec::encode_u64(third.sequence()).as_slice()
+                        ],
+                    )
+                    .unwrap();
+                    drop(raw);
                 }
                 _ => unreachable!(),
             }
+            let expected_revision = store.expected_revision;
             store
                 .connection
                 .execute_batch(&format!(
-                    "CREATE TEMP TRIGGER abort_relevance_change
-                     BEFORE {operation} ON main.relevance_edges
+                    "CREATE TEMP TRIGGER abort_feedback_change
+                     BEFORE {operation} ON main.feedback_edges
                      BEGIN SELECT RAISE(ABORT, 'test abort'); END;"
                 ))
                 .unwrap();
@@ -1120,14 +1126,14 @@ mod tests {
 
             let reopened = SqliteStore::open(&path).unwrap();
             assert_eq!(
-                reopened.memory().relevance(first, second),
-                Some(InfluenceWeight::from_ppm(100).unwrap())
+                reopened.memory().feedback_trace(first, second),
+                Some(trace(1, 1))
             );
         }
     }
 
     #[test]
-    fn save_reconciles_unrevisioned_relevance_divergence() {
+    fn save_reconciles_unrevisioned_feedback_divergence() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("memory.sqlite3");
         let mut store = SqliteStore::create(&path).unwrap();
@@ -1136,15 +1142,18 @@ mod tests {
         let third = store.memory_mut().insert_episode(draft(2)).unwrap();
         store
             .memory_mut()
-            .set_relevance(first, second, InfluenceWeight::from_ppm(100).unwrap())
+            .set_feedback_trace(first, second, trace(1, 1))
             .unwrap();
         store.save().unwrap();
 
         let raw = Connection::open(&path).unwrap();
-        raw.execute("UPDATE relevance_edges SET weight_ppm = 200", [])
-            .unwrap();
         raw.execute(
-            "INSERT INTO relevance_edges VALUES (?1, ?2, 300)",
+            "UPDATE feedback_edges SET history_bits = 0, sample_count = 1",
+            [],
+        )
+        .unwrap();
+        raw.execute(
+            "INSERT INTO feedback_edges VALUES (?1, ?2, 3, 2)",
             params![
                 codec::encode_u64(second.sequence()).as_slice(),
                 codec::encode_u64(third.sequence()).as_slice()
@@ -1157,15 +1166,15 @@ mod tests {
         drop(store);
         let reopened = SqliteStore::open(&path).unwrap();
         assert_eq!(
-            reopened.memory().relevance(first, second),
-            Some(InfluenceWeight::from_ppm(100).unwrap())
+            reopened.memory().feedback_trace(first, second),
+            Some(trace(1, 1))
         );
-        assert_eq!(reopened.memory().relevance(second, third), None);
-        assert_eq!(reopened.memory().relevance_edges().count(), 1);
+        assert_eq!(reopened.memory().feedback_trace(second, third), None);
+        assert_eq!(reopened.memory().feedback_edges().count(), 1);
     }
 
     #[test]
-    fn save_rejects_invalid_persisted_relevance_without_advancing_revision() {
+    fn save_rejects_invalid_persisted_feedback_without_advancing_revision() {
         fn assert_rejected(
             persisted_episodes: u64,
             unsaved_episodes: u64,
@@ -1191,7 +1200,7 @@ mod tests {
             assert!(matches!(
                 store.save(),
                 Err(StoreError::InvalidStore(
-                    StoreIntegrityError::InvalidRelevance {
+                    StoreIntegrityError::InvalidFeedback {
                         from: 0,
                         to,
                         ..
@@ -1219,7 +1228,7 @@ mod tests {
                 raw.pragma_update(None, "ignore_check_constraints", true)
                     .unwrap();
                 raw.execute(
-                    "INSERT INTO relevance_edges VALUES (?1, ?2, 0)",
+                    "INSERT INTO feedback_edges VALUES (?1, ?2, 2, 1)",
                     params![
                         codec::encode_u64(0).as_slice(),
                         codec::encode_u64(1).as_slice()
@@ -1229,13 +1238,33 @@ mod tests {
             },
             1,
         );
+        for sample_count in [0, 17] {
+            assert_rejected(
+                3,
+                0,
+                |raw| {
+                    raw.pragma_update(None, "ignore_check_constraints", true)
+                        .unwrap();
+                    raw.execute(
+                        "INSERT INTO feedback_edges VALUES (?1, ?2, 0, ?3)",
+                        params![
+                            codec::encode_u64(0).as_slice(),
+                            codec::encode_u64(1).as_slice(),
+                            sample_count
+                        ],
+                    )
+                    .unwrap();
+                },
+                1,
+            );
+        }
         assert_rejected(
             3,
             0,
             |raw| {
                 raw.pragma_update(None, "foreign_keys", false).unwrap();
                 raw.execute(
-                    "INSERT INTO relevance_edges VALUES (?1, ?2, 1)",
+                    "INSERT INTO feedback_edges VALUES (?1, ?2, 1, 1)",
                     params![
                         codec::encode_u64(0).as_slice(),
                         codec::encode_u64(3).as_slice()
@@ -1246,30 +1275,12 @@ mod tests {
             3,
         );
         assert_rejected(
-            3,
-            0,
-            |raw| {
-                for (to, weight_ppm) in [(1, 600_000), (2, 600_000)] {
-                    raw.execute(
-                        "INSERT INTO relevance_edges VALUES (?1, ?2, ?3)",
-                        params![
-                            codec::encode_u64(0).as_slice(),
-                            codec::encode_u64(to).as_slice(),
-                            weight_ppm
-                        ],
-                    )
-                    .unwrap();
-                }
-            },
-            2,
-        );
-        assert_rejected(
             1,
             1,
             |raw| {
                 raw.pragma_update(None, "foreign_keys", false).unwrap();
                 raw.execute(
-                    "INSERT INTO relevance_edges VALUES (?1, ?2, 1)",
+                    "INSERT INTO feedback_edges VALUES (?1, ?2, 1, 1)",
                     params![
                         codec::encode_u64(0).as_slice(),
                         codec::encode_u64(1).as_slice()
