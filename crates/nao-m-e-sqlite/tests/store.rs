@@ -49,6 +49,19 @@ fn draft(seed: u64) -> EpisodeDraft {
     }
 }
 
+fn observation_draft(seed: u64, predicate: u64, arguments: &[u64]) -> EpisodeDraft {
+    let timestamp = i64::try_from(seed).expect("test seed fits an i64");
+    EpisodeDraft {
+        occurred_at: TimestampMs::new(timestamp),
+        recorded_at: TimestampMs::new(timestamp + 1),
+        context: Vec::new(),
+        observation: statement(predicate, arguments),
+        action: None,
+        outcome: None,
+        source: SourceId::new(seed + 100),
+    }
+}
+
 fn insert(store: &mut SqliteStore, episode: EpisodeDraft) -> AtomId {
     store
         .memory_mut()
@@ -183,6 +196,40 @@ fn full_snapshot_round_trips_exactly_and_continues_the_sequence() {
     let next = insert(&mut reopened, draft(8));
     assert_eq!(next.memory_id(), reopened.memory_id());
     assert_eq!(next.sequence(), 3);
+}
+
+#[test]
+fn cue_derived_recall_is_identical_after_reopen_without_relevance() {
+    let directory = tempdir().expect("temporary directory is available");
+    let path = database_path(&directory);
+    let mut store = SqliteStore::create(&path).expect("new store is created");
+    let source = insert(&mut store, observation_draft(1, 10, &[7, 8]));
+    let target = insert(&mut store, observation_draft(2, 10, &[7, 9]));
+    insert(&mut store, observation_draft(3, 20, &[30]));
+
+    let before = store
+        .memory()
+        .recall_from(source, usize::MAX)
+        .expect("source is known");
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].atom_id, target);
+    assert_eq!(before[0].activation.as_ppm(), 177_777);
+    assert_eq!(store.memory().relevance_edges().count(), 0);
+    let persisted = snapshot(store.memory());
+
+    store.save().expect("episodes are saved");
+    drop(store);
+
+    let reopened = SqliteStore::open(&path).expect("saved store reopens");
+    assert_eq!(snapshot(reopened.memory()), persisted);
+    assert_eq!(reopened.memory().relevance_edges().count(), 0);
+    assert_eq!(
+        reopened
+            .memory()
+            .recall_from(source, usize::MAX)
+            .expect("source is reconstructed"),
+        before
+    );
 }
 
 #[test]

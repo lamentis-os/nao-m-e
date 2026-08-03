@@ -2,14 +2,15 @@ use std::cmp::{Ordering as ComparisonOrdering, Reverse};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::fmt;
+use std::sync::OnceLock;
 
 use crate::model::{
     Activation, AtomId, EpisodeAtom, EpisodeDraft, GraphError, InfluenceWeight, MemoryError,
-    MemoryId,
+    MemoryId, PredicateId, Statement, TermId,
 };
 use crate::parameters::{
     FEEDBACK_MAX_EVENT_PPM, FEEDBACK_TARGET_STEP_PPM, MAX_FEEDBACK_TARGETS, PROPAGATION_GAIN_PPM,
-    SCALE,
+    SCALE, STRUCTURAL_GAIN_PPM,
 };
 
 /// A directed positive relevance edge between two atoms.
@@ -40,7 +41,7 @@ impl RelevanceEdge {
     }
 }
 
-/// A non-zero projected activation score returned by source-conditioned recall.
+/// A non-zero query-local activation score returned by source-conditioned recall.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecallHit {
     /// Identifier of the recalled atom.
@@ -67,13 +68,149 @@ impl PartialOrd for RankedRecallHit {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum StatementRole {
+    Context,
+    Observation,
+    Action,
+    Outcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Cue {
+    Predicate(PredicateId),
+    Term(TermId),
+    RolePredicate {
+        role: StatementRole,
+        predicate: PredicateId,
+    },
+    RoleArgument {
+        role: StatementRole,
+        predicate: PredicateId,
+        position: u64,
+        term: TermId,
+    },
+}
+
+impl Cue {
+    const fn weight(self) -> u64 {
+        match self {
+            Self::Predicate(_) | Self::Term(_) => 1,
+            Self::RolePredicate { .. } => 2,
+            Self::RoleArgument { .. } => 4,
+        }
+    }
+}
+
+fn episode_cues(episode: &EpisodeAtom) -> Vec<Cue> {
+    let mut cues = Vec::new();
+    for statement in episode.context() {
+        append_statement_cues(&mut cues, StatementRole::Context, statement);
+    }
+    append_statement_cues(&mut cues, StatementRole::Observation, episode.observation());
+    if let Some(statement) = episode.action() {
+        append_statement_cues(&mut cues, StatementRole::Action, statement);
+    }
+    if let Some(statement) = episode.outcome() {
+        append_statement_cues(&mut cues, StatementRole::Outcome, statement);
+    }
+    cues.sort_unstable();
+    cues.dedup();
+    cues
+}
+
+fn append_statement_cues(cues: &mut Vec<Cue>, role: StatementRole, statement: &Statement) {
+    let predicate = statement.predicate();
+    cues.push(Cue::Predicate(predicate));
+    cues.push(Cue::RolePredicate { role, predicate });
+    for (position, term) in statement.arguments().iter().copied().enumerate() {
+        cues.push(Cue::Term(term));
+        cues.push(Cue::RoleArgument {
+            role,
+            predicate,
+            position: u64::try_from(position)
+                .expect("a statement argument position fits in u64 on supported platforms"),
+            term,
+        });
+    }
+}
+
+fn cue_weight_total(cues: &[Cue]) -> u64 {
+    cues.iter().copied().fold(0_u64, |total, cue| {
+        total
+            .checked_add(cue.weight())
+            .expect("an in-memory episode's cue weight fits in u64")
+    })
+}
+
+enum PostingList {
+    One(usize),
+    Many(Vec<usize>),
+}
+
+impl PostingList {
+    fn push(&mut self, atom_index: usize) {
+        match self {
+            Self::One(first) => {
+                debug_assert!(*first < atom_index);
+                let mut postings = Vec::with_capacity(4);
+                postings.extend([*first, atom_index]);
+                *self = Self::Many(postings);
+            }
+            Self::Many(postings) => {
+                debug_assert!(postings.last().is_some_and(|last| *last < atom_index));
+                postings.push(atom_index);
+            }
+        }
+    }
+
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            Self::One(atom_index) => std::slice::from_ref(atom_index),
+            Self::Many(postings) => postings,
+        }
+    }
+}
+
+struct CueIndex {
+    postings: BTreeMap<Cue, PostingList>,
+    weight_totals: Vec<u64>,
+}
+
+impl CueIndex {
+    fn from_atoms(atoms: &[EpisodeAtom]) -> Self {
+        let mut index = Self {
+            postings: BTreeMap::new(),
+            weight_totals: Vec::with_capacity(atoms.len()),
+        };
+        for (atom_index, atom) in atoms.iter().enumerate() {
+            index.insert(atom_index, atom);
+        }
+        index
+    }
+
+    fn insert(&mut self, atom_index: usize, atom: &EpisodeAtom) {
+        debug_assert_eq!(atom_index, self.weight_totals.len());
+        let cues = episode_cues(atom);
+        self.weight_totals.push(cue_weight_total(&cues));
+        for cue in cues {
+            match self.postings.entry(cue) {
+                Entry::Vacant(entry) => {
+                    entry.insert(PostingList::One(atom_index));
+                }
+                Entry::Occupied(mut entry) => entry.get_mut().push(atom_index),
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct OutgoingRelevance {
     total_ppm: u32,
     targets: BTreeMap<usize, InfluenceWeight>,
 }
 
-/// Append-only atom storage with sparse mutable relevance edges.
+/// Append-only atom storage with derived cue postings and sparse relevance.
 ///
 /// Each memory ID must name one exclusively written logical memory. Reopening
 /// requires reconstructing its complete atom sequence before appending. Atom
@@ -81,6 +218,7 @@ struct OutgoingRelevance {
 pub struct MemoryV0 {
     memory_id: MemoryId,
     atoms: Vec<EpisodeAtom>,
+    cue_index: OnceLock<CueIndex>,
     outgoing: BTreeMap<usize, OutgoingRelevance>,
 }
 
@@ -91,6 +229,7 @@ impl MemoryV0 {
         Self {
             memory_id,
             atoms: Vec::new(),
+            cue_index: OnceLock::new(),
             outgoing: BTreeMap::new(),
         }
     }
@@ -101,13 +240,17 @@ impl MemoryV0 {
         self.memory_id
     }
 
-    /// Canonicalizes the draft context and appends an immutable episode.
+    /// Canonicalizes the draft context and appends the immutable episode.
     pub fn insert_episode(&mut self, draft: EpisodeDraft) -> Result<AtomId, MemoryError> {
         let sequence = u64::try_from(self.atoms.len()).map_err(|_| MemoryError::IdExhausted)?;
         let id = AtomId::from_parts(self.memory_id, sequence);
         let atom = EpisodeAtom::from_draft(id, draft);
+        let atom_index = self.atoms.len();
 
         self.atoms.push(atom);
+        if let Some(index) = self.cue_index.get_mut() {
+            index.insert(atom_index, &self.atoms[atom_index]);
+        }
         Ok(id)
     }
 
@@ -367,13 +510,14 @@ impl MemoryV0 {
         Ok(())
     }
 
-    /// Ranks the direct one-hop influence of `source` in isolation.
+    /// Ranks cue-derived similarity and direct learned relevance from `source`.
     ///
-    /// The projection treats the source as fully active and every other atom as
-    /// inactive, scans only the source's outgoing relevance row, and leaves all
-    /// stored state unchanged. Each target score is the source's direct
-    /// propagation contribution. Zero scores and the source itself are omitted;
-    /// equal scores are ordered by ascending atom identifier.
+    /// Cue postings generate structural candidates from the source episode's
+    /// symbolic content. Direct outgoing relevance can add candidates and a
+    /// learned score. Both contributions use deterministic fixed-point
+    /// arithmetic. The query may initialize a private derived cue cache, but
+    /// leaves episode and relevance state unchanged. Zero scores and the source
+    /// itself are omitted; equal scores are ordered by ascending atom identifier.
     ///
     /// # Errors
     ///
@@ -381,31 +525,78 @@ impl MemoryV0 {
     /// memory. The source is validated even when `limit` is zero.
     pub fn recall_from(&self, source: AtomId, limit: usize) -> Result<Vec<RecallHit>, GraphError> {
         let source_index = self.require_atom(source)?;
-        let Some(outgoing) = self.outgoing.get(&source_index) else {
+        if limit == 0 {
             return Ok(Vec::new());
-        };
+        }
 
-        let hits = outgoing
-            .targets
-            .iter()
-            .filter_map(|(&target_index, &weight)| {
+        let cue_index = self
+            .cue_index
+            .get_or_init(|| CueIndex::from_atoms(&self.atoms));
+        let source_cues = episode_cues(&self.atoms[source_index]);
+        let mut candidates = BTreeMap::<usize, u64>::new();
+        for cue in source_cues {
+            let Some(postings) = cue_index.postings.get(&cue) else {
+                continue;
+            };
+            for &target_index in postings.as_slice() {
                 if target_index == source_index {
-                    return None;
+                    continue;
                 }
+                let shared_weight = candidates.entry(target_index).or_default();
+                *shared_weight = shared_weight
+                    .checked_add(cue.weight())
+                    .expect("shared cue weight is bounded by each episode's cue weight");
+            }
+        }
 
-                let score =
-                    u64::from(weight.as_ppm()) * u64::from(PROPAGATION_GAIN_PPM) / u64::from(SCALE);
-                let activation = Activation::from_ppm(
-                    u32::try_from(score).expect("projected activation is bounded by SCALE"),
-                )
-                .expect("projected activation is bounded by SCALE");
+        let outgoing = self.outgoing.get(&source_index);
+        if let Some(outgoing) = outgoing {
+            for &target_index in outgoing.targets.keys() {
+                candidates.entry(target_index).or_default();
+            }
+        }
+
+        let candidate_bound = candidates.len();
+        let source_cue_weight = cue_index.weight_totals[source_index];
+        let hits = candidates
+            .into_iter()
+            .filter_map(|(target_index, shared_weight)| {
+                let structural_score = Self::structural_score(
+                    shared_weight,
+                    source_cue_weight,
+                    cue_index.weight_totals[target_index],
+                );
+                let learned_score = outgoing
+                    .and_then(|outgoing| outgoing.targets.get(&target_index))
+                    .copied()
+                    .map_or(0, Self::project_relevance);
+                let score = structural_score + learned_score;
+                let activation = Activation::from_ppm(score)
+                    .expect("combined recall activation is bounded by SCALE");
                 (activation != Activation::ZERO).then_some(RecallHit {
                     atom_id: self.atoms[target_index].id(),
                     activation,
                 })
             });
 
-        Ok(Self::rank_hits(hits, outgoing.targets.len(), limit))
+        Ok(Self::rank_hits(hits, candidate_bound, limit))
+    }
+
+    fn structural_score(shared_weight: u64, source_weight: u64, target_weight: u64) -> u32 {
+        if shared_weight == 0 {
+            return 0;
+        }
+        debug_assert!(shared_weight <= source_weight);
+        debug_assert!(shared_weight <= target_weight);
+        let union_weight =
+            u128::from(source_weight) + u128::from(target_weight) - u128::from(shared_weight);
+        let score = u128::from(shared_weight) * u128::from(STRUCTURAL_GAIN_PPM) / union_weight;
+        u32::try_from(score).expect("structural recall score is bounded by its gain")
+    }
+
+    fn project_relevance(weight: InfluenceWeight) -> u32 {
+        let score = u64::from(weight.as_ppm()) * u64::from(PROPAGATION_GAIN_PPM) / u64::from(SCALE);
+        u32::try_from(score).expect("projected relevance is bounded by its gain")
     }
 
     fn rank_hits(

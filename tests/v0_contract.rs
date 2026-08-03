@@ -1,7 +1,7 @@
 use nao_m_e::{
     Activation, AtomId, EpisodeDraft, FEEDBACK_MAX_EVENT_PPM, FEEDBACK_TARGET_STEP_PPM, GraphError,
     InfluenceWeight, MAX_FEEDBACK_TARGETS, MemoryId, MemoryIdError, MemoryV0, ModelError,
-    PredicateId, SCALE, SourceId, Statement, TermId, TimestampMs, ValueError,
+    PredicateId, SCALE, STRUCTURAL_GAIN_PPM, SourceId, Statement, TermId, TimestampMs, ValueError,
 };
 
 fn memory_id(value: u128) -> MemoryId {
@@ -38,6 +38,29 @@ fn insert(memory: &mut MemoryV0, seed: u64) -> AtomId {
         .expect("identifier space is available")
 }
 
+fn observation_draft(seed: u64, predicate: u64, arguments: &[u64]) -> EpisodeDraft {
+    EpisodeDraft {
+        occurred_at: TimestampMs::new(i64::try_from(seed).expect("small test seed")),
+        recorded_at: TimestampMs::new(i64::try_from(seed + 1).expect("small test seed")),
+        context: Vec::new(),
+        observation: statement(predicate, arguments),
+        action: None,
+        outcome: None,
+        source: SourceId::new(seed),
+    }
+}
+
+fn insert_observation(
+    memory: &mut MemoryV0,
+    seed: u64,
+    predicate: u64,
+    arguments: &[u64],
+) -> AtomId {
+    memory
+        .insert_episode(observation_draft(seed, predicate, arguments))
+        .expect("identifier space is available")
+}
+
 fn activation(value: u32) -> Activation {
     Activation::from_ppm(value).expect("test activation is bounded")
 }
@@ -58,6 +81,7 @@ fn model_constructors_enforce_their_boundaries() {
     assert_eq!(FEEDBACK_TARGET_STEP_PPM, 1_000);
     assert_eq!(FEEDBACK_MAX_EVENT_PPM, 10_000);
     assert_eq!(MAX_FEEDBACK_TARGETS, 10_000);
+    assert_eq!(STRUCTURAL_GAIN_PPM, 400_000);
     assert_eq!(
         Statement::new(PredicateId::new(1), Vec::new()),
         Err(ModelError::EmptyArguments)
@@ -768,7 +792,7 @@ fn relevance_is_directed_sorted_and_removal_of_absent_edge_is_a_noop() {
 }
 
 #[test]
-fn recall_from_projects_only_the_source_row_without_mutating_state() {
+fn recall_from_uses_only_the_sources_direct_learned_row_without_mutating_state() {
     let mut memory = new_memory(1);
     let source = insert(&mut memory, 1);
     let strongest = insert(&mut memory, 2);
@@ -794,10 +818,11 @@ fn recall_from_projects_only_the_source_row_without_mutating_state() {
     let episodes_before: Vec<_> = memory.episodes().cloned().collect();
     let relevance_before = relevance_snapshot(&memory);
 
+    let hits = memory
+        .recall_from(source, usize::MAX)
+        .expect("source is known");
     assert_eq!(
-        memory
-            .recall_from(source, usize::MAX)
-            .expect("source is known"),
+        hits,
         vec![
             nao_m_e::RecallHit {
                 atom_id: strongest,
@@ -905,6 +930,208 @@ fn recall_from_validates_the_source_before_the_limit_and_handles_isolated_source
     assert_eq!(
         memory.recall_from(foreign, 0),
         Err(GraphError::UnknownAtom(foreign))
+    );
+}
+
+#[test]
+fn recall_from_derives_length_normalized_structural_candidates_without_relevance() {
+    let mut memory = new_memory(1);
+    let source = insert_observation(&mut memory, 1, 10, &[100]);
+    let exact = insert_observation(&mut memory, 2, 10, &[100]);
+    let mut longer_draft = observation_draft(3, 10, &[100]);
+    longer_draft.context.push(statement(30, &[300]));
+    let longer = memory
+        .insert_episode(longer_draft)
+        .expect("longer structural target inserts");
+    let predicate_only = insert_observation(&mut memory, 4, 10, &[200]);
+    let term_only = insert_observation(&mut memory, 5, 20, &[100]);
+    let unrelated = insert_observation(&mut memory, 6, 20, &[200]);
+    let episodes_before: Vec<_> = memory.episodes().cloned().collect();
+
+    assert_eq!(memory.relevance_edges().count(), 0);
+    let hits = memory
+        .recall_from(source, usize::MAX)
+        .expect("source is known");
+    assert_eq!(
+        hits,
+        vec![
+            nao_m_e::RecallHit {
+                atom_id: exact,
+                activation: activation(400_000),
+            },
+            nao_m_e::RecallHit {
+                atom_id: longer,
+                activation: activation(200_000),
+            },
+            nao_m_e::RecallHit {
+                atom_id: predicate_only,
+                activation: activation(92_307),
+            },
+            nao_m_e::RecallHit {
+                atom_id: term_only,
+                activation: activation(26_666),
+            },
+        ]
+    );
+    assert!(!hits.iter().any(|hit| hit.atom_id == unrelated));
+    assert_eq!(
+        memory.episodes().cloned().collect::<Vec<_>>(),
+        episodes_before
+    );
+    assert_eq!(memory.relevance_edges().count(), 0);
+}
+
+#[test]
+fn structural_recall_separates_namespaces_roles_and_argument_positions() {
+    let mut memory = new_memory(1);
+    let source = insert_observation(&mut memory, 1, 10, &[100, 200]);
+    let positional = insert_observation(&mut memory, 2, 10, &[100, 999]);
+    let reordered = insert_observation(&mut memory, 3, 10, &[200, 100]);
+    let mut other_role_draft = observation_draft(4, 20, &[300]);
+    other_role_draft.action = Some(statement(10, &[100, 200]));
+    let other_role = memory
+        .insert_episode(other_role_draft)
+        .expect("role-sensitive target inserts");
+    insert_observation(&mut memory, 5, 100, &[10]);
+
+    assert_eq!(
+        memory
+            .recall_from(source, usize::MAX)
+            .expect("source is known"),
+        vec![
+            nao_m_e::RecallHit {
+                atom_id: positional,
+                activation: activation(177_777),
+            },
+            nao_m_e::RecallHit {
+                atom_id: reordered,
+                activation: activation(95_238),
+            },
+            nao_m_e::RecallHit {
+                atom_id: other_role,
+                activation: activation(38_709),
+            },
+        ]
+    );
+}
+
+#[test]
+fn cue_index_uses_canonical_context_and_rebuilds_from_the_atom_sequence() {
+    let mut repeated_context = observation_draft(1, 10, &[100]);
+    repeated_context.context = vec![statement(20, &[200]), statement(20, &[200])];
+    let mut canonical_context = observation_draft(2, 10, &[100]);
+    canonical_context.context = vec![statement(20, &[200])];
+
+    let mut original = new_memory(1);
+    let source = original
+        .insert_episode(repeated_context.clone())
+        .expect("source inserts");
+    let target = original
+        .insert_episode(canonical_context.clone())
+        .expect("target inserts");
+    let original_hits = original
+        .recall_from(source, usize::MAX)
+        .expect("source is known");
+    assert_eq!(
+        original_hits,
+        vec![nao_m_e::RecallHit {
+            atom_id: target,
+            activation: activation(400_000),
+        }]
+    );
+
+    let mut reconstructed = new_memory(1);
+    let reconstructed_source = reconstructed
+        .insert_episode(repeated_context)
+        .expect("source reconstructs");
+    assert_eq!(
+        reconstructed
+            .recall_from(reconstructed_source, usize::MAX)
+            .expect("the first recall initializes the index"),
+        Vec::new()
+    );
+    reconstructed
+        .insert_episode(canonical_context)
+        .expect("target updates the initialized index");
+    assert_eq!(
+        reconstructed
+            .recall_from(reconstructed_source, usize::MAX)
+            .expect("reconstructed source is known"),
+        original_hits
+    );
+}
+
+#[test]
+fn feedback_boosts_structural_recall_and_negative_feedback_restores_its_base() {
+    let mut memory = new_memory(1);
+    let source = insert_observation(&mut memory, 1, 10, &[100]);
+    let target = insert_observation(&mut memory, 2, 10, &[100]);
+
+    assert_eq!(
+        memory.recall_from(source, 1).expect("source is known")[0]
+            .activation
+            .as_ppm(),
+        400_000
+    );
+    memory
+        .apply_feedback(source, &[target], true)
+        .expect("positive feedback applies");
+    assert_eq!(
+        memory.recall_from(source, 1).expect("source is known")[0]
+            .activation
+            .as_ppm(),
+        400_400
+    );
+    memory
+        .apply_feedback(source, &[target], false)
+        .expect("negative feedback applies");
+    assert_eq!(memory.relevance(source, target), None);
+    assert_eq!(
+        memory.recall_from(source, 1).expect("source is known"),
+        vec![nao_m_e::RecallHit {
+            atom_id: target,
+            activation: activation(400_000),
+        }]
+    );
+}
+
+#[test]
+fn recall_unifies_structural_learned_and_combined_candidates_once() {
+    let mut memory = new_memory(1);
+    let source = insert_observation(&mut memory, 1, 10, &[100]);
+    let structural_only = insert_observation(&mut memory, 2, 10, &[100]);
+    let combined = insert_observation(&mut memory, 3, 10, &[200]);
+    let learned_only = insert_observation(&mut memory, 4, 20, &[300]);
+    memory
+        .set_relevance(source, combined, weight(600_000))
+        .expect("combined edge fits");
+    memory
+        .set_relevance(source, learned_only, weight(400_000))
+        .expect("learned-only edge fits");
+
+    let expected = vec![
+        nao_m_e::RecallHit {
+            atom_id: structural_only,
+            activation: activation(400_000),
+        },
+        nao_m_e::RecallHit {
+            atom_id: combined,
+            activation: activation(332_307),
+        },
+        nao_m_e::RecallHit {
+            atom_id: learned_only,
+            activation: activation(160_000),
+        },
+    ];
+    assert_eq!(
+        memory
+            .recall_from(source, usize::MAX)
+            .expect("source is known"),
+        expected
+    );
+    assert_eq!(
+        memory.recall_from(source, 2).expect("source is known"),
+        expected[..2]
     );
 }
 

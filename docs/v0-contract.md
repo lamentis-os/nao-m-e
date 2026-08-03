@@ -15,7 +15,9 @@ M = (A, W)
 - `W` is a sparse matrix of directed, positive relevance weights.
 
 Relevance is mutable state separate from episode content. Inserting identical
-episode content creates distinct atoms.
+episode content creates distinct atoms. Implementations may maintain a private
+cue index derived completely from `A`; that index is not additional logical
+state and is rebuilt by replaying the atom sequence.
 
 ## Symbolic episodes
 
@@ -29,6 +31,24 @@ then lexicographically by the ordered argument identifiers. It does not reorder
 a statement's arguments or otherwise interpret caller-owned identifiers.
 Timestamps are signed milliseconds on a caller-defined timeline and do not
 drive recall or feedback.
+
+Recall derives a set of symbolic cues from every statement in an episode. The
+statement roles are `Context`, `Observation`, `Action`, and `Outcome`. For a
+statement with role `r`, predicate `p`, and zero-based ordered arguments `t_i`,
+the cues and their fixed weights are:
+
+```text
+Predicate(p)                 1
+Term(t_i)                    1
+RolePredicate(r, p)          2
+RoleArgument(r, p, i, t_i)   4
+```
+
+Each distinct cue occurs at most once in an episode's cue set, even if several
+statements produce it. Predicate and term cues can therefore match across
+roles, while role-predicate and role-argument cues preserve their stated role;
+role-argument cues additionally preserve predicate and argument position.
+Timestamps and provenance source identifiers do not produce cues.
 
 ## Identity and membership
 
@@ -141,32 +161,57 @@ does not change immutable episode content.
 Recall scores use integer parts per million with these fixed parameters:
 
 ```text
-SCALE            = 1,000,000
-PROPAGATION_GAIN =   400,000
+SCALE                  = 1,000,000
+STRUCTURAL_GAIN_PPM    =   400,000
+PROPAGATION_GAIN_PPM   =   400,000
 ```
 
-`recall_from(source, limit)` performs a read-only, source-conditioned one-hop
-projection. It validates `source` even when `limit` is zero, then treats that
-source as fully active and every other atom as inactive. Only the source's
-direct outgoing relevance row is scanned. For each target, the projected
-query-local activation score is:
+`recall_from(source, limit)` performs a read-only, source-conditioned query. It
+validates `source` even when `limit` is zero. Its candidates are the union of
+all other episodes sharing at least one cue with the source and all targets in
+the source's direct outgoing relevance row. The first successful recall with a
+positive limit may build the derived index by scanning all atoms once. Warm
+candidate lookup in that `MemoryV0` then traverses only the source cues and
+their postings rather than globally scanning episodes. A target present through
+several cues or through both paths occurs only once.
+
+For source cue set `C_s` and target cue set `C_t`, let `w(c)` be the fixed cue
+weight above. Weighted intersection and union are:
 
 ```text
-score[target] = floor(weight[source,target] * PROPAGATION_GAIN / SCALE)
+intersection = sum(w(c) for c in C_s intersect C_t)
+union        = sum(w(c) for c in C_s union C_t)
 ```
 
-The source itself and targets whose score rounds to zero are excluded. At most
-`limit` hits are returned by descending projected activation and then ascending
-`AtomId`. The memory stores no activation vector. Neither episodes nor
-relevance are mutated. Incoming edges, other source rows, and multi-hop paths
-do not contribute.
+The structural contribution is weighted Jaccard similarity scaled with integer
+flooring. A direct learned relevance edge contributes the existing one-hop
+projection; an absent edge contributes zero:
+
+```text
+structural[target] = floor(intersection * STRUCTURAL_GAIN_PPM / union)
+learned[target]    = floor(weight[source,target] * PROPAGATION_GAIN_PPM / SCALE)
+score[target]      = structural[target] + learned[target]
+```
+
+For a learned-only candidate, `intersection` and `structural` are zero. Each
+contribution is at most 400,000 ppm, so the combined score is at most 800,000
+ppm. The source itself and targets whose combined score is zero are excluded.
+At most `limit` hits are returned by descending score and then ascending
+`AtomId`. The memory stores no activation vector. Recall does not mutate the
+logical atom or relevance state, but may initialize and reuse a private derived
+cue cache. Incoming edges, other source rows, and multi-hop paths do not
+contribute. Unhelpful feedback can reduce or remove only the learned
+contribution; it cannot suppress a target's independently derived structural
+contribution.
 
 ## Kernel boundary
 
-The V0 kernel stores atoms and relevance only in a `MemoryV0` instance. It
-performs no persistence, loading, synchronization, or multi-writer coordination.
-It also performs no free-text processing, embedding or LLM calls, or autonomous
-relevance learning. Relevance changes only through explicit graph mutation or
-caller-supplied feedback. Persistence adapters remain outside the kernel; the
-format and lifecycle of the optional SQLite adapter are specified separately in
-the [SQLite V2 contract](sqlite-v2-contract.md).
+The V0 kernel's logical state contains atoms and relevance only. `MemoryV0` may
+also hold cue postings and cue-weight totals derived deterministically from its
+immutable atoms; they are neither independently mutable nor persistent. The
+kernel performs no persistence, loading, synchronization, or multi-writer
+coordination. It also performs no free-text processing, embedding or LLM calls,
+or autonomous relevance learning. Relevance changes only through explicit graph
+mutation or caller-supplied feedback. Persistence adapters remain outside the
+kernel; the format and lifecycle of the optional SQLite adapter are specified
+separately in the [SQLite V2 contract](sqlite-v2-contract.md).

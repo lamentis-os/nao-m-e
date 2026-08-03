@@ -176,6 +176,12 @@ fn help_version_and_top_level_syntax_have_stable_exit_categories() {
         assert!(!stdout.contains("JSON"));
     }
 
+    let mut recall_help = cli();
+    recall_help.args(["recall", "--help"]);
+    let recall_help = success_text(invoke(recall_help, None));
+    assert!(recall_help.contains("Symbolic cue overlap provides cold candidates"));
+    assert!(recall_help.contains("Direct learned relevance"));
+
     let mut version = cli();
     version.arg("--version");
     assert!(success_text(invoke(version, None)).starts_with("nao-m-e 0.0.1"));
@@ -403,6 +409,48 @@ fn recall_emits_exact_ranked_blocks_and_honors_limit() {
     assert_eq!(
         success_text(recall(&database, 0, Some(11))),
         expected_eleven
+    );
+}
+
+#[test]
+fn cold_recall_rebuilds_cue_candidates_without_feedback() {
+    let directory = TempDir::new().expect("temporary directory");
+    let database = directory.path().join("memory.sqlite3");
+    init(&database);
+
+    for (sequence, occurred, source, predicate, terms) in [
+        (0, 1, 100, 10, "7,8"),
+        (1, 3, 101, 10, "7,9"),
+        (2, 5, 102, 20, "30"),
+    ] {
+        let mut command = cli();
+        command
+            .arg("add")
+            .arg(&database)
+            .arg("--occurred")
+            .arg(occurred.to_string())
+            .arg("--recorded")
+            .arg((occurred + 1).to_string())
+            .arg("--source")
+            .arg(source.to_string())
+            .arg("--predicate")
+            .arg(predicate.to_string())
+            .arg("--terms")
+            .arg(terms);
+        assert_eq!(success_text(invoke(command, None)), format!("{sequence}\n"));
+    }
+
+    assert_eq!(
+        success_text(recall(&database, 0, None)),
+        "sequence 1\nactivation_ppm 177777\noccurred 3\nrecorded 4\nsource 101\npredicate 10\nterms 7,9\n"
+    );
+    assert_eq!(
+        SqliteStore::open(&database)
+            .unwrap()
+            .memory()
+            .relevance_edges()
+            .count(),
+        0
     );
 }
 
