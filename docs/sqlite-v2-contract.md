@@ -369,12 +369,16 @@ is not a supported API.
 
 ## CLI boundary
 
-The CLI's JSON `schema_version = 2` identifies its request and response
-protocol, while SQLite `format_version = 2` identifies this database format.
-The equal numbers do not couple the protocols: changing either version does not
-implicitly change, accept, or migrate the other. `init` creates the database
-format defined here; `run` and `recall` open and reconstruct that complete
-snapshot before executing their command.
+CLI V3 is an argument and text-output contract independent of SQLite
+`format_version = 2`. Changing the CLI syntax does not implicitly change,
+accept, or migrate the persisted format. `init` creates an empty database in
+the format defined here and is silent on success. `add`, `recall`, and
+`feedback` require an existing store and open and reconstruct its complete
+snapshot before executing. Singular `add` commits one episode in one save,
+while `add --many` commits all validated input episodes in one save or none of
+them. Feedback also uses one save. Recall does not save. Add output begins only
+after its save commits and is not part of the SQLite transaction; a later
+standard-output failure cannot roll back that commit.
 
 ## Durability boundary
 

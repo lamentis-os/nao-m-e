@@ -104,160 +104,153 @@ before exposing memory state.
 
 ## Command-line interface
 
-Install the private workspace binary from a checkout:
+Install the workspace binary from a checkout:
 
 ```sh
 cargo install --locked --path crates/nao-m-e-cli
 ```
 
-The CLI has three commands:
+CLI V3 has four commands:
 
 ```text
 nao-m-e init <DATABASE>
-nao-m-e run <DATABASE> --input <FILE|->
-nao-m-e recall <DATABASE> --from-sequence <N>
-nao-m-e recall <DATABASE> --from-sequence <N> --limit <N>
+nao-m-e add <DATABASE> --occurred <MS> --recorded <MS> --source <ID>
+  [--context <PREDICATE>:<TERMS>]...
+  --predicate <PREDICATE> --terms <TERMS>
+  [--action <PREDICATE>:<TERMS>]
+  [--outcome <PREDICATE>:<TERMS>]
+  [--quiet]
+nao-m-e add <DATABASE> --many [--quiet]
+nao-m-e recall <DATABASE> --from <SEQUENCE> [--limit <N>]
+nao-m-e feedback <DATABASE> --from <SEQUENCE> --helpful <SEQUENCES>
+nao-m-e feedback <DATABASE> --from <SEQUENCE> --unhelpful <SEQUENCES>
 ```
 
-Create a store, then apply a versioned JSON batch:
+`MS` is a signed decimal millisecond value. Identifiers and sequences are
+unsigned decimal integers. `TERMS` is a non-empty comma-separated list of term
+identifiers, and `SEQUENCES` is a non-empty comma-separated list of episode
+sequences. A compact statement such as `20:1001,3001` therefore means predicate
+`20` with the ordered terms `1001` and `3001`. Every option except `--context`
+may occur at most once in one episode; the required observation uses the
+separate `--predicate` and `--terms` options.
+
+Create an empty store, then append episodes. `init` never replaces an existing
+path and writes nothing to standard output on success. `add` requires an
+existing store and prints only the assigned local sequence followed by a
+newline. `--quiet` suppresses that sequence without changing the saved state.
 
 ```sh
 nao-m-e init incident-memory.sqlite3
-nao-m-e run incident-memory.sqlite3 --input episodes.json
+
+nao-m-e add incident-memory.sqlite3 \
+  --occurred 1785596400000 \
+  --recorded 1785596405000 \
+  --source 7 \
+  --context 10:1001 \
+  --predicate 20 \
+  --terms 1001,3001
+# stdout: 0
+
+nao-m-e add incident-memory.sqlite3 \
+  --occurred 1785596460000 \
+  --recorded 1785596465000 \
+  --source 7 \
+  --predicate 21 \
+  --terms 1001 \
+  --outcome 30:4001
+# stdout: 1
 ```
 
-For example, `episodes.json` can append a failure and a recovery episode and
-connect the failure to the recovery:
-
-```json
-{
-  "schema_version": 2,
-  "operations": [
-    {
-      "op": "insert_episode",
-      "label": "failure",
-      "episode": {
-        "occurred_at_ms": 1785596400000,
-        "recorded_at_ms": 1785596405000,
-        "source_id": 7,
-        "context": [
-          { "predicate_id": 10, "term_ids": [1001] }
-        ],
-        "observation": {
-          "predicate_id": 20,
-          "term_ids": [1001, 3001]
-        }
-      }
-    },
-    {
-      "op": "insert_episode",
-      "label": "recovery",
-      "episode": {
-        "occurred_at_ms": 1785596460000,
-        "recorded_at_ms": 1785596465000,
-        "source_id": 7,
-        "observation": {
-          "predicate_id": 21,
-          "term_ids": [1001]
-        },
-        "outcome": {
-          "predicate_id": 30,
-          "term_ids": [4001]
-        }
-      }
-    },
-    {
-      "op": "set_relevance",
-      "from": { "label": "failure" },
-      "to": { "label": "recovery" },
-      "weight_ppm": 600000
-    }
-  ]
-}
-```
-
-CLI protocol V2 supports `insert_episode`, `set_relevance`,
-`remove_relevance`, and `apply_feedback`, and accepts standard input with
-`--input -`. Later batches can refer to already persisted atoms as
-`{ "sequence": 0 }`; labels exist only within the batch that defines them. A
-successful batch is saved once as a complete snapshot. If parsing, an
-operation, validation, or saving fails, none of that batch is persisted.
-Scenario documents whose `schema_version` is not `2` are rejected.
-
-Recall from the failure episode. The default limit is ten:
+`add --many` reads standard input. Each non-empty line contains the same episode
+options accepted by singular `add`, without the command, database path,
+`--many`, or `--quiet`. Blank lines do not create episodes, and the input must
+contain at least one episode. The complete input is parsed and validated before
+one save commits every episode atomically. On success, one assigned sequence
+per input episode is written in input order; invocation-level `--quiet`
+suppresses all of those lines.
 
 ```sh
-nao-m-e recall incident-memory.sqlite3 --from-sequence 0
-nao-m-e recall incident-memory.sqlite3 --from-sequence 0 --limit 5
+printf '%s\n' \
+  '--occurred 1785596520000 --recorded 1785596525000 --source 7 --predicate 22 --terms 1001' \
+  '--occurred 1785596580000 --recorded 1785596585000 --source 7 --predicate 23 --terms 1001 --action 40:5001' \
+  | nao-m-e add incident-memory.sqlite3 --many
+# stdout:
+# 2
+# 3
 ```
 
-The recovery is returned with `activation_ppm: 240000`: a query temporarily
-treats the selected source as fully activated, treats every other episode as
-inactive, and projects exactly one direct score. It creates no stored activation
-state and does not save or otherwise mutate the memory.
+If any line, episode, or save is invalid, no episode from that `--many`
+invocation is committed and standard output remains empty. Singular `add` also
+uses exactly one save.
 
-The remaining mutation shapes are deliberately small:
+Recall is a read-only, source-conditioned query. The default limit is ten. Each
+hit is emitted as a deterministic block of `key value` lines in this exact
+order: `sequence`, `activation_ppm`, `occurred`, `recorded`, `source`, zero or
+more `context` lines, `predicate`, `terms`, then `action` and `outcome` when
+present. Repeated `context` lines retain their canonical order, and absent
+optional statements have no line. Blocks follow recall rank and are separated
+by one blank line; a query with no hits writes zero bytes.
 
-```json
-[
-  {
-    "op": "set_relevance",
-    "from": { "sequence": 0 },
-    "to": { "sequence": 1 },
-    "weight_ppm": 250000
-  },
-  {
-    "op": "remove_relevance",
-    "from": { "sequence": 0 },
-    "to": { "sequence": 1 }
-  },
-  {
-    "op": "apply_feedback",
-    "source": { "sequence": 0 },
-    "targets": [{ "sequence": 1 }],
-    "feedback": 1
-  }
-]
+```sh
+nao-m-e feedback incident-memory.sqlite3 --from 0 --helpful 1
+nao-m-e recall incident-memory.sqlite3 --from 0 --limit 5
 ```
 
-Relevance weights use `1..=1_000_000` ppm. Feedback is binary: `1` is helpful
-and `0` is unhelpful. The supplied target list is authoritative; applying
-feedback does not recompute recall or bind the event to an earlier query. The
-core removes source self-hits and duplicate targets, then applies the
-deterministic feedback rule documented in the V0 contract. A feedback event
-accepts at most 10,000 target entries, changes each effective target by at most
-1,000 ppm, and caps their aggregate direct adjustment at 10,000 ppm. Positive
-feedback uses free outgoing capacity first, then removes exactly the remaining
-required total from non-target edges, independent of how that weight is
-fragmented. The next recall from the same source observes the resulting edge
-weights. The snapshot stores only that relevance graph, not a feedback receipt
-or provenance record.
+```text
+sequence 1
+activation_ppm 400
+occurred 1785596460000
+recorded 1785596465000
+source 7
+predicate 21
+terms 1001
+outcome 30:4001
+```
 
-Successful `init`, `run`, and `recall` commands write one JSON document to
-standard output; help and version output are plain text. `run` reports the
-memory ID, applied-operation and episode counts, and every inserted label and
-sequence. Before response output begins, errors leave standard output empty and
-write diagnostics to standard error. A standard-output failure can leave a
-partial JSON document and does not roll back a completed side effect: `init`
-may already have created the store, and `run` may already have committed its
-batch. Inspect or reopen the store before retrying; batches containing inserts
-or feedback are not generally idempotent, and replaying feedback may mutate
-relevance again. Exit code `2` denotes invalid CLI syntax, while input, model,
-graph, store, and output errors use exit code `1`.
+The query temporarily treats the selected source as fully active and every
+other episode as inactive. It projects exactly one direct score, creates no
+stored activation state, and does not save or otherwise mutate the memory.
 
-Scenario input and data-command responses are strict, versioned JSON.
-`schema_version = 2` identifies the CLI protocol; SQLite `format_version = 2`
-identifies the database format. The equal numbers do not couple the two
-protocols. The adapter rejects every other persisted format version, including
-`format_version = 1`, and performs no migration. Predicate, term, source, and
-time values are caller-owned numeric symbols; the CLI does not interpret text,
-assign symbols, deduplicate episodes, or provide embeddings. `run` and `recall`
-each load the complete snapshot. The current adapter opens that snapshot
-read-write, so `recall` requires write access even though it never saves.
-Simultaneous writers are rejected rather than merged. The Core and CLI expose
-source-conditioned recall only; there is no persistent activation vector or
-global activation ranking. Direct episode inspection remains available through
-the Rust API.
+Feedback is binary and successful feedback writes nothing to standard output.
+Exactly one of `--helpful` and `--unhelpful` supplies the authoritative target
+sequence list. Helpful feedback strengthens direct relevance from the source to
+the effective targets; unhelpful feedback weakens or removes only those target
+edges. Feedback is deterministic and budgeted, does not recompute recall, and
+does not bind the event to an earlier query. The next recall from the same
+source observes the resulting graph. Each feedback command uses one save, and
+the snapshot stores neither a feedback receipt nor provenance for the change.
+The [V0 external-feedback contract](docs/v0-contract.md#external-feedback) is
+authoritative for validation, the 10,000-target input limit, target
+normalization, adjustment bounds, and exact fixed-point redistribution.
+
+An initialized memory and newly added episodes have no relevance edges. Recall
+from such an episode is empty until helpful feedback seeds known target
+sequences. The CLI does not discover candidates, list episodes, assign symbolic
+identifiers, or silently create a missing database. Callers must retain the
+sequences printed by `add` or maintain their own index. Direct graph mutation
+and episode inspection remain Rust API operations rather than CLI commands.
+
+Errors detected before a command commits leave standard output empty and write
+diagnostics to standard error. Add sequences are emitted only after the save
+commits. A standard-output failure can therefore lose one sequence or expose
+only a prefix after `add --many`, even though the complete append is already
+durable. Retrying an uncertain add can create duplicate immutable episodes.
+Feedback is also not idempotent: silence removes an output failure point but
+does not prove whether a process interrupted around commit saved its change.
+Inspect or reopen the store before retrying an operation with an unknown
+completion state. Exit code `2` denotes invalid CLI syntax; model, graph,
+store, input, and output failures use exit code `1`. Help and version output
+remain plain text.
+
+CLI V3 syntax and text output are independent of SQLite `format_version = 2`.
+Changing the CLI does not accept or migrate another database format. Predicate,
+term, source, and time values are caller-owned numeric symbols; the CLI does not
+interpret text, deduplicate episodes, or provide embeddings. `add`, `recall`,
+and `feedback` each load the complete snapshot. The current adapter opens it
+read-write, so recall still requires write access even though it never saves.
+Simultaneous writers are rejected rather than merged. Recall remains one-hop
+and source-conditioned; there is no persistent activation vector or global
+activation ranking.
 
 ## Boundaries
 

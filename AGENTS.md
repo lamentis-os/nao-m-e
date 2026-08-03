@@ -4,7 +4,8 @@
 
 These instructions apply to the entire repository. The workspace contains a
 deterministic, in-memory Rust 2024 kernel for symbolic episode memory, an
-optional SQLite snapshot adapter, and a private command-line adapter. Core
+optional SQLite snapshot adapter, and a user- and agent-facing command-line
+adapter. Core
 behavior is defined in `docs/v0-contract.md`; the persistence format and
 lifecycle are defined in `docs/sqlite-v2-contract.md`.
 
@@ -17,8 +18,8 @@ lifecycle are defined in `docs/sqlite-v2-contract.md`.
 - `tests/v0_contract.rs` exercises the public V0 contract.
 - `crates/nao-m-e-sqlite` owns SQLite connection handling, format validation,
   snapshot transactions, and adapter tests.
-- `crates/nao-m-e-cli` owns argument parsing, strict JSON V2 request and
-  response shapes, command execution, and cross-process CLI tests.
+- `crates/nao-m-e-cli` owns the strict CLI V3 argument and text-output grammar,
+  command execution, and cross-process CLI tests.
 
 ## Contract guardrails
 
