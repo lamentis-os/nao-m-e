@@ -3,8 +3,8 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use nao_m_e::{
-    AtomId, EpisodeAtom, EpisodeDraft, InfluenceWeight, MemoryId, MemoryV0, PredicateId,
-    RelevanceEdge, SCALE, SourceId, Statement, TermId, TimestampMs,
+    AtomId, EpisodeAtom, EpisodeDraft, FeedbackEdge, FeedbackTrace, MemoryId, MemoryV0,
+    PredicateId, SourceId, Statement, TermId, TimestampMs,
 };
 use nao_m_e_sqlite::{SqliteStore, StoreError};
 use tempfile::{TempDir, tempdir};
@@ -13,14 +13,14 @@ use tempfile::{TempDir, tempdir};
 struct MemorySnapshot {
     memory_id: MemoryId,
     episodes: Vec<EpisodeAtom>,
-    relevance_edges: Vec<RelevanceEdge>,
+    feedback_edges: Vec<FeedbackEdge>,
 }
 
 fn snapshot(memory: &MemoryV0) -> MemorySnapshot {
     MemorySnapshot {
         memory_id: memory.memory_id(),
         episodes: memory.episodes().cloned().collect(),
-        relevance_edges: memory.relevance_edges().collect(),
+        feedback_edges: memory.feedback_edges().collect(),
     }
 }
 
@@ -69,8 +69,8 @@ fn insert(store: &mut SqliteStore, episode: EpisodeDraft) -> AtomId {
         .expect("test memory has identifier capacity")
 }
 
-fn weight(value: u32) -> InfluenceWeight {
-    InfluenceWeight::from_ppm(value).expect("test weight is positive and in range")
+fn trace(history_bits: u16, sample_count: u8) -> FeedbackTrace {
+    FeedbackTrace::from_parts(history_bits, sample_count).expect("test feedback trace is canonical")
 }
 
 #[test]
@@ -175,16 +175,16 @@ fn full_snapshot_round_trips_exactly_and_continues_the_sequence() {
 
     store
         .memory_mut()
-        .set_relevance(first, second, weight(600_000))
-        .expect("first edge fits its source budget");
+        .set_feedback_trace(first, second, trace(1, 1))
+        .expect("first trace is valid");
     store
         .memory_mut()
-        .set_relevance(first, third, weight(400_000))
-        .expect("second edge fills its source budget");
+        .set_feedback_trace(first, third, trace(2, 2))
+        .expect("second trace is valid");
     store
         .memory_mut()
-        .set_relevance(second, first, weight(SCALE))
-        .expect("reverse edge has an independent budget");
+        .set_feedback_trace(second, first, trace(u16::MAX, 16))
+        .expect("reverse trace is valid");
 
     let persisted = snapshot(store.memory());
     store.save().expect("snapshot is saved atomically");
@@ -199,7 +199,63 @@ fn full_snapshot_round_trips_exactly_and_continues_the_sequence() {
 }
 
 #[test]
-fn cue_derived_recall_is_identical_after_reopen_without_relevance() {
+fn feedback_trace_forms_round_trip_and_continue_after_reopen() {
+    let directory = tempdir().expect("temporary directory is available");
+    let path = database_path(&directory);
+    let mut store = SqliteStore::create(&path).expect("new store is created");
+    let ids: Vec<_> = (0..5).map(|seed| insert(&mut store, draft(seed))).collect();
+    for (target, feedback_trace) in [
+        (ids[1], trace(0, 1)),
+        (ids[2], trace(1, 1)),
+        (ids[3], trace(0xaaaa, 16)),
+        (ids[4], trace(0x8000, 16)),
+    ] {
+        store
+            .memory_mut()
+            .set_feedback_trace(ids[0], target, feedback_trace)
+            .expect("feedback trace endpoints are known");
+    }
+    store.save().expect("all feedback trace forms save");
+    drop(store);
+
+    let mut reopened = SqliteStore::open(&path).expect("feedback traces reopen");
+    assert_eq!(
+        reopened.memory().feedback_trace(ids[0], ids[1]),
+        Some(trace(0, 1))
+    );
+    assert_eq!(
+        reopened.memory().feedback_trace(ids[0], ids[2]),
+        Some(trace(1, 1))
+    );
+    assert_eq!(
+        reopened.memory().feedback_trace(ids[0], ids[3]),
+        Some(trace(0xaaaa, 16))
+    );
+    assert_eq!(
+        reopened.memory().feedback_trace(ids[0], ids[4]),
+        Some(trace(0x8000, 16))
+    );
+
+    reopened
+        .memory_mut()
+        .apply_feedback(ids[0], &[ids[4]], true)
+        .expect("continued feedback is accepted");
+    assert_eq!(
+        reopened.memory().feedback_trace(ids[0], ids[4]),
+        Some(trace(1, 16))
+    );
+    reopened.save().expect("continued trace saves");
+    drop(reopened);
+
+    let reopened = SqliteStore::open(&path).expect("continued trace reopens");
+    assert_eq!(
+        reopened.memory().feedback_trace(ids[0], ids[4]),
+        Some(trace(1, 16))
+    );
+}
+
+#[test]
+fn cue_derived_recall_is_identical_after_reopen_without_feedback() {
     let directory = tempdir().expect("temporary directory is available");
     let path = database_path(&directory);
     let mut store = SqliteStore::create(&path).expect("new store is created");
@@ -214,7 +270,7 @@ fn cue_derived_recall_is_identical_after_reopen_without_relevance() {
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].atom_id, target);
     assert_eq!(before[0].activation.as_ppm(), 177_777);
-    assert_eq!(store.memory().relevance_edges().count(), 0);
+    assert_eq!(store.memory().feedback_edges().count(), 0);
     let persisted = snapshot(store.memory());
 
     store.save().expect("episodes are saved");
@@ -222,7 +278,7 @@ fn cue_derived_recall_is_identical_after_reopen_without_relevance() {
 
     let reopened = SqliteStore::open(&path).expect("saved store reopens");
     assert_eq!(snapshot(reopened.memory()), persisted);
-    assert_eq!(reopened.memory().relevance_edges().count(), 0);
+    assert_eq!(reopened.memory().feedback_edges().count(), 0);
     assert_eq!(
         reopened
             .memory()
@@ -233,7 +289,7 @@ fn cue_derived_recall_is_identical_after_reopen_without_relevance() {
 }
 
 #[test]
-fn repeated_saves_persist_relevance_deltas() {
+fn repeated_saves_persist_feedback_deltas() {
     let directory = tempdir().expect("temporary directory is available");
     let path = database_path(&directory);
     let mut store = SqliteStore::create(&path).expect("new store is created");
@@ -243,24 +299,21 @@ fn repeated_saves_persist_relevance_deltas() {
 
     store
         .memory_mut()
-        .set_relevance(first, second, weight(600_000))
+        .set_feedback_trace(first, second, trace(1, 1))
         .expect("first edge inserts");
     store
         .memory_mut()
-        .set_relevance(second, third, weight(700_000))
+        .set_feedback_trace(second, third, trace(0, 1))
         .expect("second edge inserts");
     store.save().expect("initial snapshot is saved");
 
-    assert_eq!(
-        store
-            .memory_mut()
-            .remove_relevance(first, second)
-            .expect("known edge can be removed"),
-        Some(weight(600_000))
-    );
     store
         .memory_mut()
-        .set_relevance(third, first, weight(123_456))
+        .set_feedback_trace(first, second, trace(2, 2))
+        .expect("known trace can be updated");
+    store
+        .memory_mut()
+        .set_feedback_trace(third, first, trace(5, 3))
         .expect("replacement topology is valid");
     store.save().expect("replacement snapshot is saved");
     store
@@ -270,16 +323,19 @@ fn repeated_saves_persist_relevance_deltas() {
 
     let reopened = SqliteStore::open(&path).expect("updated store reopens");
     assert_eq!(reopened.memory().episodes().len(), 3);
-    assert_eq!(reopened.memory().relevance(first, second), None);
     assert_eq!(
-        reopened.memory().relevance(second, third),
-        Some(weight(700_000))
+        reopened.memory().feedback_trace(first, second),
+        Some(trace(2, 2))
     );
     assert_eq!(
-        reopened.memory().relevance(third, first),
-        Some(weight(123_456))
+        reopened.memory().feedback_trace(second, third),
+        Some(trace(0, 1))
     );
-    assert_eq!(reopened.memory().relevance_edges().count(), 2);
+    assert_eq!(
+        reopened.memory().feedback_trace(third, first),
+        Some(trace(5, 3))
+    );
+    assert_eq!(reopened.memory().feedback_edges().count(), 3);
 }
 
 #[test]
@@ -375,7 +431,7 @@ fn empty_memory_can_be_saved_and_reopened() {
     let reopened = SqliteStore::open(&path).expect("empty store reopens");
     assert_eq!(reopened.memory_id(), memory_id);
     assert_eq!(snapshot(reopened.memory()).episodes.len(), 0);
-    assert_eq!(reopened.memory().relevance_edges().count(), 0);
+    assert_eq!(reopened.memory().feedback_edges().count(), 0);
 }
 
 #[test]
@@ -394,8 +450,8 @@ fn thousand_episode_snapshot_reopens_without_semantic_drift() {
     for pair in ids.windows(2) {
         store
             .memory_mut()
-            .set_relevance(pair[0], pair[1], weight(1))
-            .expect("chain edge has an independent source budget");
+            .set_feedback_trace(pair[0], pair[1], trace(1, 1))
+            .expect("chain feedback trace is valid");
     }
     store.save().expect("large deterministic fixture is saved");
     let expected = snapshot(store.memory());
@@ -404,7 +460,7 @@ fn thousand_episode_snapshot_reopens_without_semantic_drift() {
     let reopened = SqliteStore::open(&path).expect("large deterministic fixture reopens");
     assert_eq!(reopened.memory().episodes().len(), EPISODE_COUNT);
     assert_eq!(
-        reopened.memory().relevance_edges().count(),
+        reopened.memory().feedback_edges().count(),
         EPISODE_COUNT - 1
     );
     assert_eq!(snapshot(reopened.memory()), expected);

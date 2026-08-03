@@ -7,12 +7,12 @@ use rusqlite::{Connection, Error, Result, TransactionBehavior, params};
 use crate::codec::encode_memory_id;
 
 pub(crate) const APPLICATION_ID: i64 = 0x4E41_4F4D;
-pub(crate) const FORMAT_VERSION: i64 = 2;
+pub(crate) const FORMAT_VERSION: i64 = 3;
 
 const SCHEMA: &str = r#"
 CREATE TABLE memory_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    format_version INTEGER NOT NULL CHECK (format_version = 2),
+    format_version INTEGER NOT NULL CHECK (format_version = 3),
     memory_id BLOB NOT NULL
         CHECK (
             typeof(memory_id) = 'blob'
@@ -29,7 +29,7 @@ CREATE TABLE episodes (
         CHECK (typeof(payload) = 'blob' AND length(payload) > 0)
 ) STRICT, WITHOUT ROWID;
 
-CREATE TABLE relevance_edges (
+CREATE TABLE feedback_edges (
     from_sequence BLOB NOT NULL
         CHECK (
             typeof(from_sequence) = 'blob'
@@ -40,18 +40,20 @@ CREATE TABLE relevance_edges (
             typeof(to_sequence) = 'blob'
             AND length(to_sequence) = 8
         ),
-    weight_ppm INTEGER NOT NULL CHECK (weight_ppm BETWEEN 1 AND 1000000),
+    history_bits INTEGER NOT NULL CHECK (history_bits BETWEEN 0 AND 65535),
+    sample_count INTEGER NOT NULL CHECK (sample_count BETWEEN 1 AND 16),
     PRIMARY KEY (from_sequence, to_sequence),
     FOREIGN KEY (from_sequence) REFERENCES episodes(sequence)
         ON UPDATE RESTRICT ON DELETE RESTRICT,
     FOREIGN KEY (to_sequence) REFERENCES episodes(sequence)
         ON UPDATE RESTRICT ON DELETE RESTRICT,
-    CHECK (from_sequence != to_sequence)
+    CHECK (from_sequence != to_sequence),
+    CHECK (history_bits < (1 << sample_count))
 ) STRICT, WITHOUT ROWID;
 "#;
 
 static CANONICAL_SCHEMA: OnceLock<Vec<SchemaObject>> = OnceLock::new();
-const SCHEMA_TABLE_NAMES: [&str; 3] = ["memory_meta", "episodes", "relevance_edges"];
+const SCHEMA_TABLE_NAMES: [&str; 3] = ["memory_meta", "episodes", "feedback_edges"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SchemaObject {
@@ -210,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_creation_commits_v2_identity_and_closed_shape() {
+    fn schema_creation_commits_v3_identity_and_closed_shape() {
         let (_directory, mut connection) = open_temporary_database();
         let memory_id = MemoryId::new(7).unwrap();
         configure(&connection);
@@ -236,7 +238,7 @@ mod tests {
             .unwrap()
             .collect::<Result<_>>()
             .unwrap();
-        assert_eq!(tables, ["episodes", "memory_meta", "relevance_edges"]);
+        assert_eq!(tables, ["episodes", "feedback_edges", "memory_meta"]);
     }
 
     #[test]
@@ -272,8 +274,8 @@ mod tests {
         let mutations = [
             SCHEMA.replacen("payload BLOB NOT NULL", "payload TEXT NOT NULL", 1),
             SCHEMA.replacen(
-                "CHECK (weight_ppm BETWEEN 1 AND 1000000)",
-                "CHECK (weight_ppm BETWEEN 0 AND 1000000)",
+                "CHECK (history_bits BETWEEN 0 AND 65535)",
+                "CHECK (history_bits BETWEEN 0 AND 65536)",
                 1,
             ),
             SCHEMA.replacen(
@@ -299,7 +301,7 @@ mod tests {
     fn validation_rejects_additional_persistent_objects() {
         for object in [
             "CREATE TABLE extra (value INTEGER) STRICT",
-            "CREATE INDEX extra_index ON relevance_edges(weight_ppm)",
+            "CREATE INDEX extra_index ON feedback_edges(history_bits)",
             "CREATE VIEW extra_view AS SELECT * FROM memory_meta",
             "CREATE TRIGGER extra_trigger AFTER UPDATE ON memory_meta BEGIN SELECT 1; END",
         ] {
@@ -349,24 +351,35 @@ mod tests {
         assert!(
             connection
                 .execute(
-                    "INSERT INTO relevance_edges VALUES (?1, ?1, 1)",
+                    "INSERT INTO feedback_edges VALUES (?1, ?1, 1, 1)",
                     [zero.as_slice()],
                 )
                 .is_err()
         );
         connection
             .execute(
-                "INSERT INTO relevance_edges VALUES (?1, ?2, 1000000)",
+                "INSERT INTO feedback_edges VALUES (?1, ?2, 65535, 16)",
                 params![zero.as_slice(), one.as_slice()],
             )
             .unwrap();
         assert!(
             connection
                 .execute(
-                    "INSERT INTO relevance_edges VALUES (?1, ?2, 1)",
+                    "INSERT INTO feedback_edges VALUES (?1, ?2, 1, 1)",
                     params![zero.as_slice(), [0xff_u8; 8].as_slice()],
                 )
                 .is_err()
         );
+        for (history_bits, sample_count) in [(2, 1), (0, 0), (0, 17)] {
+            assert!(
+                connection
+                    .execute(
+                        "UPDATE feedback_edges
+                         SET history_bits = ?1, sample_count = ?2",
+                        params![history_bits, sample_count],
+                    )
+                    .is_err()
+            );
+        }
     }
 }

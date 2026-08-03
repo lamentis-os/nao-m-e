@@ -1,4 +1,4 @@
-# SQLite V2 contract
+# SQLite V3 contract
 
 This document defines the durable format and observable lifecycle of the
 `nao-m-e-sqlite` adapter. The state being stored and reconstructed remains the
@@ -28,12 +28,12 @@ only operation that persists those changes. There is no automatic save on
 mutation or drop. A failed save leaves the in-memory state available for a
 retry, while unsaved state is lost when its process ends.
 
-Explicit feedback adjusts ordinary in-memory relevance state. `save()` stores
-the resulting relevance graph as part of the complete snapshot transaction; it
-does not use a separate persistence path. The database stores no feedback
-receipt, history, count, provenance record, or idempotency key. Reapplying the
-same feedback after a successful save is a new mutation and can change
-relevance again.
+Explicit feedback appends one sample to each addressed in-memory feedback
+trace. `save()` stores the resulting bounded feedback graph as part of the
+complete snapshot transaction; it does not use a separate persistence path.
+The database stores the trace's bounded history and sample count, but no
+feedback receipt, timestamp, provenance record, or idempotency key. Reapplying
+the same feedback after a successful save is a new sample.
 
 The core's cue postings and per-episode cue-weight totals are derived in-memory
 data, not snapshot state. SQLite stores only the episode content from which the
@@ -47,11 +47,11 @@ same `MemoryId` must not be modified independently and later merged.
 ## Format identity and connection settings
 
 The format uses SQLite application ID `0x4E414F4D` (`NAOM`, decimal
-`1312902989`) and `format_version = 2`. This adapter accepts only that format
-version. In particular, a metadata row containing `format_version = 1` is
-rejected with `StoreIntegrityError::UnsupportedFormatVersion { found: 1 }`,
-wrapped in `StoreError::InvalidStore`. The adapter has no migrator and never
-rewrites an unsupported store.
+`1312902989`) and `format_version = 3`. This adapter accepts only that format
+version. Metadata rows containing `format_version = 1` or `2` are rejected
+with `StoreIntegrityError::UnsupportedFormatVersion`, wrapped in
+`StoreError::InvalidStore`. The adapter has no migrator and never rewrites an
+unsupported store.
 
 Immediately after opening a connection, and before reading or creating schema
 or memory state, the adapter applies and verifies these connection-local safety
@@ -65,18 +65,19 @@ ignore_check_constraints = OFF
 ```
 
 For an existing file-backed target, the adapter next reads the SQLite header's
-application ID. Only after accepting that ID as `NAOM` does it apply and verify
-the settings that affect persistent journaling behavior:
+application ID and then the metadata format version. Only after accepting the
+ID as `NAOM` and the format as V3 does it apply and verify the settings that
+affect persistent journaling behavior:
 
 ```text
 journal_mode = DELETE
 synchronous = EXTRA
 ```
 
-This ordering prevents an attempted open of an unrelated SQLite database from
-changing its journaling mode. A zero busy timeout means the adapter neither
-waits nor retries on its own; SQLite locking failures remain immediately
-visible to the caller as database errors.
+This ordering prevents an attempted open of an unrelated, V1, or V2 SQLite
+database from changing its journaling mode. A zero busy timeout means the
+adapter neither waits nor retries on its own; SQLite locking failures remain
+immediately visible to the caller as database errors.
 
 A newly created database is also file-backed while it is staged. It receives
 both the connection-local safety settings and the file durability settings
@@ -89,7 +90,8 @@ before its schema and initial snapshot are committed.
   8-byte big-endian unsigned integers.
 - Timestamps in an episode payload are fixed-width 8-byte big-endian
   two's-complement signed integers containing the unchanged `i64` value.
-- Relevance weights are SQLite integers containing parts per million.
+- Feedback history is an unsigned 16-bit bitset stored as a SQLite integer.
+- Feedback sample count is an unsigned integer in `1..=16`.
 - An `AtomId` is reconstructed from the database `MemoryId` and an episode
   sequence. Its diagnostic display and Rust memory layout are never stored.
 
@@ -142,7 +144,7 @@ and non-canonical scalar encodings reject the complete store. The format
 version in `memory_meta` versions this codec; an episode payload has no
 independent magic or version field.
 
-One encoded episode must fit SQLite's effective BLOB and row-length limit. V2
+One encoded episode must fit SQLite's effective BLOB and row-length limit. V3
 does not split an oversized episode across rows or introduce overflow chunks;
 if SQLite rejects the bound payload, the enclosing save transaction rolls back
 and the unsaved in-memory state remains available to the caller.
@@ -160,7 +162,7 @@ PRAGMA application_id = 1312902989;
 
 CREATE TABLE memory_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    format_version INTEGER NOT NULL CHECK (format_version = 2),
+    format_version INTEGER NOT NULL CHECK (format_version = 3),
     memory_id BLOB NOT NULL
         CHECK (
             typeof(memory_id) = 'blob'
@@ -177,7 +179,7 @@ CREATE TABLE episodes (
         CHECK (typeof(payload) = 'blob' AND length(payload) > 0)
 ) STRICT, WITHOUT ROWID;
 
-CREATE TABLE relevance_edges (
+CREATE TABLE feedback_edges (
     from_sequence BLOB NOT NULL
         CHECK (
             typeof(from_sequence) = 'blob'
@@ -188,13 +190,15 @@ CREATE TABLE relevance_edges (
             typeof(to_sequence) = 'blob'
             AND length(to_sequence) = 8
         ),
-    weight_ppm INTEGER NOT NULL CHECK (weight_ppm BETWEEN 1 AND 1000000),
+    history_bits INTEGER NOT NULL CHECK (history_bits BETWEEN 0 AND 65535),
+    sample_count INTEGER NOT NULL CHECK (sample_count BETWEEN 1 AND 16),
     PRIMARY KEY (from_sequence, to_sequence),
     FOREIGN KEY (from_sequence) REFERENCES episodes(sequence)
         ON UPDATE RESTRICT ON DELETE RESTRICT,
     FOREIGN KEY (to_sequence) REFERENCES episodes(sequence)
         ON UPDATE RESTRICT ON DELETE RESTRICT,
-    CHECK (from_sequence != to_sequence)
+    CHECK (from_sequence != to_sequence),
+    CHECK (history_bits < (1 << sample_count))
 ) STRICT, WITHOUT ROWID;
 
 INSERT INTO memory_meta (
@@ -202,7 +206,7 @@ INSERT INTO memory_meta (
     format_version,
     memory_id,
     snapshot_revision
-) VALUES (1, 2, :memory_id, 0);
+) VALUES (1, 3, :memory_id, 0);
 
 COMMIT;
 ```
@@ -217,10 +221,12 @@ Episode rows are append-only and their sequences form the exact prefix
 sequence. There are no statement or term tables and no content dictionaries or
 content deduplication.
 
-Relevance is sparse and stores only positive edges. The schema rejects invalid
-storage classes, lengths, ranges, duplicate keys, self-edges, and missing
-endpoints. The adapter additionally validates the cross-row relevance budget
-that SQL does not enforce efficiently.
+Feedback is sparse and stores one non-empty bounded trace per directed edge.
+Bit zero is the newest sample; one means helpful and zero means unhelpful. Bits
+at or above `sample_count` must be zero. The schema rejects invalid storage
+classes, lengths, ranges, non-canonical bitsets, duplicate keys, self-edges,
+and missing endpoints. Feedback traces are independent and have no cross-row
+outgoing budget.
 
 The application schema is closed. It contains exactly these three user tables
 and no additional persistent user table, view, trigger, or user-defined index.
@@ -244,7 +250,7 @@ The staging connection receives the required session and durability settings.
 One immediate transaction commits the application ID, schema, metadata, and
 empty snapshot. Before publication, the adapter verifies the application ID,
 supported format, canonical closed schema, singleton metadata, revision zero,
-empty episode and relevance tables, `PRAGMA quick_check`, and
+empty episode and feedback tables, `PRAGMA quick_check`, and
 complete core reconstruction. It then closes the SQLite connection, flushes
 the staging file, and calls `sync_all()` on that file.
 
@@ -280,8 +286,8 @@ classified as `UnsupportedFormatVersion`. The remaining checks are:
 5. Stored context is already strictly increasing and duplicate-free. Every
    reconstructed episode is accepted by the core without changing its content,
    and the returned `AtomId` has the expected sequence and memory ID.
-6. Relevance endpoints exist, edges are unique and non-reflexive, and each
-   source's total outgoing weight is at most `SCALE`.
+6. Feedback endpoints exist, edges are unique and non-reflexive, and every
+   history bitset and sample count form a canonical `FeedbackTrace`.
 
 Rows are consumed in canonical key order. Reconstruction occurs only in local
 state:
@@ -289,11 +295,11 @@ state:
 1. Create a `MemoryV0` with the stored `MemoryId`.
 2. Decode and insert episodes in sequence order, checking every returned
    `AtomId`.
-3. Install relevance edges in source and target order through the core API.
+3. Install feedback traces in source and target order through the core API.
 
 Any storage-level or core rejection invalidates the complete snapshot. The
 adapter does not expose the reconstructed `MemoryV0` until all rows and all
-invariants have been validated. A late relevance error therefore discards the
+invariants have been validated. A late feedback error therefore discards the
 local reconstruction rather than returning a partial memory. If a snapshot
 contains multiple independent violations, which violation is reported first is
 unspecified.
@@ -317,8 +323,8 @@ episode count. `save()` starts `BEGIN IMMEDIATE` and performs one transaction:
    identity and expected revision were checked inside that same transaction.
 6. Append only episodes at or beyond the remembered count, encoding one
    complete payload BLOB per episode.
-7. Compare persisted and in-memory relevance in canonical source/target order,
-   then delete absent edges, update changed weights, and insert new edges.
+7. Compare persisted and in-memory feedback in canonical source/target order,
+   then delete absent edges, update changed traces, and insert new edges.
 8. Commit, then update the store's remembered revision and episode count.
 
 Every successful save increments the revision exactly once, including a save
@@ -326,20 +332,21 @@ with no logical state change. The append-boundary query uses the ordered episode
 primary key and does not count or scan the immutable prefix. Direct SQL edits
 remain unsupported; the next `open()` performs complete fail-closed validation.
 
-Relevance reconciliation performs one ordered `O(E)` comparison because
-`memory_mut()` permits unrestricted graph mutation and the adapter deliberately
-does not duplicate the complete persisted graph or put persistence dirty
-tracking into the core. A bounded delta plan retains small change sets until
-the SQLite read cursor is closed, then performs `O(D)` row mutations for `D`
-inserted, updated, or deleted edges; equal rows are not rewritten on this path.
+Feedback reconciliation performs one ordered `O(E)` comparison because
+`memory_mut()` permits direct edge insertion and replacement, and the adapter
+deliberately does not duplicate the complete persisted graph or put persistence
+dirty tracking into the core. A bounded delta plan retains small change sets
+until the SQLite read cursor is closed, then performs `O(D)` row mutations for
+`D` inserted, updated, or deleted edges; equal rows are not rewritten on this
+path.
 If the delta exceeds that fixed internal bound, the adapter discards the plan
-and replaces the complete relevance table after validation. This keeps
+and replaces the complete feedback table after validation. This keeps
 transient reconciliation memory bounded and avoids pathological row-by-row DML
 for a wholesale graph replacement.
 
-Every persisted relevance record encountered by the comparison is decoded and
-validated against the previously persisted episode prefix and cumulative
-source budget before any relevance DML begins. An invalid persisted graph
+Every persisted feedback record encountered by the comparison is decoded and
+validated against the previously persisted episode prefix before any feedback
+DML begins. An invalid persisted graph
 therefore fails the save and rolls back the transaction rather than being
 silently repaired.
 
@@ -361,21 +368,21 @@ errors remain available through `std::error::Error::source`.
 `StoreIntegrityError` reports application mismatch, missing metadata,
 unsupported format version, failed quick check, invalid fixed-width or payload
 encoding, invalid memory ID, invalid metadata, non-contiguous episode
-sequences, invalid episodes, or invalid relevance. A non-canonical schema is
+sequences, invalid episodes, or invalid feedback. A non-canonical schema is
 invalid metadata. Both error enums are non-exhaustive so later releases can
 report corruption more precisely
 without making callers treat the variants as a closed format definition.
 
 The adapter fails closed. It does not migrate an unsupported format, accept a
 non-canonical schema or payload, renumber episodes, canonicalize malformed
-stored context, drop invalid rows, clamp stored values, reduce relevance
-weights, or expose a partially reconstructed memory. Direct SQL modification
+stored context, drop invalid rows, clamp stored values, discard feedback
+samples, or expose a partially reconstructed memory. Direct SQL modification
 is not a supported API.
 
 ## CLI boundary
 
 CLI V3 is an argument and text-output contract independent of SQLite
-`format_version = 2`. Changing the CLI syntax does not implicitly change,
+`format_version = 3`. Changing the CLI syntax does not implicitly change,
 accept, or migrate the persisted format. `init` creates an empty database in
 the format defined here and is silent on success. `add`, `recall`, and
 `feedback` require an existing store and open and reconstruct its complete
@@ -384,7 +391,7 @@ while `add --many` commits all validated input episodes in one save or none of
 them. Feedback also uses one save. Recall does not save. Add output begins only
 after its save commits and is not part of the SQLite transaction; a later
 standard-output failure cannot roll back that commit. Recall can return
-cue-derived hits without relevance edges or a schema migration.
+cue-derived hits without feedback edges or a schema migration.
 
 ## Durability boundary
 

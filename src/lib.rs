@@ -3,7 +3,7 @@
 
 //! Deterministic in-memory kernel for immutable symbolic episode atoms.
 //!
-//! Episode content is immutable; directed relevance is mutable. Cue-derived
+//! Episode content is immutable; directed feedback traces are mutable. Cue-derived
 //! candidates, fixed-point arithmetic, and ordered storage make recall and
 //! feedback reproducible.
 //! Cross-cutting V0 semantics are specified in `docs/v0-contract.md`.
@@ -12,12 +12,12 @@ mod memory;
 mod model;
 mod parameters;
 
-pub use memory::{MemoryV0, RecallHit, RelevanceEdge};
-pub use model::{Activation, InfluenceWeight, ValueError};
+pub use memory::{FeedbackEdge, MemoryV0, RecallHit};
+pub use model::{Activation, FeedbackTrace, ValueError};
 pub use model::{AtomId, MemoryId, PredicateId, SourceId, TermId, TimestampMs};
 pub use model::{EpisodeAtom, EpisodeDraft, Statement};
 pub use model::{GraphError, MemoryError, MemoryIdError, ModelError};
 pub use parameters::{
-    FEEDBACK_MAX_EVENT_PPM, FEEDBACK_TARGET_STEP_PPM, MAX_FEEDBACK_TARGETS, PROPAGATION_GAIN_PPM,
-    SCALE, STRUCTURAL_GAIN_PPM,
+    FEEDBACK_HISTORY_CAPACITY, FEEDBACK_PRIOR_MASS, LEARNED_GAIN_PPM, MAX_FEEDBACK_TARGETS, SCALE,
+    STRUCTURAL_GAIN_PPM,
 };
