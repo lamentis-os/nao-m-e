@@ -11,7 +11,7 @@ pub enum StoreError {
     Database(rusqlite::Error),
     /// Operating-system entropy was unavailable while allocating a memory ID.
     Entropy(getrandom::Error),
-    /// Persisted data did not satisfy the SQLite V3 contract.
+    /// Persisted data did not satisfy the SQLite contract.
     InvalidStore(StoreIntegrityError),
     /// Another store session committed after this session was opened or saved.
     ConcurrentModification {

@@ -212,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_creation_commits_v3_identity_and_closed_shape() {
+    fn schema_creation_commits_current_format_identity_and_closed_shape() {
         let (_directory, mut connection) = open_temporary_database();
         let memory_id = MemoryId::new(7).unwrap();
         configure(&connection);

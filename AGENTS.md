@@ -5,8 +5,8 @@
 These instructions apply to the entire repository. The workspace contains a
 deterministic, in-memory Rust 2024 kernel for symbolic episode memory, an
 optional SQLite snapshot adapter, and a user- and agent-facing command-line
-adapter. Core behavior is defined in `docs/v0-contract.md`; the persistence
-format and lifecycle are defined in `docs/sqlite-v3-contract.md`.
+adapter. Core behavior is defined in `docs/core-contract.md`; the persistence
+format and lifecycle are defined in `docs/sqlite-contract.md`.
 
 ## Source layout
 
@@ -14,10 +14,10 @@ format and lifecycle are defined in `docs/sqlite-v3-contract.md`.
   and errors.
 - `src/memory.rs` owns atom storage, bounded feedback traces, and recall.
 - `src/parameters.rs` owns fixed-point constants.
-- `tests/v0_contract.rs` exercises the public V0 contract.
+- `tests/core_contract.rs` exercises the public core contract.
 - `crates/nao-m-e-sqlite` owns SQLite connection handling, format validation,
   snapshot transactions, and adapter tests.
-- `crates/nao-m-e-cli` owns the strict CLI V3 argument and text-output grammar,
+- `crates/nao-m-e-cli` owns the strict CLI argument and text-output grammar,
   command execution, and cross-process CLI tests.
 
 ## Contract guardrails
@@ -58,8 +58,8 @@ repository-level guardrails when changing the implementation:
 
 - `README.md` is the durable user entry point: purpose, overview, minimal use,
   boundaries, and links.
-- `docs/v0-contract.md` is the single cross-cutting core specification.
-- `docs/sqlite-v3-contract.md` is the single SQLite format and lifecycle
+- `docs/core-contract.md` is the single cross-cutting core specification.
+- `docs/sqlite-contract.md` is the single SQLite format and lifecycle
   specification.
 - Rustdoc describes symbol-local semantics, errors, and non-obvious behavior.
   Public items remain documented under `#![deny(missing_docs)]`.

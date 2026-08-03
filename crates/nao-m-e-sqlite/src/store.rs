@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::path::Path;
 
-use nao_m_e::{AtomId, FeedbackTrace, MemoryId, MemoryV0};
+use nao_m_e::{AtomId, FeedbackTrace, Memory, MemoryId};
 use rusqlite::types::ValueRef;
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, Rows, Transaction, TransactionBehavior,
@@ -17,13 +17,13 @@ use crate::schema;
 /// not write to disk; call [`Self::save`] to atomically persist the changes.
 pub struct SqliteStore {
     connection: Connection,
-    memory: MemoryV0,
+    memory: Memory,
     persisted_episode_count: usize,
     expected_revision: i64,
 }
 
 impl SqliteStore {
-    /// Creates a new empty SQLite V3 store at `path`.
+    /// Creates a new empty SQLite memory store at `path`.
     ///
     /// The operation fails rather than opening or replacing an existing file.
     /// A non-zero memory identifier is generated from operating-system entropy
@@ -39,9 +39,9 @@ impl SqliteStore {
         Self::open(path)
     }
 
-    /// Opens and validates an existing SQLite V3 memory store.
+    /// Opens and validates an existing SQLite memory store.
     ///
-    /// Missing files are not created. Earlier, invalid, and unsupported stores are
+    /// Missing files are not created. Invalid and unsupported stores are
     /// rejected without returning a partial memory.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE;
@@ -68,14 +68,14 @@ impl SqliteStore {
 
     /// Returns the owned memory for read-only operations.
     #[must_use]
-    pub const fn memory(&self) -> &MemoryV0 {
+    pub const fn memory(&self) -> &Memory {
         &self.memory
     }
 
     /// Returns the owned memory for mutations that remain unsaved until
     /// [`Self::save`] succeeds.
     #[must_use]
-    pub const fn memory_mut(&mut self) -> &mut MemoryV0 {
+    pub const fn memory_mut(&mut self) -> &mut Memory {
         &mut self.memory
     }
 
@@ -185,7 +185,7 @@ fn build_initial_database(
     Ok(staging)
 }
 
-fn load_memory(connection: &mut Connection) -> Result<(MemoryV0, usize, i64), StoreError> {
+fn load_memory(connection: &mut Connection) -> Result<(Memory, usize, i64), StoreError> {
     let transaction = connection.transaction()?;
     verify_application_id(&transaction)?;
     let (memory_id, revision) = read_metadata(&transaction)?;
@@ -231,7 +231,7 @@ fn verify_schema(connection: &Connection) -> Result<(), StoreError> {
         Ok(())
     } else {
         Err(StoreIntegrityError::InvalidMetadata {
-            detail: "database schema differs from the SQLite V3 contract",
+            detail: "database schema differs from the SQLite contract",
         }
         .into())
     }
@@ -293,17 +293,14 @@ fn read_metadata(connection: &Connection) -> Result<(MemoryId, i64), StoreError>
     Ok((memory_id, revision))
 }
 
-fn reconstruct_memory(
-    connection: &Connection,
-    memory_id: MemoryId,
-) -> Result<MemoryV0, StoreError> {
+fn reconstruct_memory(connection: &Connection, memory_id: MemoryId) -> Result<Memory, StoreError> {
     let mut statement = connection.prepare(
         "SELECT sequence, payload
          FROM episodes
          ORDER BY sequence",
     )?;
     let mut rows = statement.query([])?;
-    let mut memory = MemoryV0::new(memory_id);
+    let mut memory = Memory::new(memory_id);
     let mut expected_sequence = 0_u64;
 
     while let Some(row) = rows.next()? {
@@ -351,7 +348,7 @@ fn reconstruct_memory(
     Ok(memory)
 }
 
-fn restore_feedback(connection: &Connection, memory: &mut MemoryV0) -> Result<(), StoreError> {
+fn restore_feedback(connection: &Connection, memory: &mut Memory) -> Result<(), StoreError> {
     let mut statement = connection.prepare(
         "SELECT from_sequence, to_sequence, history_bits, sample_count
          FROM feedback_edges
@@ -409,7 +406,7 @@ fn verify_persisted_tail(
 
 fn append_episodes(
     transaction: &Transaction<'_>,
-    memory: &MemoryV0,
+    memory: &Memory,
     start: usize,
 ) -> Result<(), StoreError> {
     let mut insert = transaction.prepare(
@@ -468,7 +465,7 @@ impl FeedbackPlan {
 
 fn reconcile_feedback(
     transaction: &Transaction<'_>,
-    memory: &MemoryV0,
+    memory: &Memory,
     persisted_episode_count: usize,
 ) -> Result<(), StoreError> {
     let mut plan = FeedbackPlan::default();
@@ -599,7 +596,7 @@ fn reconcile_feedback(
     Ok(())
 }
 
-fn memory_feedback_records(memory: &MemoryV0) -> impl Iterator<Item = FeedbackRecord> + '_ {
+fn memory_feedback_records(memory: &Memory) -> impl Iterator<Item = FeedbackRecord> + '_ {
     memory.feedback_edges().map(|edge| FeedbackRecord {
         from: edge.from().sequence(),
         to: edge.to().sequence(),
@@ -758,8 +755,8 @@ mod tests {
     }
 
     #[test]
-    fn metadata_and_earlier_formats_fail_closed_with_specific_errors() {
-        for unsupported in [1, 2] {
+    fn metadata_and_unsupported_formats_fail_closed_with_specific_errors() {
+        for unsupported in [schema::FORMAT_VERSION - 1, schema::FORMAT_VERSION + 1] {
             let directory = tempdir().unwrap();
             let path = saved_store(&directory, 0);
             let raw = Connection::open(&path).unwrap();
@@ -794,7 +791,11 @@ mod tests {
 
     #[test]
     fn rejected_application_and_format_do_not_change_journal_mode() {
-        for unsupported_format in [None, Some(1), Some(2)] {
+        for unsupported_format in [
+            None,
+            Some(schema::FORMAT_VERSION - 1),
+            Some(schema::FORMAT_VERSION + 1),
+        ] {
             let directory = tempdir().unwrap();
             let path = if unsupported_format.is_some() {
                 saved_store(&directory, 0)

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use nao_m_e::{
-    AtomId, EpisodeAtom, EpisodeDraft, MemoryV0, PredicateId, SourceId, Statement, TermId,
+    AtomId, EpisodeAtom, EpisodeDraft, Memory, PredicateId, SourceId, Statement, TermId,
     TimestampMs,
 };
 use nao_m_e_sqlite::SqliteStore;
@@ -527,7 +527,7 @@ fn execute_recall(database: &Path, source_sequence: u64, limit: usize) -> CliRes
     Ok(format_recall(store.memory(), &hits))
 }
 
-fn format_recall(memory: &MemoryV0, hits: &[nao_m_e::RecallHit]) -> Vec<u8> {
+fn format_recall(memory: &Memory, hits: &[nao_m_e::RecallHit]) -> Vec<u8> {
     let mut output = String::new();
     for (index, hit) in hits.iter().enumerate() {
         if index != 0 {

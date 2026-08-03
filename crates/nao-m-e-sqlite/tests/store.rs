@@ -3,8 +3,8 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use nao_m_e::{
-    AtomId, EpisodeAtom, EpisodeDraft, FeedbackEdge, FeedbackTrace, MemoryId, MemoryV0,
-    PredicateId, SourceId, Statement, TermId, TimestampMs,
+    AtomId, EpisodeAtom, EpisodeDraft, FeedbackEdge, FeedbackTrace, Memory, MemoryId, PredicateId,
+    SourceId, Statement, TermId, TimestampMs,
 };
 use nao_m_e_sqlite::{SqliteStore, StoreError};
 use tempfile::{TempDir, tempdir};
@@ -16,7 +16,7 @@ struct MemorySnapshot {
     feedback_edges: Vec<FeedbackEdge>,
 }
 
-fn snapshot(memory: &MemoryV0) -> MemorySnapshot {
+fn snapshot(memory: &Memory) -> MemorySnapshot {
     MemorySnapshot {
         memory_id: memory.memory_id(),
         episodes: memory.episodes().cloned().collect(),

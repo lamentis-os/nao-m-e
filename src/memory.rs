@@ -209,14 +209,14 @@ impl CueIndex {
 /// Each memory ID must name one exclusively written logical memory. Reopening
 /// requires reconstructing its complete atom sequence before appending. Atom
 /// identifiers from another memory are rejected rather than aliased.
-pub struct MemoryV0 {
+pub struct Memory {
     memory_id: MemoryId,
     atoms: Vec<EpisodeAtom>,
     cue_index: OnceLock<CueIndex>,
     outgoing: BTreeMap<usize, BTreeMap<usize, FeedbackTrace>>,
 }
 
-impl MemoryV0 {
+impl Memory {
     /// Creates an empty memory with the caller-owned durable identifier.
     #[must_use]
     pub fn new(memory_id: MemoryId) -> Self {
@@ -514,10 +514,10 @@ impl MemoryV0 {
     }
 }
 
-impl fmt::Debug for MemoryV0 {
+impl fmt::Debug for Memory {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("MemoryV0")
+            .debug_struct("Memory")
             .field("memory_id", &self.memory_id)
             .field("atoms", &self.atoms)
             .field("outgoing", &self.outgoing)

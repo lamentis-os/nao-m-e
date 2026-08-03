@@ -1,13 +1,14 @@
-# SQLite V3 contract
+# SQLite contract
 
 This document defines the durable format and observable lifecycle of the
 `nao-m-e-sqlite` adapter. The state being stored and reconstructed remains the
-state defined by the [V0 core contract](v0-contract.md).
+state defined by the [core contract](core-contract.md). The current persisted
+format version is `3`.
 
 ## Adapter boundary
 
 One SQLite database represents exactly one logical memory. `SqliteStore` owns
-both the database connection and the reconstructed `MemoryV0`. The public API
+both the database connection and the reconstructed `Memory`. The public API
 is:
 
 ```rust
@@ -17,13 +18,13 @@ impl SqliteStore {
     pub fn create(path: impl AsRef<Path>) -> Result<Self, StoreError>;
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError>;
     pub fn memory_id(&self) -> MemoryId;
-    pub fn memory(&self) -> &MemoryV0;
-    pub fn memory_mut(&mut self) -> &mut MemoryV0;
+    pub fn memory(&self) -> &Memory;
+    pub fn memory_mut(&mut self) -> &mut Memory;
     pub fn save(&mut self) -> Result<(), StoreError>;
 }
 ```
 
-Mutating the returned `MemoryV0` changes only process memory. `save()` is the
+Mutating the returned `Memory` changes only process memory. `save()` is the
 only operation that persists those changes. There is no automatic save on
 mutation or drop. A failed save leaves the in-memory state available for a
 retry, while unsaved state is lost when its process ends.
@@ -41,15 +42,15 @@ core rebuilds them and never persists a cue table, posting list, or structural
 recall score.
 
 The adapter does not expose its SQLite connection and does not accept an
-independently constructed `MemoryV0` for saving. Database copies carrying the
+independently constructed `Memory` for saving. Database copies carrying the
 same `MemoryId` must not be modified independently and later merged.
 
 ## Format identity and connection settings
 
 The format uses SQLite application ID `0x4E414F4D` (`NAOM`, decimal
 `1312902989`) and `format_version = 3`. This adapter accepts only that format
-version. Metadata rows containing `format_version = 1` or `2` are rejected
-with `StoreIntegrityError::UnsupportedFormatVersion`, wrapped in
+version. Every other format version is rejected with
+`StoreIntegrityError::UnsupportedFormatVersion`, wrapped in
 `StoreError::InvalidStore`. The adapter has no migrator and never rewrites an
 unsupported store.
 
@@ -66,7 +67,7 @@ ignore_check_constraints = OFF
 
 For an existing file-backed target, the adapter next reads the SQLite header's
 application ID and then the metadata format version. Only after accepting the
-ID as `NAOM` and the format as V3 does it apply and verify the settings that
+ID as `NAOM` and format version `3` does it apply and verify the settings that
 affect persistent journaling behavior:
 
 ```text
@@ -74,7 +75,7 @@ journal_mode = DELETE
 synchronous = EXTRA
 ```
 
-This ordering prevents an attempted open of an unrelated, V1, or V2 SQLite
+This ordering prevents an attempted open of an unrelated or unsupported SQLite
 database from changing its journaling mode. A zero busy timeout means the
 adapter neither waits nor retries on its own; SQLite locking failures remain
 immediately visible to the caller as database errors.
@@ -135,7 +136,7 @@ following outcome statement. All other bits are reserved and must be zero. An
 unset bit means that the corresponding statement is absent; there are no
 separate presence tags. Every statement has at least one argument. The context
 count may be zero. Stored context must already be strictly increasing and
-duplicate-free under the statement order in the V0 core contract. The decoder
+duplicate-free under the statement order in the core contract. The decoder
 does not repair or canonicalize it.
 
 The decoder must consume the payload exactly. Missing bytes, trailing bytes,
@@ -144,10 +145,10 @@ and non-canonical scalar encodings reject the complete store. The format
 version in `memory_meta` versions this codec; an episode payload has no
 independent magic or version field.
 
-One encoded episode must fit SQLite's effective BLOB and row-length limit. V3
-does not split an oversized episode across rows or introduce overflow chunks;
-if SQLite rejects the bound payload, the enclosing save transaction rolls back
-and the unsaved in-memory state remains available to the caller.
+One encoded episode must fit SQLite's effective BLOB and row-length limit. The
+format does not split an oversized episode across rows or introduce overflow
+chunks; if SQLite rejects the bound payload, the enclosing save transaction
+rolls back and the unsaved in-memory state remains available to the caller.
 
 ## Schema
 
@@ -292,13 +293,13 @@ classified as `UnsupportedFormatVersion`. The remaining checks are:
 Rows are consumed in canonical key order. Reconstruction occurs only in local
 state:
 
-1. Create a `MemoryV0` with the stored `MemoryId`.
+1. Create a `Memory` with the stored `MemoryId`.
 2. Decode and insert episodes in sequence order, checking every returned
    `AtomId`.
 3. Install feedback traces in source and target order through the core API.
 
 Any storage-level or core rejection invalidates the complete snapshot. The
-adapter does not expose the reconstructed `MemoryV0` until all rows and all
+adapter does not expose the reconstructed `Memory` until all rows and all
 invariants have been validated. A late feedback error therefore discards the
 local reconstruction rather than returning a partial memory. If a snapshot
 contains multiple independent violations, which violation is reported first is
@@ -313,7 +314,7 @@ episode count. `save()` starts `BEGIN IMMEDIATE` and performs one transaction:
    schema. An added persistent trigger, view, table, or index rejects the save
    before state changes.
 2. Read the persisted memory ID and current revision. A memory ID different
-   from the owned `MemoryV0` is invalid metadata. A changed revision is a stale
+   from the owned `Memory` is invalid metadata. A changed revision is a stale
    writer and fails with `StoreError::ConcurrentModification`.
 3. Reject `i64::MAX` with `StoreError::RevisionExhausted`.
 4. Read the greatest stored episode sequence and compare it with the remembered
@@ -381,7 +382,7 @@ is not a supported API.
 
 ## CLI boundary
 
-CLI V3 is an argument and text-output contract independent of SQLite
+The CLI is an argument and text-output contract independent of SQLite
 `format_version = 3`. Changing the CLI syntax does not implicitly change,
 accept, or migrate the persisted format. `init` creates an empty database in
 the format defined here and is silent on success. `add`, `recall`, and
