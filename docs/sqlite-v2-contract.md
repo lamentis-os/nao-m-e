@@ -35,6 +35,11 @@ receipt, history, count, provenance record, or idempotency key. Reapplying the
 same feedback after a successful save is a new mutation and can change
 relevance again.
 
+The core's cue postings and per-episode cue-weight totals are derived in-memory
+data, not snapshot state. SQLite stores only the episode content from which the
+core rebuilds them and never persists a cue table, posting list, or structural
+recall score.
+
 The adapter does not expose its SQLite connection and does not accept an
 independently constructed `MemoryV0` for saving. Database copies carrying the
 same `MemoryId` must not be modified independently and later merged.
@@ -210,7 +215,8 @@ definitions, and this singleton row are committed together or not at all.
 Episode rows are append-only and their sequences form the exact prefix
 `0..N-1`. The payload holds the complete immutable episode associated with its
 sequence. There are no statement or term tables and no content dictionaries or
-content deduplication.
+content deduplication. There is likewise no persistent cue index; cue postings
+are reconstructed by the core from these canonical episode payloads.
 
 Relevance is sparse and stores only positive edges. The schema rejects invalid
 storage classes, lengths, ranges, duplicate keys, self-edges, and missing
@@ -285,6 +291,11 @@ state:
 2. Decode and insert episodes in sequence order, checking every returned
    `AtomId`.
 3. Install relevance edges in source and target order through the core API.
+
+The derived cue index may remain uninitialized after reconstruction. The first
+successful recall with a positive limit builds it from the complete canonical
+atom sequence, even if it finds no hits; later inserts in the same process
+update an already initialized index.
 
 Any storage-level or core rejection invalidates the complete snapshot. The
 adapter does not expose the reconstructed `MemoryV0` until all rows and all
@@ -378,7 +389,9 @@ snapshot before executing. Singular `add` commits one episode in one save,
 while `add --many` commits all validated input episodes in one save or none of
 them. Feedback also uses one save. Recall does not save. Add output begins only
 after its save commits and is not part of the SQLite transaction; a later
-standard-output failure cannot roll back that commit.
+standard-output failure cannot roll back that commit. A newly opened store can
+therefore return cue-derived recall hits without relevance edges or a schema
+migration because the core derives the index on that first recall.
 
 ## Durability boundary
 

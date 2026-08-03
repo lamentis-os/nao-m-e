@@ -28,7 +28,7 @@ Usage:
 Commands:
   init      Create a new SQLite memory store without replacing an existing file
   add       Append one episode, or atomic line-delimited episodes with --many
-  recall    Return direct source-conditioned episodes without changing state
+  recall    Rank cue-derived and learned source-conditioned episodes read-only
   feedback  Learn from one explicit helpful or unhelpful target set
 
 Options:
@@ -58,14 +58,15 @@ episode. The command saves all rows once or saves none. Successful add writes
 the assigned sequence per episode unless --quiet is present.
 ";
 
-const RECALL_HELP: &str = "Return direct source-conditioned episodes without changing state.
+const RECALL_HELP: &str = "Rank source-conditioned episodes without changing state.
 
 Usage:
   nao-m-e recall <DATABASE> --from <SEQUENCE>
   nao-m-e recall <DATABASE> --from <SEQUENCE> --limit <N>
 
-The default recall limit is 10. Hits are separated by one blank line. No hits
-produce no standard output.
+Symbolic cue overlap provides cold candidates. Direct learned relevance can add
+candidates and boost their score. The default recall limit is 10. Hits are
+separated by one blank line. No hits produce no standard output.
 ";
 
 const FEEDBACK_HELP: &str = "Learn from one explicit binary assessment and save atomically.
