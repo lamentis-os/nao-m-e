@@ -1,35 +1,35 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
-use std::io::{self, BufReader, Write as IoWrite};
+use std::fmt::Write as FmtWrite;
+use std::io::{self, BufRead, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use nao_m_e::{
-    AtomId, EpisodeAtom, EpisodeDraft, InfluenceWeight, MAX_FEEDBACK_TARGETS, MemoryId, MemoryV0,
-    PredicateId, SourceId, Statement, TermId, TimestampMs,
+    AtomId, EpisodeAtom, EpisodeDraft, MemoryV0, PredicateId, SourceId, Statement, TermId,
+    TimestampMs,
 };
 use nao_m_e_sqlite::SqliteStore;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
-const CLI_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_RECALL_LIMIT: usize = 10;
 
 const ROOT_HELP: &str = "NAO-M-E symbolic memory command-line interface
 
 Usage:
   nao-m-e init <DATABASE>
-  nao-m-e run <DATABASE> --input <FILE|->
-  nao-m-e recall <DATABASE> --from-sequence <N> [--limit <N>]
+  nao-m-e add <DATABASE> [--quiet] --occurred <MS> --recorded <MS> --source <ID> --predicate <ID> --terms <ID,...> [EPISODE OPTIONS]
+  nao-m-e add <DATABASE> --many [--quiet]
+  nao-m-e recall <DATABASE> --from <SEQUENCE> [--limit <N>]
+  nao-m-e feedback <DATABASE> --from <SEQUENCE> --helpful <SEQUENCE,...>
+  nao-m-e feedback <DATABASE> --from <SEQUENCE> --unhelpful <SEQUENCE,...>
 
 Commands:
   init      Create a new SQLite memory store without replacing an existing file
-  run       Apply one JSON operation batch and save it atomically
+  add       Append one episode, or atomic line-delimited episodes with --many
   recall    Return direct source-conditioned episodes without changing state
+  feedback  Learn from one explicit helpful or unhelpful target set
 
 Options:
   -h, --help     Show help
@@ -42,21 +42,40 @@ Usage:
   nao-m-e init <DATABASE>
 ";
 
-const RUN_HELP: &str = "Apply a versioned JSON operation batch and save it atomically.
+const ADD_HELP: &str = "Append symbolic episodes and save atomically.
 
 Usage:
-  nao-m-e run <DATABASE> --input <FILE|->
+  nao-m-e add <DATABASE> [--quiet] --occurred <MS> --recorded <MS> --source <ID> --predicate <ID> --terms <ID,...> [EPISODE OPTIONS]
+  nao-m-e add <DATABASE> --many [--quiet]
 
-Use '-' as the input path to read JSON from standard input.
+Episode options:
+  --context <PREDICATE:TERM,...>   Add one context statement; repeatable
+  --action <PREDICATE:TERM,...>    Set the optional action statement
+  --outcome <PREDICATE:TERM,...>   Set the optional outcome statement
+
+With --many, standard input contains one non-empty single-episode flag row per
+episode. The command saves all rows once or saves none. Successful add writes
+the assigned sequence per episode unless --quiet is present.
 ";
 
 const RECALL_HELP: &str = "Return direct source-conditioned episodes without changing state.
 
 Usage:
-  nao-m-e recall <DATABASE> --from-sequence <N>
-  nao-m-e recall <DATABASE> --from-sequence <N> --limit <N>
+  nao-m-e recall <DATABASE> --from <SEQUENCE>
+  nao-m-e recall <DATABASE> --from <SEQUENCE> --limit <N>
 
-The default recall limit is 10.
+The default recall limit is 10. Hits are separated by one blank line. No hits
+produce no standard output.
+";
+
+const FEEDBACK_HELP: &str = "Learn from one explicit binary assessment and save atomically.
+
+Usage:
+  nao-m-e feedback <DATABASE> --from <SEQUENCE> --helpful <SEQUENCE,...>
+  nao-m-e feedback <DATABASE> --from <SEQUENCE> --unhelpful <SEQUENCE,...>
+
+Every listed target receives the same assessment. Successful feedback produces
+no standard output.
 ";
 
 fn main() -> ExitCode {
@@ -93,14 +112,25 @@ enum Command {
     Init {
         database: PathBuf,
     },
-    Run {
+    Add {
         database: PathBuf,
-        input: PathBuf,
+        draft: EpisodeDraft,
+        quiet: bool,
+    },
+    AddMany {
+        database: PathBuf,
+        quiet: bool,
     },
     Recall {
         database: PathBuf,
         source_sequence: u64,
         limit: usize,
+    },
+    Feedback {
+        database: PathBuf,
+        source_sequence: u64,
+        target_sequences: Vec<u64>,
+        helpful: bool,
     },
 }
 
@@ -116,8 +146,9 @@ fn parse_args(args: Vec<OsString>) -> Result<ParsedArgs, String> {
             env!("CARGO_PKG_VERSION")
         ))),
         "init" => parse_init_args(&args[1..]),
-        "run" => parse_run_args(&args[1..]),
+        "add" => parse_add_args(&args[1..]),
         "recall" => parse_recall_args(&args[1..]),
+        "feedback" => parse_feedback_args(&args[1..]),
         _ => Err(format!("unknown command or option `{command}`")),
     }
 }
@@ -135,18 +166,191 @@ fn parse_init_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     }))
 }
 
-fn parse_run_args(args: &[OsString]) -> Result<ParsedArgs, String> {
+fn parse_add_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     if is_help_request(args) {
-        return Ok(ParsedArgs::Print(RUN_HELP.to_owned()));
+        return Ok(ParsedArgs::Print(ADD_HELP.to_owned()));
     }
-    if args.len() != 3 || args[1].as_os_str() != OsStr::new("--input") {
-        return Err("`run` requires <DATABASE> --input <FILE|->".to_owned());
+    let Some(database) = args.first() else {
+        return Err("`add` requires a database path and episode flags".to_owned());
+    };
+    let options = &args[1..];
+    let many_count = options
+        .iter()
+        .filter(|value| value.as_os_str() == OsStr::new("--many"))
+        .count();
+
+    if many_count != 0 {
+        if many_count != 1 {
+            return Err("`--many` may be specified only once".to_owned());
+        }
+        let quiet = parse_mode_options(options, "--many")?;
+        return Ok(ParsedArgs::Execute(Command::AddMany {
+            database: PathBuf::from(database),
+            quiet,
+        }));
     }
 
-    Ok(ParsedArgs::Execute(Command::Run {
-        database: PathBuf::from(&args[0]),
-        input: PathBuf::from(&args[2]),
+    let (episode_options, quiet) = strip_quiet(options)?;
+    let draft = parse_episode_flags(&episode_options)?;
+    Ok(ParsedArgs::Execute(Command::Add {
+        database: PathBuf::from(database),
+        draft,
+        quiet,
     }))
+}
+
+fn parse_mode_options(options: &[OsString], required: &str) -> Result<bool, String> {
+    let mut quiet = false;
+    for option in options {
+        match option.to_str() {
+            Some(value) if value == required => {}
+            Some("--quiet") if !quiet => quiet = true,
+            Some("--quiet") => return Err("`--quiet` may be specified only once".to_owned()),
+            Some(value) => {
+                return Err(format!(
+                    "`{required}` cannot be combined with episode option `{value}`"
+                ));
+            }
+            None => return Err("add options must be valid UTF-8".to_owned()),
+        }
+    }
+    Ok(quiet)
+}
+
+fn strip_quiet(options: &[OsString]) -> Result<(Vec<OsString>, bool), String> {
+    let mut episode_options = Vec::with_capacity(options.len());
+    let mut quiet = false;
+    for option in options {
+        if option.as_os_str() == OsStr::new("--quiet") {
+            if quiet {
+                return Err("`--quiet` may be specified only once".to_owned());
+            }
+            quiet = true;
+        } else {
+            episode_options.push(option.clone());
+        }
+    }
+    Ok((episode_options, quiet))
+}
+
+fn parse_episode_flags(args: &[OsString]) -> CliResult<EpisodeDraft> {
+    let mut occurred_at = None;
+    let mut recorded_at = None;
+    let mut source = None;
+    let mut predicate = None;
+    let mut terms = None;
+    let mut context = Vec::new();
+    let mut action = None;
+    let mut outcome = None;
+    let mut cursor = 0;
+
+    while cursor < args.len() {
+        let option = args[cursor]
+            .to_str()
+            .ok_or_else(|| "episode options must be valid UTF-8".to_owned())?;
+        cursor += 1;
+        let value = args
+            .get(cursor)
+            .ok_or_else(|| format!("`{option}` requires a value"))?;
+        cursor += 1;
+
+        match option {
+            "--occurred" => set_once(
+                &mut occurred_at,
+                TimestampMs::new(parse_number(value, "occurred timestamp")?),
+                option,
+            )?,
+            "--recorded" => set_once(
+                &mut recorded_at,
+                TimestampMs::new(parse_number(value, "recorded timestamp")?),
+                option,
+            )?,
+            "--source" => set_once(
+                &mut source,
+                SourceId::new(parse_number(value, "source ID")?),
+                option,
+            )?,
+            "--predicate" => set_once(
+                &mut predicate,
+                PredicateId::new(parse_number(value, "predicate ID")?),
+                option,
+            )?,
+            "--terms" => set_once(&mut terms, parse_terms(value, "observation terms")?, option)?,
+            "--context" => context.push(parse_statement(value, "context statement")?),
+            "--action" => set_once(
+                &mut action,
+                parse_statement(value, "action statement")?,
+                option,
+            )?,
+            "--outcome" => set_once(
+                &mut outcome,
+                parse_statement(value, "outcome statement")?,
+                option,
+            )?,
+            _ => return Err(format!("unknown episode option `{option}`")),
+        }
+    }
+
+    let occurred_at = occurred_at.ok_or_else(|| "episode requires `--occurred`".to_owned())?;
+    let recorded_at = recorded_at.ok_or_else(|| "episode requires `--recorded`".to_owned())?;
+    let source = source.ok_or_else(|| "episode requires `--source`".to_owned())?;
+    let predicate = predicate.ok_or_else(|| "episode requires `--predicate`".to_owned())?;
+    let terms = terms.ok_or_else(|| "episode requires `--terms`".to_owned())?;
+    let observation = Statement::new(predicate, terms).map_err(|error| error.to_string())?;
+
+    Ok(EpisodeDraft {
+        occurred_at,
+        recorded_at,
+        context,
+        observation,
+        action,
+        outcome,
+        source,
+    })
+}
+
+fn set_once<T>(slot: &mut Option<T>, value: T, option: &str) -> CliResult<()> {
+    if slot.replace(value).is_some() {
+        return Err(format!("`{option}` may be specified only once"));
+    }
+    Ok(())
+}
+
+fn parse_statement(value: &OsStr, description: &str) -> CliResult<Statement> {
+    let value = value
+        .to_str()
+        .ok_or_else(|| format!("{description} must be valid UTF-8"))?;
+    let (predicate, terms) = value
+        .split_once(':')
+        .ok_or_else(|| format!("invalid {description}; expected PREDICATE:TERM,..."))?;
+    let predicate = predicate
+        .parse()
+        .map(PredicateId::new)
+        .map_err(|_| format!("invalid {description} predicate"))?;
+    let terms = parse_term_text(terms, description)?;
+    Statement::new(predicate, terms).map_err(|error| format!("invalid {description}: {error}"))
+}
+
+fn parse_terms(value: &OsStr, description: &str) -> CliResult<Vec<TermId>> {
+    let value = value
+        .to_str()
+        .ok_or_else(|| format!("{description} must be valid UTF-8"))?;
+    parse_term_text(value, description)
+}
+
+fn parse_term_text(value: &str, description: &str) -> CliResult<Vec<TermId>> {
+    if value.is_empty() {
+        return Err(format!("{description} must not be empty"));
+    }
+    value
+        .split(',')
+        .enumerate()
+        .map(|(index, term)| {
+            term.parse()
+                .map(TermId::new)
+                .map_err(|_| format!("invalid {description} term at index {index}"))
+        })
+        .collect()
 }
 
 fn parse_recall_args(args: &[OsString]) -> Result<ParsedArgs, String> {
@@ -158,12 +362,12 @@ fn parse_recall_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     };
 
     let (source_sequence, limit) = match &args[1..] {
-        [option, source] if option.as_os_str() == OsStr::new("--from-sequence") => (
+        [option, source] if option.as_os_str() == OsStr::new("--from") => (
             parse_number(source, "source sequence")?,
             DEFAULT_RECALL_LIMIT,
         ),
         [source_option, source, limit_option, limit]
-            if source_option.as_os_str() == OsStr::new("--from-sequence")
+            if source_option.as_os_str() == OsStr::new("--from")
                 && limit_option.as_os_str() == OsStr::new("--limit") =>
         {
             (
@@ -172,9 +376,7 @@ fn parse_recall_args(args: &[OsString]) -> Result<ParsedArgs, String> {
             )
         }
         _ => {
-            return Err(
-                "`recall` requires <DATABASE> --from-sequence <N> [--limit <N>]".to_owned(),
-            );
+            return Err("`recall` requires <DATABASE> --from <SEQUENCE> [--limit <N>]".to_owned());
         }
     };
 
@@ -183,6 +385,51 @@ fn parse_recall_args(args: &[OsString]) -> Result<ParsedArgs, String> {
         source_sequence,
         limit,
     }))
+}
+
+fn parse_feedback_args(args: &[OsString]) -> Result<ParsedArgs, String> {
+    if is_help_request(args) {
+        return Ok(ParsedArgs::Print(FEEDBACK_HELP.to_owned()));
+    }
+    let [database, source_option, source, assessment, targets] = args else {
+        return Err(
+            "`feedback` requires <DATABASE> --from <SEQUENCE> (--helpful|--unhelpful) <SEQUENCE,...>"
+                .to_owned(),
+        );
+    };
+    if source_option.as_os_str() != OsStr::new("--from") {
+        return Err("`feedback` source must use `--from <SEQUENCE>`".to_owned());
+    }
+    let helpful = match assessment.to_str() {
+        Some("--helpful") => true,
+        Some("--unhelpful") => false,
+        _ => return Err("feedback assessment must be `--helpful` or `--unhelpful`".to_owned()),
+    };
+
+    Ok(ParsedArgs::Execute(Command::Feedback {
+        database: PathBuf::from(database),
+        source_sequence: parse_number(source, "source sequence")?,
+        target_sequences: parse_sequence_list(targets)?,
+        helpful,
+    }))
+}
+
+fn parse_sequence_list(value: &OsStr) -> CliResult<Vec<u64>> {
+    let value = value
+        .to_str()
+        .ok_or_else(|| "feedback targets must be valid UTF-8".to_owned())?;
+    if value.is_empty() {
+        return Err("feedback targets must not be empty".to_owned());
+    }
+    value
+        .split(',')
+        .enumerate()
+        .map(|(index, sequence)| {
+            sequence
+                .parse()
+                .map_err(|_| format!("invalid feedback target sequence at index {index}"))
+        })
+        .collect()
 }
 
 fn is_help_request(args: &[OsString]) -> bool {
@@ -203,85 +450,83 @@ where
 fn execute(command: Command) -> CliResult<Vec<u8>> {
     match command {
         Command::Init { database } => execute_init(&database),
-        Command::Run { database, input } => execute_run(&database, &input),
+        Command::Add {
+            database,
+            draft,
+            quiet,
+        } => execute_add(&database, vec![draft], quiet),
+        Command::AddMany { database, quiet } => {
+            let drafts = read_many_drafts()?;
+            execute_add(&database, drafts, quiet)
+        }
         Command::Recall {
             database,
             source_sequence,
             limit,
         } => execute_recall(&database, source_sequence, limit),
+        Command::Feedback {
+            database,
+            source_sequence,
+            target_sequences,
+            helpful,
+        } => execute_feedback(&database, source_sequence, &target_sequences, helpful),
     }
 }
 
 fn execute_init(database: &Path) -> CliResult<Vec<u8>> {
-    let store = SqliteStore::create(database)
+    SqliteStore::create(database)
         .map_err(|error| format!("could not create `{}`: {error}", database.display()))?;
-    let response = InitResponse {
-        schema_version: CLI_SCHEMA_VERSION,
-        memory_id: encode_memory_id(store.memory_id()),
-        episode_count: 0,
-    };
-    serialize_response(&response)
+    Ok(Vec::new())
 }
 
-fn execute_run(database: &Path, input: &Path) -> CliResult<Vec<u8>> {
-    let scenario = read_scenario(input)?;
-    if scenario.schema_version != CLI_SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported scenario schema_version {}; expected {CLI_SCHEMA_VERSION}",
-            scenario.schema_version
-        ));
+fn read_many_drafts() -> CliResult<Vec<EpisodeDraft>> {
+    let mut drafts = Vec::new();
+    for (index, line) in io::stdin().lock().lines().enumerate() {
+        let line_number = index + 1;
+        let line =
+            line.map_err(|error| format!("could not read add --many line {line_number}: {error}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let arguments = line
+            .split_ascii_whitespace()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        let draft = parse_episode_flags(&arguments)
+            .map_err(|error| format!("add --many line {line_number}: {error}"))?;
+        drafts.push(draft);
     }
-    if scenario.operations.is_empty() {
-        return Err("scenario operations must not be empty".to_owned());
+    if drafts.is_empty() {
+        return Err("add --many requires at least one non-empty input line".to_owned());
     }
+    Ok(drafts)
+}
 
-    let operations = scenario
-        .operations
-        .into_iter()
-        .enumerate()
-        .map(|(index, operation)| {
-            serde_json::from_value(operation)
-                .map_err(|error| format!("operations[{index}] is invalid: {error}"))
-        })
-        .collect::<CliResult<Vec<OperationInput>>>()?;
-    let operation_count = operations.len();
+fn execute_add(database: &Path, drafts: Vec<EpisodeDraft>, quiet: bool) -> CliResult<Vec<u8>> {
     let mut store = SqliteStore::open(database)
         .map_err(|error| format!("could not open `{}`: {error}", database.display()))?;
-    let baseline_episode_count = store.memory().episodes().len();
-    let mut labels = BTreeMap::new();
-    let mut inserted = Vec::new();
-
-    for (index, operation) in operations.into_iter().enumerate() {
-        let name = operation.name();
-        if let Err(error) = apply_operation(
-            operation,
-            store.memory_mut(),
-            baseline_episode_count,
-            &mut labels,
-            &mut inserted,
-        ) {
-            return Err(format!("operations[{index}] ({name}) failed: {error}"));
-        }
+    let mut sequences = Vec::with_capacity(drafts.len());
+    for draft in drafts {
+        let atom_id = store
+            .memory_mut()
+            .insert_episode(draft)
+            .map_err(|error| error.to_string())?;
+        sequences.push(atom_id.sequence());
     }
-
-    let response = RunResponse {
-        schema_version: CLI_SCHEMA_VERSION,
-        memory_id: encode_memory_id(store.memory_id()),
-        operations_applied: u64::try_from(operation_count)
-            .map_err(|_| "operation count exceeds the JSON protocol range".to_owned())?,
-        episode_count: u64::try_from(store.memory().episodes().len())
-            .map_err(|_| "episode count exceeds the JSON protocol range".to_owned())?,
-        inserted,
-    };
-    let output = serialize_response(&response)?;
-
-    store.save().map_err(|error| {
-        format!(
-            "could not save `{}`: {error}; the batch was not committed",
-            database.display()
-        )
-    })?;
+    let output = format_sequences(&sequences, quiet);
+    save(&mut store, database)?;
     Ok(output)
+}
+
+fn format_sequences(sequences: &[u64], quiet: bool) -> Vec<u8> {
+    if quiet {
+        return Vec::new();
+    }
+    let mut output = String::with_capacity(sequences.len().saturating_mul(21));
+    for sequence in sequences {
+        writeln!(output, "{sequence}").expect("writing to a String cannot fail");
+    }
+    output.into_bytes()
 }
 
 fn execute_recall(database: &Path, source_sequence: u64, limit: usize) -> CliResult<Vec<u8>> {
@@ -291,350 +536,111 @@ fn execute_recall(database: &Path, source_sequence: u64, limit: usize) -> CliRes
     let hits = store
         .memory()
         .recall_from(source, limit)
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .map(|hit| {
-            let episode = store
-                .memory()
-                .episode(hit.atom_id)
-                .expect("recall hits always reference stored episodes");
-            RecallEpisode::from_atom(episode, hit.activation.as_ppm())
-        })
-        .collect();
-    serialize_response(&RecallResponse {
-        schema_version: CLI_SCHEMA_VERSION,
-        memory_id: encode_memory_id(store.memory_id()),
-        hits,
+        .map_err(|error| error.to_string())?;
+    Ok(format_recall(store.memory(), &hits))
+}
+
+fn format_recall(memory: &MemoryV0, hits: &[nao_m_e::RecallHit]) -> Vec<u8> {
+    let mut output = String::new();
+    for (index, hit) in hits.iter().enumerate() {
+        if index != 0 {
+            output.push('\n');
+        }
+        let episode = memory
+            .episode(hit.atom_id)
+            .expect("recall hits always reference stored episodes");
+        write_recall_hit(&mut output, episode, hit.activation.as_ppm());
+    }
+    output.into_bytes()
+}
+
+fn write_recall_hit(output: &mut String, episode: &EpisodeAtom, activation_ppm: u32) {
+    writeln!(output, "sequence {}", episode.id().sequence())
+        .expect("writing to a String cannot fail");
+    writeln!(output, "activation_ppm {activation_ppm}").expect("writing to a String cannot fail");
+    writeln!(output, "occurred {}", episode.occurred_at().get())
+        .expect("writing to a String cannot fail");
+    writeln!(output, "recorded {}", episode.recorded_at().get())
+        .expect("writing to a String cannot fail");
+    writeln!(output, "source {}", episode.source().get()).expect("writing to a String cannot fail");
+    for statement in episode.context() {
+        write_statement_line(output, "context", statement);
+    }
+    writeln!(
+        output,
+        "predicate {}",
+        episode.observation().predicate().get()
+    )
+    .expect("writing to a String cannot fail");
+    write_terms_line(output, "terms", episode.observation().arguments());
+    if let Some(action) = episode.action() {
+        write_statement_line(output, "action", action);
+    }
+    if let Some(outcome) = episode.outcome() {
+        write_statement_line(output, "outcome", outcome);
+    }
+}
+
+fn write_statement_line(output: &mut String, name: &str, statement: &Statement) {
+    write!(output, "{name} {}:", statement.predicate().get())
+        .expect("writing to a String cannot fail");
+    write_term_values(output, statement.arguments());
+    output.push('\n');
+}
+
+fn write_terms_line(output: &mut String, name: &str, terms: &[TermId]) {
+    write!(output, "{name} ").expect("writing to a String cannot fail");
+    write_term_values(output, terms);
+    output.push('\n');
+}
+
+fn write_term_values(output: &mut String, terms: &[TermId]) {
+    for (index, term) in terms.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        write!(output, "{}", term.get()).expect("writing to a String cannot fail");
+    }
+}
+
+fn execute_feedback(
+    database: &Path,
+    source_sequence: u64,
+    target_sequences: &[u64],
+    helpful: bool,
+) -> CliResult<Vec<u8>> {
+    let mut store = SqliteStore::open(database)
+        .map_err(|error| format!("could not open `{}`: {error}", database.display()))?;
+    let memory_id = store.memory_id();
+    let source = AtomId::from_parts(memory_id, source_sequence);
+    let targets = target_sequences
+        .iter()
+        .map(|&sequence| AtomId::from_parts(memory_id, sequence))
+        .collect::<Vec<_>>();
+    store
+        .memory_mut()
+        .apply_feedback(source, &targets, helpful)
+        .map_err(|error| error.to_string())?;
+    save(&mut store, database)?;
+    Ok(Vec::new())
+}
+
+fn save(store: &mut SqliteStore, database: &Path) -> CliResult<()> {
+    store.save().map_err(|error| {
+        format!(
+            "could not save `{}`: {error}; the operation was not committed",
+            database.display()
+        )
     })
 }
 
-fn read_scenario(input: &Path) -> CliResult<ScenarioInput> {
-    if input.as_os_str() == OsStr::new("-") {
-        serde_json::from_reader(io::stdin().lock())
-            .map_err(|error| format!("invalid scenario JSON from stdin: {error}"))
-    } else {
-        let file = File::open(input)
-            .map_err(|error| format!("could not read `{}`: {error}", input.display()))?;
-        serde_json::from_reader(BufReader::new(file))
-            .map_err(|error| format!("invalid scenario JSON in `{}`: {error}", input.display()))
-    }
-}
-
-fn apply_operation(
-    operation: OperationInput,
-    memory: &mut MemoryV0,
-    baseline_episode_count: usize,
-    labels: &mut BTreeMap<String, AtomId>,
-    inserted: &mut Vec<InsertedEpisode>,
-) -> CliResult<()> {
-    match operation {
-        OperationInput::InsertEpisode { label, episode } => {
-            if let Some(label) = label.as_deref() {
-                if label.is_empty() {
-                    return Err("insert label must not be empty".to_owned());
-                }
-                if labels.contains_key(label) {
-                    return Err(format!("insert label `{label}` is already defined"));
-                }
-            }
-
-            let draft = episode.into_draft()?;
-            let id = memory
-                .insert_episode(draft)
-                .map_err(|error| error.to_string())?;
-            if let Some(label) = label.as_ref() {
-                labels.insert(label.clone(), id);
-            }
-            inserted.push(InsertedEpisode {
-                label,
-                sequence: id.sequence(),
-            });
-        }
-        OperationInput::SetRelevance {
-            from,
-            to,
-            weight_ppm,
-        } => {
-            let from = resolve_atom(from, memory, baseline_episode_count, labels)?;
-            let to = resolve_atom(to, memory, baseline_episode_count, labels)?;
-            let weight =
-                InfluenceWeight::from_ppm(weight_ppm).map_err(|error| error.to_string())?;
-            memory
-                .set_relevance(from, to, weight)
-                .map_err(|error| error.to_string())?;
-        }
-        OperationInput::RemoveRelevance { from, to } => {
-            let from = resolve_atom(from, memory, baseline_episode_count, labels)?;
-            let to = resolve_atom(to, memory, baseline_episode_count, labels)?;
-            memory
-                .remove_relevance(from, to)
-                .map_err(|error| error.to_string())?;
-        }
-        OperationInput::ApplyFeedback {
-            source,
-            targets,
-            feedback,
-        } => {
-            let helpful = match feedback {
-                0 => false,
-                1 => true,
-                _ => return Err("feedback must be 0 or 1".to_owned()),
-            };
-            let source = resolve_atom(source, memory, baseline_episode_count, labels)?;
-            if targets.len() > MAX_FEEDBACK_TARGETS {
-                return Err(format!(
-                    "feedback target count {} exceeds {MAX_FEEDBACK_TARGETS}",
-                    targets.len()
-                ));
-            }
-            let targets = targets
-                .into_iter()
-                .map(|target| resolve_atom(target, memory, baseline_episode_count, labels))
-                .collect::<CliResult<Vec<_>>>()?;
-            memory
-                .apply_feedback(source, &targets, helpful)
-                .map_err(|error| error.to_string())?;
-        }
-    }
-    Ok(())
-}
-
-fn resolve_atom(
-    reference: AtomReferenceInput,
-    memory: &MemoryV0,
-    baseline_episode_count: usize,
-    labels: &BTreeMap<String, AtomId>,
-) -> CliResult<AtomId> {
-    match reference {
-        AtomReferenceInput::Sequence { sequence } => {
-            let index = usize::try_from(sequence)
-                .map_err(|_| format!("episode sequence {sequence} is not addressable"))?;
-            if index >= baseline_episode_count {
-                return Err(format!(
-                    "episode sequence {sequence} was not persisted before this batch; use an insert label"
-                ));
-            }
-            Ok(AtomId::from_parts(memory.memory_id(), sequence))
-        }
-        AtomReferenceInput::Label { label } => {
-            if label.is_empty() {
-                return Err("atom label must not be empty".to_owned());
-            }
-            labels
-                .get(&label)
-                .copied()
-                .ok_or_else(|| format!("unknown or forward label `{label}`"))
-        }
-    }
-}
-
-fn serialize_response<T: Serialize>(response: &T) -> CliResult<Vec<u8>> {
-    let mut output = serde_json::to_vec_pretty(response)
-        .map_err(|error| format!("could not serialize JSON output: {error}"))?;
-    output.push(b'\n');
-    Ok(output)
-}
-
 fn write_stdout(output: Vec<u8>) -> CliResult<()> {
+    if output.is_empty() {
+        return Ok(());
+    }
     let mut stdout = io::stdout().lock();
     stdout
         .write_all(&output)
         .and_then(|()| stdout.flush())
         .map_err(|error| format!("could not write standard output: {error}"))
-}
-
-fn encode_memory_id(memory_id: MemoryId) -> String {
-    format!("{:032x}", memory_id.get())
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ScenarioInput {
-    schema_version: u32,
-    operations: Vec<Value>,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-enum OperationInput {
-    InsertEpisode {
-        #[serde(default)]
-        label: Option<String>,
-        episode: EpisodeDocument,
-    },
-    SetRelevance {
-        from: AtomReferenceInput,
-        to: AtomReferenceInput,
-        weight_ppm: u32,
-    },
-    RemoveRelevance {
-        from: AtomReferenceInput,
-        to: AtomReferenceInput,
-    },
-    ApplyFeedback {
-        source: AtomReferenceInput,
-        targets: Vec<AtomReferenceInput>,
-        feedback: u8,
-    },
-}
-
-impl OperationInput {
-    const fn name(&self) -> &'static str {
-        match self {
-            Self::InsertEpisode { .. } => "insert_episode",
-            Self::SetRelevance { .. } => "set_relevance",
-            Self::RemoveRelevance { .. } => "remove_relevance",
-            Self::ApplyFeedback { .. } => "apply_feedback",
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(untagged, deny_unknown_fields)]
-enum AtomReferenceInput {
-    Sequence { sequence: u64 },
-    Label { label: String },
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct EpisodeDocument {
-    occurred_at_ms: i64,
-    recorded_at_ms: i64,
-    source_id: u64,
-    #[serde(default)]
-    context: Vec<StatementDocument>,
-    observation: StatementDocument,
-    #[serde(default)]
-    action: Option<StatementDocument>,
-    #[serde(default)]
-    outcome: Option<StatementDocument>,
-}
-
-impl EpisodeDocument {
-    fn into_draft(self) -> CliResult<EpisodeDraft> {
-        let context = self
-            .context
-            .into_iter()
-            .enumerate()
-            .map(|(index, statement)| {
-                statement
-                    .into_statement()
-                    .map_err(|error| format!("context[{index}]: {error}"))
-            })
-            .collect::<CliResult<Vec<_>>>()?;
-        let observation = self
-            .observation
-            .into_statement()
-            .map_err(|error| format!("observation: {error}"))?;
-        let action = self
-            .action
-            .map(StatementDocument::into_statement)
-            .transpose()
-            .map_err(|error| format!("action: {error}"))?;
-        let outcome = self
-            .outcome
-            .map(StatementDocument::into_statement)
-            .transpose()
-            .map_err(|error| format!("outcome: {error}"))?;
-
-        Ok(EpisodeDraft {
-            occurred_at: TimestampMs::new(self.occurred_at_ms),
-            recorded_at: TimestampMs::new(self.recorded_at_ms),
-            context,
-            observation,
-            action,
-            outcome,
-            source: SourceId::new(self.source_id),
-        })
-    }
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StatementDocument {
-    predicate_id: u64,
-    term_ids: Vec<u64>,
-}
-
-impl StatementDocument {
-    fn into_statement(self) -> Result<Statement, nao_m_e::ModelError> {
-        Statement::new(
-            PredicateId::new(self.predicate_id),
-            self.term_ids.into_iter().map(TermId::new).collect(),
-        )
-    }
-}
-
-#[derive(Serialize)]
-struct InitResponse {
-    schema_version: u32,
-    memory_id: String,
-    episode_count: u64,
-}
-
-#[derive(Serialize)]
-struct RunResponse {
-    schema_version: u32,
-    memory_id: String,
-    operations_applied: u64,
-    episode_count: u64,
-    inserted: Vec<InsertedEpisode>,
-}
-
-#[derive(Serialize)]
-struct InsertedEpisode {
-    label: Option<String>,
-    sequence: u64,
-}
-
-#[derive(Serialize)]
-struct RecallResponse {
-    schema_version: u32,
-    memory_id: String,
-    hits: Vec<RecallEpisode>,
-}
-
-#[derive(Serialize)]
-struct RecallEpisode {
-    sequence: u64,
-    activation_ppm: u32,
-    episode: EpisodeDocument,
-}
-
-impl RecallEpisode {
-    fn from_atom(atom: &EpisodeAtom, activation_ppm: u32) -> Self {
-        Self {
-            sequence: atom.id().sequence(),
-            activation_ppm,
-            episode: EpisodeDocument::from(atom),
-        }
-    }
-}
-
-impl From<&EpisodeAtom> for EpisodeDocument {
-    fn from(atom: &EpisodeAtom) -> Self {
-        Self {
-            occurred_at_ms: atom.occurred_at().get(),
-            recorded_at_ms: atom.recorded_at().get(),
-            source_id: atom.source().get(),
-            context: atom.context().iter().map(StatementDocument::from).collect(),
-            observation: StatementDocument::from(atom.observation()),
-            action: atom.action().map(StatementDocument::from),
-            outcome: atom.outcome().map(StatementDocument::from),
-        }
-    }
-}
-
-impl From<&Statement> for StatementDocument {
-    fn from(statement: &Statement) -> Self {
-        Self {
-            predicate_id: statement.predicate().get(),
-            term_ids: statement
-                .arguments()
-                .iter()
-                .map(|term| term.get())
-                .collect(),
-        }
-    }
 }
