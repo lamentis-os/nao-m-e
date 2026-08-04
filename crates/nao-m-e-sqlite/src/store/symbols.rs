@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use nao_m_e::{EpisodeAtom, EpisodeDraft, Memory, PredicateId, Statement, TermId};
 use rusqlite::types::ValueRef;
@@ -262,28 +262,35 @@ impl SqliteStore {
             .map(|(value, &id)| (id, value.as_str()))
             .collect();
         let mut persisted_ids = Vec::new();
-        let mut seen = BTreeSet::new();
-        for &id in ids {
+        let mut last_persisted_positions = BTreeMap::new();
+        for (position, &id) in ids.iter().enumerate() {
             if pending_by_id.contains_key(&id) {
                 continue;
             }
             if !state.contains_persisted(id) {
                 continue;
             }
-            if seen.insert(id) {
+            if last_persisted_positions.insert(id, position).is_none() {
                 persisted_ids.push(id);
             }
         }
-        let persisted = read_symbol_values_for_ids(&self.connection, namespace, &persisted_ids)?;
+        let mut persisted =
+            read_symbol_values_for_ids(&self.connection, namespace, &persisted_ids)?;
         ids.iter()
-            .map(|id| {
+            .enumerate()
+            .map(|(position, id)| {
                 if let Some(value) = pending_by_id.get(id) {
                     return Ok(Some((*value).to_owned()));
                 }
                 if !state.contains_persisted(*id) {
                     return Ok(None);
                 }
-                persisted.get(id).cloned().map(Some).ok_or_else(|| {
+                let value = if last_persisted_positions.get(id) == Some(&position) {
+                    persisted.remove(id)
+                } else {
+                    persisted.get(id).cloned()
+                };
+                value.map(Some).ok_or_else(|| {
                     StoreIntegrityError::InvalidSymbol {
                         namespace: namespace.name(),
                         id: *id,
