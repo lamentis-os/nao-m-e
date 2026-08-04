@@ -506,9 +506,14 @@ fn read_symbol_row(row: &Row<'_>, namespace: SymbolNamespace) -> Result<(u64, St
 }
 
 fn placeholders(count: usize) -> String {
-    std::iter::repeat_n("?", count)
-        .collect::<Vec<_>>()
-        .join(", ")
+    let mut placeholders = String::with_capacity(count * 3);
+    if count != 0 {
+        placeholders.push('?');
+        for _ in 1..count {
+            placeholders.push_str(", ?");
+        }
+    }
+    placeholders
 }
 
 fn read_symbol_ids_for_values(
@@ -517,28 +522,50 @@ fn read_symbol_ids_for_values(
     values: &[&str],
 ) -> Result<BTreeMap<String, u64>, StoreError> {
     let mut found = BTreeMap::new();
-    for chunk in values.chunks(MAX_SYMBOL_QUERY_BINDINGS) {
-        if chunk.is_empty() {
-            continue;
-        }
+    let full_end = values.len() / MAX_SYMBOL_QUERY_BINDINGS * MAX_SYMBOL_QUERY_BINDINGS;
+    let (full_chunks, remainder) = values.split_at(full_end);
+
+    if !full_chunks.is_empty() {
         let sql = format!(
             "SELECT id, value FROM {} WHERE value IN ({}) ORDER BY id",
             namespace.table(),
-            placeholders(chunk.len())
+            placeholders(MAX_SYMBOL_QUERY_BINDINGS)
         );
         let mut statement = connection.prepare(&sql)?;
-        let mut rows = statement.query(params_from_iter(chunk.iter().copied()))?;
-        while let Some(row) = rows.next()? {
-            let (id, value) = read_symbol_row(row, namespace)?;
-            if found.insert(value, id).is_some() {
-                return Err(StoreIntegrityError::InvalidMetadata {
-                    detail: "symbol value appears more than once",
-                }
-                .into());
-            }
+        for chunk in full_chunks.chunks_exact(MAX_SYMBOL_QUERY_BINDINGS) {
+            read_symbol_id_rows(&mut statement, namespace, chunk, &mut found)?;
         }
     }
+
+    if !remainder.is_empty() {
+        let sql = format!(
+            "SELECT id, value FROM {} WHERE value IN ({}) ORDER BY id",
+            namespace.table(),
+            placeholders(remainder.len())
+        );
+        let mut statement = connection.prepare(&sql)?;
+        read_symbol_id_rows(&mut statement, namespace, remainder, &mut found)?;
+    }
     Ok(found)
+}
+
+fn read_symbol_id_rows(
+    statement: &mut rusqlite::Statement<'_>,
+    namespace: SymbolNamespace,
+    values: &[&str],
+    found: &mut BTreeMap<String, u64>,
+) -> Result<(), StoreError> {
+    let mut rows = statement.query(params_from_iter(values.iter().copied()))?;
+    while let Some(row) = rows.next()? {
+        let (id, value) = read_symbol_row(row, namespace)?;
+        if found.insert(value, id).is_some() {
+            return Err(StoreIntegrityError::InvalidMetadata {
+                detail: "symbol value appears more than once",
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 fn read_symbol_values_for_ids(
@@ -547,31 +574,53 @@ fn read_symbol_values_for_ids(
     ids: &[u64],
 ) -> Result<BTreeMap<u64, String>, StoreError> {
     let mut found = BTreeMap::new();
-    for chunk in ids.chunks(MAX_SYMBOL_QUERY_BINDINGS) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let encoded: Vec<_> = chunk.iter().copied().map(format::encode_u64).collect();
+    let full_end = ids.len() / MAX_SYMBOL_QUERY_BINDINGS * MAX_SYMBOL_QUERY_BINDINGS;
+    let (full_chunks, remainder) = ids.split_at(full_end);
+
+    if !full_chunks.is_empty() {
         let sql = format!(
             "SELECT id, value FROM {} WHERE id IN ({}) ORDER BY id",
             namespace.table(),
-            placeholders(chunk.len())
+            placeholders(MAX_SYMBOL_QUERY_BINDINGS)
         );
         let mut statement = connection.prepare(&sql)?;
-        let mut rows = statement.query(params_from_iter(
-            encoded.iter().map(|value| value.as_slice()),
-        ))?;
-        while let Some(row) = rows.next()? {
-            let (id, value) = read_symbol_row(row, namespace)?;
-            if found.insert(id, value).is_some() {
-                return Err(StoreIntegrityError::InvalidMetadata {
-                    detail: "symbol identifier appears more than once",
-                }
-                .into());
-            }
+        for chunk in full_chunks.chunks_exact(MAX_SYMBOL_QUERY_BINDINGS) {
+            read_symbol_value_rows(&mut statement, namespace, chunk, &mut found)?;
         }
     }
+
+    if !remainder.is_empty() {
+        let sql = format!(
+            "SELECT id, value FROM {} WHERE id IN ({}) ORDER BY id",
+            namespace.table(),
+            placeholders(remainder.len())
+        );
+        let mut statement = connection.prepare(&sql)?;
+        read_symbol_value_rows(&mut statement, namespace, remainder, &mut found)?;
+    }
     Ok(found)
+}
+
+fn read_symbol_value_rows(
+    statement: &mut rusqlite::Statement<'_>,
+    namespace: SymbolNamespace,
+    ids: &[u64],
+    found: &mut BTreeMap<u64, String>,
+) -> Result<(), StoreError> {
+    let encoded: Vec<_> = ids.iter().copied().map(format::encode_u64).collect();
+    let mut rows = statement.query(params_from_iter(
+        encoded.iter().map(|value| value.as_slice()),
+    ))?;
+    while let Some(row) = rows.next()? {
+        let (id, value) = read_symbol_row(row, namespace)?;
+        if found.insert(id, value).is_some() {
+            return Err(StoreIntegrityError::InvalidMetadata {
+                detail: "symbol identifier appears more than once",
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 fn draft_statements(draft: &EpisodeDraft) -> impl Iterator<Item = &Statement> {

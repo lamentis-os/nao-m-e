@@ -95,14 +95,6 @@ fn append_statement_cues(cues: &mut Vec<Cue>, role: StatementRole, statement: &S
     }
 }
 
-fn cue_weight_total(cues: &[Cue]) -> u64 {
-    cues.iter().copied().fold(0_u64, |total, cue| {
-        total
-            .checked_add(cue.weight())
-            .expect("an in-memory episode's cue weight fits in u64")
-    })
-}
-
 enum PostingList {
     One(usize),
     Many(Vec<usize>),
@@ -225,8 +217,11 @@ impl CueIndex {
     pub(super) fn insert(&mut self, atom_index: usize, atom: &EpisodeAtom) {
         debug_assert_eq!(atom_index, self.weight_totals.len());
         let cues = episode_cues(atom);
-        self.weight_totals.push(cue_weight_total(&cues));
+        let mut weight_total = 0_u64;
         for cue in cues {
+            weight_total = weight_total
+                .checked_add(cue.weight())
+                .expect("an in-memory episode's cue weight fits in u64");
             match self.postings.entry(cue) {
                 Entry::Vacant(entry) => {
                     entry.insert(PostingList::One(atom_index));
@@ -234,6 +229,7 @@ impl CueIndex {
                 Entry::Occupied(mut entry) => entry.get_mut().push(atom_index),
             }
         }
+        self.weight_totals.push(weight_total);
     }
 }
 
