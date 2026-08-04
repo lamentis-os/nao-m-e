@@ -3,8 +3,8 @@ use std::cmp::Ordering;
 use nao_m_e::{AtomId, FeedbackTrace, Memory};
 use rusqlite::{Connection, Row, Rows, Transaction};
 
-use crate::codec;
 use crate::error::{StoreError, StoreIntegrityError};
+use crate::format;
 
 use super::{read_integer, read_u64};
 
@@ -142,8 +142,8 @@ pub(super) fn reconcile(
              ) VALUES (?1, ?2, ?3, ?4)",
         )?;
         for edge in memory_feedback_records(memory) {
-            let from = codec::encode_u64(edge.from);
-            let to = codec::encode_u64(edge.to);
+            let from = format::encode_u64(edge.from);
+            let to = format::encode_u64(edge.to);
             insert.execute((
                 from.as_slice(),
                 to.as_slice(),
@@ -177,13 +177,13 @@ pub(super) fn reconcile(
     for mutation in plan.mutations {
         match mutation {
             FeedbackMutation::Delete(edge) => {
-                let from = codec::encode_u64(edge.from);
-                let to = codec::encode_u64(edge.to);
+                let from = format::encode_u64(edge.from);
+                let to = format::encode_u64(edge.to);
                 delete.execute((from.as_slice(), to.as_slice()))?;
             }
             FeedbackMutation::Insert(edge) => {
-                let from = codec::encode_u64(edge.from);
-                let to = codec::encode_u64(edge.to);
+                let from = format::encode_u64(edge.from);
+                let to = format::encode_u64(edge.to);
                 insert.execute((
                     from.as_slice(),
                     to.as_slice(),
@@ -192,8 +192,8 @@ pub(super) fn reconcile(
                 ))?;
             }
             FeedbackMutation::Update(edge) => {
-                let from = codec::encode_u64(edge.from);
-                let to = codec::encode_u64(edge.to);
+                let from = format::encode_u64(edge.from);
+                let to = format::encode_u64(edge.to);
                 update.execute((
                     from.as_slice(),
                     to.as_slice(),

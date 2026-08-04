@@ -125,7 +125,7 @@ fn non_contiguous_symbol_identifiers_are_rejected() {
     let raw = Connection::open(&path).unwrap();
     raw.execute(
         "INSERT INTO predicates (id, value) VALUES (?1, 'gap')",
-        [codec::encode_u64(1).as_slice()],
+        [format::encode_u64(1).as_slice()],
     )
     .unwrap();
     drop(raw);
@@ -142,7 +142,7 @@ fn non_contiguous_symbol_identifiers_are_rejected() {
 
 #[test]
 fn metadata_and_unsupported_formats_fail_closed_with_specific_errors() {
-    for unsupported in [1, 2, 3, schema::FORMAT_VERSION + 1] {
+    for unsupported in [1, 2, 3, format::FORMAT_VERSION + 1] {
         let directory = tempdir().unwrap();
         let path = saved_store(&directory, 0);
         let raw = Connection::open(&path).unwrap();
@@ -182,8 +182,8 @@ fn rejected_identity_format_or_journal_mode_never_rewrites_the_file_mode() {
         Some(1),
         Some(2),
         Some(3),
-        Some(schema::FORMAT_VERSION),
-        Some(schema::FORMAT_VERSION + 1),
+        Some(format::FORMAT_VERSION),
+        Some(format::FORMAT_VERSION + 1),
     ] {
         let directory = tempdir().unwrap();
         let path = if unsupported_format.is_some() {
@@ -228,7 +228,7 @@ fn payload_and_sequence_corruption_are_rejected() {
     let raw = Connection::open(&path).unwrap();
     raw.execute(
         "UPDATE episodes SET sequence = ?1",
-        [codec::encode_u64(1).as_slice()],
+        [format::encode_u64(1).as_slice()],
     )
     .unwrap();
     drop(raw);
@@ -261,8 +261,8 @@ fn multiple_feedback_edges_per_source_are_accepted_but_persistent_triggers_are_r
         raw.execute(
             "INSERT INTO feedback_edges VALUES (?1, ?2, 65535, 16)",
             params![
-                codec::encode_u64(0).as_slice(),
-                codec::encode_u64(to).as_slice()
+                format::encode_u64(0).as_slice(),
+                format::encode_u64(to).as_slice()
             ],
         )
         .unwrap();
@@ -301,8 +301,8 @@ fn missing_feedback_endpoint_is_rejected_during_reconstruction() {
     raw.execute(
         "INSERT INTO feedback_edges VALUES (?1, ?2, 1, 1)",
         params![
-            codec::encode_u64(0).as_slice(),
-            codec::encode_u64(1).as_slice()
+            format::encode_u64(0).as_slice(),
+            format::encode_u64(1).as_slice()
         ],
     )
     .unwrap();
@@ -351,8 +351,8 @@ fn feedback_save_writes_only_changed_rows() {
     raw.execute(
         "INSERT INTO feedback_edges VALUES (?1, ?2, 0, 1)",
         params![
-            codec::encode_u64(ids[4].sequence()).as_slice(),
-            codec::encode_u64(ids[0].sequence()).as_slice()
+            format::encode_u64(ids[4].sequence()).as_slice(),
+            format::encode_u64(ids[0].sequence()).as_slice()
         ],
     )
     .unwrap();
@@ -470,8 +470,8 @@ fn failed_feedback_updates_and_deletes_roll_back_the_graph() {
                 raw.execute(
                     "INSERT INTO feedback_edges VALUES (?1, ?2, 0, 1)",
                     params![
-                        codec::encode_u64(second.sequence()).as_slice(),
-                        codec::encode_u64(third.sequence()).as_slice()
+                        format::encode_u64(second.sequence()).as_slice(),
+                        format::encode_u64(third.sequence()).as_slice()
                     ],
                 )
                 .unwrap();
@@ -524,8 +524,8 @@ fn save_reconciles_unrevisioned_feedback_divergence() {
     raw.execute(
         "INSERT INTO feedback_edges VALUES (?1, ?2, 3, 2)",
         params![
-            codec::encode_u64(second.sequence()).as_slice(),
-            codec::encode_u64(third.sequence()).as_slice()
+            format::encode_u64(second.sequence()).as_slice(),
+            format::encode_u64(third.sequence()).as_slice()
         ],
     )
     .unwrap();
@@ -599,8 +599,8 @@ fn save_rejects_invalid_persisted_feedback_without_advancing_revision() {
             raw.execute(
                 "INSERT INTO feedback_edges VALUES (?1, ?2, 2, 1)",
                 params![
-                    codec::encode_u64(0).as_slice(),
-                    codec::encode_u64(1).as_slice()
+                    format::encode_u64(0).as_slice(),
+                    format::encode_u64(1).as_slice()
                 ],
             )
             .unwrap();
@@ -617,8 +617,8 @@ fn save_rejects_invalid_persisted_feedback_without_advancing_revision() {
                 raw.execute(
                     "INSERT INTO feedback_edges VALUES (?1, ?2, 0, ?3)",
                     params![
-                        codec::encode_u64(0).as_slice(),
-                        codec::encode_u64(1).as_slice(),
+                        format::encode_u64(0).as_slice(),
+                        format::encode_u64(1).as_slice(),
                         sample_count
                     ],
                 )
@@ -635,8 +635,8 @@ fn save_rejects_invalid_persisted_feedback_without_advancing_revision() {
             raw.execute(
                 "INSERT INTO feedback_edges VALUES (?1, ?2, 1, 1)",
                 params![
-                    codec::encode_u64(0).as_slice(),
-                    codec::encode_u64(3).as_slice()
+                    format::encode_u64(0).as_slice(),
+                    format::encode_u64(3).as_slice()
                 ],
             )
             .unwrap();
@@ -651,8 +651,8 @@ fn save_rejects_invalid_persisted_feedback_without_advancing_revision() {
             raw.execute(
                 "INSERT INTO feedback_edges VALUES (?1, ?2, 1, 1)",
                 params![
-                    codec::encode_u64(0).as_slice(),
-                    codec::encode_u64(1).as_slice()
+                    format::encode_u64(0).as_slice(),
+                    format::encode_u64(1).as_slice()
                 ],
             )
             .unwrap();
@@ -669,7 +669,7 @@ fn save_rejects_changed_identity_and_exhausted_revision() {
     let raw = Connection::open(&path).unwrap();
     raw.execute(
         "UPDATE memory_meta SET memory_id = ?1",
-        [codec::encode_memory_id(MemoryId::new(1).unwrap()).as_slice()],
+        [MemoryId::new(1).unwrap().to_be_bytes().as_slice()],
     )
     .unwrap();
     drop(raw);

@@ -4,9 +4,8 @@ use nao_m_e::{AtomId, Memory, MemoryId};
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior};
 
-use crate::codec;
 use crate::error::{StoreError, StoreIntegrityError};
-use crate::schema;
+use crate::format;
 
 mod feedback;
 mod symbols;
@@ -48,10 +47,10 @@ impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE;
         let mut connection = Connection::open_with_flags(path, flags)?;
-        schema::configure_session(&connection)?;
+        format::configure_session(&connection)?;
         verify_application_id(&connection)?;
         verify_format_version(&connection)?;
-        schema::verify_durability(&connection)?;
+        format::verify_durability(&connection)?;
 
         let loaded = load_memory(&mut connection)?;
         Ok(Self {
@@ -106,7 +105,7 @@ impl SqliteStore {
             .into());
         }
 
-        schema::verify_durability(connection)?;
+        format::verify_durability(connection)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         verify_application_id(&transaction)?;
         let (actual_memory_id, actual_revision) = read_metadata(&transaction)?;
@@ -190,9 +189,9 @@ fn build_initial_database(
 
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;
     let mut connection = Connection::open_with_flags(staging.path(), flags)?;
-    schema::configure_session(&connection)?;
-    schema::configure_durability(&connection)?;
-    schema::create_schema(&mut connection, memory_id)?;
+    format::configure_session(&connection)?;
+    format::configure_durability(&connection)?;
+    format::create_schema(&mut connection, memory_id)?;
     let loaded = load_memory(&mut connection)?;
     if loaded.memory.memory_id() != memory_id
         || loaded.episode_count != 0
@@ -243,8 +242,8 @@ fn load_memory(connection: &mut Connection) -> Result<LoadedStore, StoreError> {
 }
 
 fn verify_application_id(connection: &Connection) -> Result<(), StoreError> {
-    let found = schema::read_application_id(connection)?;
-    if found == schema::APPLICATION_ID {
+    let found = format::read_application_id(connection)?;
+    if found == format::APPLICATION_ID {
         Ok(())
     } else {
         Err(StoreIntegrityError::ApplicationMismatch { found }.into())
@@ -258,7 +257,7 @@ fn verify_format_version(connection: &Connection) -> Result<(), StoreError> {
         return Err(StoreIntegrityError::MissingMetadata.into());
     };
     let found = read_integer(row, 0, "memory_meta", "format_version")?;
-    if found != schema::FORMAT_VERSION {
+    if found != format::FORMAT_VERSION {
         return Err(StoreIntegrityError::UnsupportedFormatVersion { found }.into());
     }
     if rows.next()?.is_some() {
@@ -271,7 +270,7 @@ fn verify_format_version(connection: &Connection) -> Result<(), StoreError> {
 }
 
 fn verify_schema(connection: &Connection) -> Result<(), StoreError> {
-    if schema::validate_schema(connection)? {
+    if format::validate_schema(connection)? {
         Ok(())
     } else {
         Err(StoreIntegrityError::InvalidMetadata {
@@ -314,7 +313,7 @@ fn read_metadata(connection: &Connection) -> Result<(MemoryId, i64), StoreError>
         .into());
     }
     let format_version = read_integer(row, 1, "memory_meta", "format_version")?;
-    if format_version != schema::FORMAT_VERSION {
+    if format_version != format::FORMAT_VERSION {
         return Err(StoreIntegrityError::UnsupportedFormatVersion {
             found: format_version,
         }
@@ -368,7 +367,7 @@ fn reconstruct_memory(
             }
             .into());
         };
-        let draft = codec::decode_episode(payload).map_err(|error| {
+        let draft = format::decode_episode(payload).map_err(|error| {
             StoreIntegrityError::InvalidEpisode {
                 sequence,
                 detail: error.detail(),
@@ -415,7 +414,7 @@ fn verify_persisted_tail(
     let actual_tail = tail
         .as_deref()
         .map(|bytes| {
-            codec::decode_u64(bytes).ok_or(StoreIntegrityError::InvalidEncoding {
+            format::decode_u64(bytes).ok_or(StoreIntegrityError::InvalidEncoding {
                 table: "episodes",
                 column: "sequence",
             })
@@ -441,8 +440,8 @@ fn append_episodes(
          VALUES (?1, ?2)",
     )?;
     for episode in memory.episodes().skip(start) {
-        let sequence = codec::encode_u64(episode.id().sequence());
-        let payload = codec::encode_episode(episode);
+        let sequence = format::encode_u64(episode.id().sequence());
+        let payload = format::encode_episode(episode);
         insert.execute((sequence.as_slice(), payload.as_slice()))?;
     }
     Ok(())
@@ -469,7 +468,7 @@ fn read_u64(
     let ValueRef::Blob(bytes) = row.get_ref(index)? else {
         return Err(StoreIntegrityError::InvalidEncoding { table, column }.into());
     };
-    codec::decode_u64(bytes)
+    format::decode_u64(bytes)
         .ok_or(StoreIntegrityError::InvalidEncoding { table, column })
         .map_err(Into::into)
 }
@@ -483,7 +482,7 @@ fn read_memory_id(
     let ValueRef::Blob(bytes) = row.get_ref(index)? else {
         return Err(StoreIntegrityError::InvalidEncoding { table, column }.into());
     };
-    codec::decode_memory_id(bytes).ok_or_else(|| {
+    format::decode_memory_id(bytes).ok_or_else(|| {
         if bytes.len() == 16 {
             StoreIntegrityError::InvalidMemoryId.into()
         } else {
