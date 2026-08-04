@@ -1,125 +1,15 @@
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use nao_m_e::{
-    AtomId, EpisodeAtom, EpisodeDraft, FeedbackTrace, Memory, MemoryId, PredicateId, Statement,
-    TermId,
-};
+use nao_m_e::{AtomId, Memory, MemoryId};
 use rusqlite::types::ValueRef;
-use rusqlite::{
-    Connection, OpenFlags, OptionalExtension, Row, Rows, Transaction, TransactionBehavior,
-    params_from_iter,
-};
-use unicode_normalization::UnicodeNormalization;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior};
 
 use crate::codec;
 use crate::error::{StoreError, StoreIntegrityError};
 use crate::schema;
 
-const MAX_SYMBOL_QUERY_BINDINGS: usize = 900;
-
-const _: () = {
-    assert!(unicode_case_mapping::UNICODE_VERSION.0 == 16);
-    assert!(unicode_case_mapping::UNICODE_VERSION.1 == 0);
-    assert!(unicode_case_mapping::UNICODE_VERSION.2 == 0);
-    assert!(unicode_normalization::UNICODE_VERSION.0 == 16);
-    assert!(unicode_normalization::UNICODE_VERSION.1 == 0);
-    assert!(unicode_normalization::UNICODE_VERSION.2 == 0);
-};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SymbolNamespace {
-    Predicate,
-    Term,
-}
-
-impl SymbolNamespace {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Predicate => "predicate",
-            Self::Term => "term",
-        }
-    }
-
-    const fn table(self) -> &'static str {
-        match self {
-            Self::Predicate => "predicates",
-            Self::Term => "terms",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NextSymbolId {
-    Next(u64),
-    Exhausted,
-}
-
-impl NextSymbolId {
-    fn allocate(self, count: usize) -> Option<(Vec<u64>, Self)> {
-        let mut next = self;
-        let mut ids = Vec::with_capacity(count);
-        for _ in 0..count {
-            let Self::Next(id) = next else {
-                return None;
-            };
-            ids.push(id);
-            next = id.checked_add(1).map_or(Self::Exhausted, Self::Next);
-        }
-        Some((ids, next))
-    }
-
-    const fn tail(self) -> Option<u64> {
-        match self {
-            Self::Next(0) => None,
-            Self::Next(next) => Some(next - 1),
-            Self::Exhausted => Some(u64::MAX),
-        }
-    }
-
-    const fn contains(self, id: u64) -> bool {
-        match self {
-            Self::Next(next) => id < next,
-            Self::Exhausted => true,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct SymbolState {
-    persisted_tail: Option<u64>,
-    next_id: NextSymbolId,
-    pending: BTreeMap<String, u64>,
-}
-
-impl SymbolState {
-    fn from_tail(tail: Option<u64>) -> Self {
-        let next_id = match tail {
-            None => NextSymbolId::Next(0),
-            Some(u64::MAX) => NextSymbolId::Exhausted,
-            Some(tail) => NextSymbolId::Next(tail + 1),
-        };
-        Self {
-            persisted_tail: tail,
-            next_id,
-            pending: BTreeMap::new(),
-        }
-    }
-
-    fn contains_persisted(&self, id: u64) -> bool {
-        self.persisted_tail.is_some_and(|tail| id <= tail)
-    }
-
-    const fn contains_current(&self, id: u64) -> bool {
-        self.next_id.contains(id)
-    }
-
-    fn mark_saved(&mut self) {
-        self.persisted_tail = self.next_id.tail();
-        self.pending.clear();
-    }
-}
+mod feedback;
+mod symbols;
 
 /// An explicitly saved SQLite database and its owned in-memory state.
 ///
@@ -130,8 +20,8 @@ pub struct SqliteStore {
     memory: Memory,
     persisted_episode_count: usize,
     expected_revision: i64,
-    predicates: SymbolState,
-    terms: SymbolState,
+    predicates: symbols::SymbolState,
+    terms: symbols::SymbolState,
 }
 
 impl SqliteStore {
@@ -193,191 +83,6 @@ impl SqliteStore {
         &mut self.memory
     }
 
-    /// Normalizes and interns predicate values in input order.
-    ///
-    /// Duplicate normalized values return the same identifier. New assignments
-    /// remain staged in this store until [`Self::save`] commits them atomically
-    /// with pending episode and feedback changes. An invalid value or exhausted
-    /// identifier space leaves the complete staged symbol state unchanged.
-    pub fn intern_predicates(&mut self, values: &[String]) -> Result<Vec<PredicateId>, StoreError> {
-        self.intern_symbols(SymbolNamespace::Predicate, values)
-            .map(|ids| ids.into_iter().map(PredicateId::new).collect())
-    }
-
-    /// Normalizes and interns term values in input order.
-    ///
-    /// Duplicate normalized values return the same identifier. New assignments
-    /// remain staged in this store until [`Self::save`] commits them atomically
-    /// with pending episode and feedback changes. An invalid value or exhausted
-    /// identifier space leaves the complete staged symbol state unchanged.
-    pub fn intern_terms(&mut self, values: &[String]) -> Result<Vec<TermId>, StoreError> {
-        self.intern_symbols(SymbolNamespace::Term, values)
-            .map(|ids| ids.into_iter().map(TermId::new).collect())
-    }
-
-    /// Resolves predicate identifiers in input order.
-    ///
-    /// Values staged by [`Self::intern_predicates`] are visible before a save.
-    /// Only the requested values are loaded from SQLite. Unknown identifiers
-    /// produce `None` at their input position.
-    pub fn predicate_values(&self, ids: &[PredicateId]) -> Result<Vec<Option<String>>, StoreError> {
-        let ids: Vec<_> = ids.iter().map(|id| id.get()).collect();
-        self.symbol_values(SymbolNamespace::Predicate, &ids)
-    }
-
-    /// Resolves term identifiers in input order.
-    ///
-    /// Values staged by [`Self::intern_terms`] are visible before a save. Only
-    /// the requested values are loaded from SQLite. Unknown identifiers
-    /// produce `None` at their input position.
-    pub fn term_values(&self, ids: &[TermId]) -> Result<Vec<Option<String>>, StoreError> {
-        let ids: Vec<_> = ids.iter().map(|id| id.get()).collect();
-        self.symbol_values(SymbolNamespace::Term, &ids)
-    }
-
-    fn intern_symbols(
-        &mut self,
-        namespace: SymbolNamespace,
-        values: &[String],
-    ) -> Result<Vec<u64>, StoreError> {
-        let NormalizedBatch {
-            mut unique_values,
-            mut positions,
-        } = normalize_batch(namespace, values)?;
-        if unique_values.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let state = self.symbol_state(namespace);
-        let mut assignments = vec![None; unique_values.len()];
-        let mut unresolved_indexes = Vec::new();
-        for (index, value) in unique_values.iter().enumerate() {
-            if let Some(&id) = state.pending.get(value) {
-                assignments[index] = Some(id);
-            } else {
-                unresolved_indexes.push(index);
-            }
-        }
-
-        let unresolved: Vec<_> = unresolved_indexes
-            .iter()
-            .map(|&index| unique_values[index].as_str())
-            .collect();
-        let persisted = read_symbol_ids_for_values(&self.connection, namespace, &unresolved)?;
-        let mut new_indexes = Vec::new();
-        for index in unresolved_indexes {
-            let value = unique_values[index].as_str();
-            if let Some(&id) = persisted.get(value) {
-                if !state.contains_persisted(id) {
-                    let (_, actual_revision) = read_metadata(&self.connection)?;
-                    if actual_revision != self.expected_revision {
-                        return Err(StoreError::ConcurrentModification {
-                            expected_revision: self.expected_revision,
-                            actual_revision,
-                        });
-                    }
-                    return Err(StoreIntegrityError::InvalidSymbol {
-                        namespace: namespace.name(),
-                        id,
-                        detail: "symbol row changed outside this store session",
-                    }
-                    .into());
-                }
-                assignments[index] = Some(id);
-            } else {
-                new_indexes.push(index);
-            }
-        }
-
-        let (new_ids, next_id) =
-            state
-                .next_id
-                .allocate(new_indexes.len())
-                .ok_or(StoreError::SymbolIdExhausted {
-                    namespace: namespace.name(),
-                })?;
-        for (&index, &id) in new_indexes.iter().zip(&new_ids) {
-            assignments[index] = Some(id);
-        }
-
-        for position in &mut positions {
-            let index = usize::try_from(*position)
-                .expect("a normalized batch position was produced from a usize");
-            *position = assignments[index].expect("every normalized symbol was assigned");
-        }
-
-        let state = self.symbol_state_mut(namespace);
-        for (index, id) in new_indexes.into_iter().zip(new_ids) {
-            let value = std::mem::take(&mut unique_values[index]);
-            let previous = state.pending.insert(value, id);
-            debug_assert!(previous.is_none());
-        }
-        state.next_id = next_id;
-        Ok(positions)
-    }
-
-    fn symbol_values(
-        &self,
-        namespace: SymbolNamespace,
-        ids: &[u64],
-    ) -> Result<Vec<Option<String>>, StoreError> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let state = self.symbol_state(namespace);
-        let pending_by_id: BTreeMap<_, _> = state
-            .pending
-            .iter()
-            .map(|(value, &id)| (id, value.as_str()))
-            .collect();
-        let mut persisted_ids = Vec::new();
-        let mut seen = BTreeSet::new();
-        for &id in ids {
-            if pending_by_id.contains_key(&id) {
-                continue;
-            }
-            if !state.contains_persisted(id) {
-                continue;
-            }
-            if seen.insert(id) {
-                persisted_ids.push(id);
-            }
-        }
-        let persisted = read_symbol_values_for_ids(&self.connection, namespace, &persisted_ids)?;
-        ids.iter()
-            .map(|id| {
-                if let Some(value) = pending_by_id.get(id) {
-                    return Ok(Some((*value).to_owned()));
-                }
-                if !state.contains_persisted(*id) {
-                    return Ok(None);
-                }
-                persisted.get(id).cloned().map(Some).ok_or_else(|| {
-                    StoreIntegrityError::InvalidSymbol {
-                        namespace: namespace.name(),
-                        id: *id,
-                        detail: "symbol row is absent",
-                    }
-                    .into()
-                })
-            })
-            .collect()
-    }
-
-    const fn symbol_state(&self, namespace: SymbolNamespace) -> &SymbolState {
-        match namespace {
-            SymbolNamespace::Predicate => &self.predicates,
-            SymbolNamespace::Term => &self.terms,
-        }
-    }
-
-    const fn symbol_state_mut(&mut self, namespace: SymbolNamespace) -> &mut SymbolState {
-        match namespace {
-            SymbolNamespace::Predicate => &mut self.predicates,
-            SymbolNamespace::Term => &mut self.terms,
-        }
-    }
-
     /// Atomically persists newly appended episodes and feedback changes.
     ///
     /// A stale store session is rejected instead of overwriting a later
@@ -422,9 +127,13 @@ impl SqliteStore {
             return Err(StoreError::RevisionExhausted);
         }
         verify_persisted_tail(&transaction, *persisted_episode_count)?;
-        verify_symbol_tail(&transaction, SymbolNamespace::Predicate, predicates)?;
-        verify_symbol_tail(&transaction, SymbolNamespace::Term, terms)?;
-        validate_new_episode_symbols(memory, *persisted_episode_count, predicates, terms)?;
+        symbols::verify_symbol_tail(
+            &transaction,
+            symbols::SymbolNamespace::Predicate,
+            predicates,
+        )?;
+        symbols::verify_symbol_tail(&transaction, symbols::SymbolNamespace::Term, terms)?;
+        symbols::validate_new_episode_symbols(memory, *persisted_episode_count, predicates, terms)?;
 
         let next_revision = actual_revision + 1;
         let changed = transaction.execute(
@@ -438,10 +147,14 @@ impl SqliteStore {
             .into());
         }
 
-        insert_pending_symbols(&transaction, SymbolNamespace::Predicate, predicates)?;
-        insert_pending_symbols(&transaction, SymbolNamespace::Term, terms)?;
+        symbols::insert_pending_symbols(
+            &transaction,
+            symbols::SymbolNamespace::Predicate,
+            predicates,
+        )?;
+        symbols::insert_pending_symbols(&transaction, symbols::SymbolNamespace::Term, terms)?;
         append_episodes(&transaction, memory, *persisted_episode_count)?;
-        reconcile_feedback(&transaction, memory, *persisted_episode_count)?;
+        feedback::reconcile(&transaction, memory, *persisted_episode_count)?;
         transaction.commit()?;
 
         *expected_revision = next_revision;
@@ -484,8 +197,8 @@ fn build_initial_database(
     if loaded.memory.memory_id() != memory_id
         || loaded.episode_count != 0
         || loaded.revision != 0
-        || loaded.predicates.persisted_tail.is_some()
-        || loaded.terms.persisted_tail.is_some()
+        || !loaded.predicates.is_persisted_empty()
+        || !loaded.terms.is_persisted_empty()
     {
         return Err(StoreIntegrityError::InvalidMetadata {
             detail: "new store differs from its initialized empty snapshot",
@@ -503,8 +216,8 @@ struct LoadedStore {
     memory: Memory,
     episode_count: usize,
     revision: i64,
-    predicates: SymbolState,
-    terms: SymbolState,
+    predicates: symbols::SymbolState,
+    terms: symbols::SymbolState,
 }
 
 fn load_memory(connection: &mut Connection) -> Result<LoadedStore, StoreError> {
@@ -513,10 +226,11 @@ fn load_memory(connection: &mut Connection) -> Result<LoadedStore, StoreError> {
     let (memory_id, revision) = read_metadata(&transaction)?;
     verify_schema(&transaction)?;
     verify_quick_check(&transaction)?;
-    let predicates = validate_symbol_catalog(&transaction, SymbolNamespace::Predicate)?;
-    let terms = validate_symbol_catalog(&transaction, SymbolNamespace::Term)?;
+    let predicates =
+        symbols::validate_symbol_catalog(&transaction, symbols::SymbolNamespace::Predicate)?;
+    let terms = symbols::validate_symbol_catalog(&transaction, symbols::SymbolNamespace::Term)?;
     let mut memory = reconstruct_memory(&transaction, memory_id, &predicates, &terms)?;
-    restore_feedback(&transaction, &mut memory)?;
+    feedback::restore(&transaction, &mut memory)?;
     let episode_count = memory.episodes().len();
     transaction.commit()?;
     Ok(LoadedStore {
@@ -623,352 +337,11 @@ fn read_metadata(connection: &Connection) -> Result<(MemoryId, i64), StoreError>
     Ok((memory_id, revision))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SymbolValueError {
-    Empty,
-    Control,
-    TooLong,
-}
-
-impl SymbolValueError {
-    const fn detail(self) -> &'static str {
-        match self {
-            Self::Empty => "normalized value is empty",
-            Self::Control => "normalized value contains a control character",
-            Self::TooLong => "normalized UTF-8 value exceeds 4096 bytes",
-        }
-    }
-}
-
-fn normalize_symbol(value: &str) -> Result<String, SymbolValueError> {
-    let lowercase = value.nfkc().flat_map(unicode_lowercase).nfkc();
-    let mut normalized = String::with_capacity(value.len().min(schema::MAX_SYMBOL_BYTES));
-    let mut whitespace_pending = false;
-    for character in lowercase {
-        if is_unicode_16_whitespace(character) {
-            whitespace_pending = !normalized.is_empty();
-            continue;
-        }
-        if is_unicode_control(character) {
-            return Err(SymbolValueError::Control);
-        }
-        if whitespace_pending {
-            normalized.push(' ');
-            whitespace_pending = false;
-        }
-        normalized.push(character);
-        if normalized.len() > schema::MAX_SYMBOL_BYTES {
-            return Err(SymbolValueError::TooLong);
-        }
-    }
-    if normalized.is_empty() {
-        return Err(SymbolValueError::Empty);
-    }
-    Ok(normalized)
-}
-
-fn unicode_lowercase(character: char) -> impl Iterator<Item = char> {
-    let mapping = unicode_case_mapping::to_lowercase(character);
-    let maps_to_self = mapping[0] == 0;
-    std::iter::once(character)
-        .filter(move |_| maps_to_self)
-        .chain(
-            mapping
-                .into_iter()
-                .filter(move |&scalar| !maps_to_self && scalar != 0)
-                .map(|scalar| {
-                    char::from_u32(scalar).expect("Unicode case mapping contains valid scalars")
-                }),
-        )
-}
-
-const fn is_unicode_16_whitespace(character: char) -> bool {
-    matches!(
-        character,
-        '\u{0009}'..='\u{000D}'
-            | '\u{0020}'
-            | '\u{0085}'
-            | '\u{00A0}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200A}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202F}'
-            | '\u{205F}'
-            | '\u{3000}'
-    )
-}
-
-const fn is_unicode_control(character: char) -> bool {
-    matches!(character, '\u{0000}'..='\u{001F}' | '\u{007F}'..='\u{009F}')
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct NormalizedBatch {
-    unique_values: Vec<String>,
-    positions: Vec<u64>,
-}
-
-fn normalize_batch(
-    namespace: SymbolNamespace,
-    values: &[String],
-) -> Result<NormalizedBatch, StoreError> {
-    let mut raw_positions = BTreeMap::<&str, usize>::new();
-    let mut canonical_positions = BTreeMap::<String, usize>::new();
-    let mut positions = Vec::with_capacity(values.len());
-
-    for (index, value) in values.iter().enumerate() {
-        if let Some(&position) = raw_positions.get(value.as_str()) {
-            positions.push(u64::try_from(position).expect("a slice index fits in a u64"));
-            continue;
-        }
-
-        let normalized =
-            normalize_symbol(value).map_err(|error| StoreError::InvalidSymbolValue {
-                namespace: namespace.name(),
-                index,
-                detail: error.detail(),
-            })?;
-        let next_position = canonical_positions.len();
-        let position = *canonical_positions
-            .entry(normalized)
-            .or_insert(next_position);
-        raw_positions.insert(value.as_str(), position);
-        positions.push(u64::try_from(position).expect("a slice index fits in a u64"));
-    }
-
-    let mut unique_values: Vec<Option<String>> = std::iter::repeat_with(|| None)
-        .take(canonical_positions.len())
-        .collect();
-    for (value, position) in canonical_positions {
-        unique_values[position] = Some(value);
-    }
-
-    Ok(NormalizedBatch {
-        unique_values: unique_values
-            .into_iter()
-            .map(|value| value.expect("every canonical symbol has a first-occurrence position"))
-            .collect(),
-        positions,
-    })
-}
-
-fn validate_symbol_catalog(
-    connection: &Connection,
-    namespace: SymbolNamespace,
-) -> Result<SymbolState, StoreError> {
-    let sql = format!("SELECT id, value FROM {} ORDER BY id", namespace.table());
-    let mut statement = connection.prepare(&sql)?;
-    let mut rows = statement.query([])?;
-    let mut next = NextSymbolId::Next(0);
-    let mut tail = None;
-    while let Some(row) = rows.next()? {
-        let NextSymbolId::Next(expected) = next else {
-            return Err(StoreIntegrityError::InvalidMetadata {
-                detail: "symbol row follows the maximum unsigned identifier",
-            }
-            .into());
-        };
-        let (id, _) = read_symbol_row(row, namespace)?;
-        if id != expected {
-            return Err(StoreIntegrityError::NonContiguousSymbolId {
-                namespace: namespace.name(),
-                expected,
-                found: id,
-            }
-            .into());
-        }
-        tail = Some(id);
-        next = id
-            .checked_add(1)
-            .map_or(NextSymbolId::Exhausted, NextSymbolId::Next);
-    }
-    let state = SymbolState::from_tail(tail);
-    debug_assert_eq!(state.next_id, next);
-    Ok(state)
-}
-
-fn read_symbol_row(row: &Row<'_>, namespace: SymbolNamespace) -> Result<(u64, String), StoreError> {
-    let id = read_u64(row, 0, namespace.table(), "id")?;
-    let ValueRef::Text(bytes) = row.get_ref(1)? else {
-        return Err(StoreIntegrityError::InvalidEncoding {
-            table: namespace.table(),
-            column: "value",
-        }
-        .into());
-    };
-    let value = std::str::from_utf8(bytes).map_err(|_| StoreIntegrityError::InvalidEncoding {
-        table: namespace.table(),
-        column: "value",
-    })?;
-    let canonical =
-        normalize_symbol(value).map_err(|error| StoreIntegrityError::InvalidSymbol {
-            namespace: namespace.name(),
-            id,
-            detail: error.detail(),
-        })?;
-    if canonical != value {
-        return Err(StoreIntegrityError::InvalidSymbol {
-            namespace: namespace.name(),
-            id,
-            detail: "value is not normalized",
-        }
-        .into());
-    }
-    Ok((id, canonical))
-}
-
-fn placeholders(count: usize) -> String {
-    std::iter::repeat_n("?", count)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn read_symbol_ids_for_values(
-    connection: &Connection,
-    namespace: SymbolNamespace,
-    values: &[&str],
-) -> Result<BTreeMap<String, u64>, StoreError> {
-    let mut found = BTreeMap::new();
-    for chunk in values.chunks(MAX_SYMBOL_QUERY_BINDINGS) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let sql = format!(
-            "SELECT id, value FROM {} WHERE value IN ({}) ORDER BY id",
-            namespace.table(),
-            placeholders(chunk.len())
-        );
-        let mut statement = connection.prepare(&sql)?;
-        let mut rows = statement.query(params_from_iter(chunk.iter().copied()))?;
-        while let Some(row) = rows.next()? {
-            let (id, value) = read_symbol_row(row, namespace)?;
-            if found.insert(value, id).is_some() {
-                return Err(StoreIntegrityError::InvalidMetadata {
-                    detail: "symbol value appears more than once",
-                }
-                .into());
-            }
-        }
-    }
-    Ok(found)
-}
-
-fn read_symbol_values_for_ids(
-    connection: &Connection,
-    namespace: SymbolNamespace,
-    ids: &[u64],
-) -> Result<BTreeMap<u64, String>, StoreError> {
-    let mut found = BTreeMap::new();
-    for chunk in ids.chunks(MAX_SYMBOL_QUERY_BINDINGS) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let encoded: Vec<_> = chunk.iter().copied().map(codec::encode_u64).collect();
-        let sql = format!(
-            "SELECT id, value FROM {} WHERE id IN ({}) ORDER BY id",
-            namespace.table(),
-            placeholders(chunk.len())
-        );
-        let mut statement = connection.prepare(&sql)?;
-        let mut rows = statement.query(params_from_iter(
-            encoded.iter().map(|value| value.as_slice()),
-        ))?;
-        while let Some(row) = rows.next()? {
-            let (id, value) = read_symbol_row(row, namespace)?;
-            if found.insert(id, value).is_some() {
-                return Err(StoreIntegrityError::InvalidMetadata {
-                    detail: "symbol identifier appears more than once",
-                }
-                .into());
-            }
-        }
-    }
-    Ok(found)
-}
-
-fn draft_statements(draft: &EpisodeDraft) -> impl Iterator<Item = &Statement> {
-    draft
-        .context
-        .iter()
-        .chain(std::iter::once(&draft.observation))
-        .chain(draft.action.iter())
-        .chain(draft.outcome.iter())
-}
-
-fn atom_statements(atom: &EpisodeAtom) -> impl Iterator<Item = &Statement> {
-    atom.context()
-        .iter()
-        .chain(std::iter::once(atom.observation()))
-        .chain(atom.action())
-        .chain(atom.outcome())
-}
-
-fn validate_persisted_episode_symbols(
-    sequence: u64,
-    draft: &EpisodeDraft,
-    predicates: &SymbolState,
-    terms: &SymbolState,
-) -> Result<(), StoreError> {
-    for statement in draft_statements(draft) {
-        if !predicates.contains_persisted(statement.predicate().get()) {
-            return Err(StoreIntegrityError::InvalidEpisode {
-                sequence,
-                detail: "predicate identifier is absent from the symbol catalog",
-            }
-            .into());
-        }
-        if statement
-            .arguments()
-            .iter()
-            .any(|term| !terms.contains_persisted(term.get()))
-        {
-            return Err(StoreIntegrityError::InvalidEpisode {
-                sequence,
-                detail: "term identifier is absent from the symbol catalog",
-            }
-            .into());
-        }
-    }
-    Ok(())
-}
-
-fn validate_new_episode_symbols(
-    memory: &Memory,
-    start: usize,
-    predicates: &SymbolState,
-    terms: &SymbolState,
-) -> Result<(), StoreError> {
-    for atom in memory.episodes().skip(start) {
-        for statement in atom_statements(atom) {
-            let predicate = statement.predicate().get();
-            if !predicates.contains_current(predicate) {
-                return Err(StoreError::UnknownSymbolId {
-                    namespace: SymbolNamespace::Predicate.name(),
-                    id: predicate,
-                });
-            }
-            if let Some(term) = statement
-                .arguments()
-                .iter()
-                .map(|term| term.get())
-                .find(|&term| !terms.contains_current(term))
-            {
-                return Err(StoreError::UnknownSymbolId {
-                    namespace: SymbolNamespace::Term.name(),
-                    id: term,
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
 fn reconstruct_memory(
     connection: &Connection,
     memory_id: MemoryId,
-    predicates: &SymbolState,
-    terms: &SymbolState,
+    predicates: &symbols::SymbolState,
+    terms: &symbols::SymbolState,
 ) -> Result<Memory, StoreError> {
     let mut statement = connection.prepare(
         "SELECT sequence, payload
@@ -1001,7 +374,7 @@ fn reconstruct_memory(
                 detail: error.detail(),
             }
         })?;
-        validate_persisted_episode_symbols(sequence, &draft, predicates, terms)?;
+        symbols::validate_persisted_episode_symbols(sequence, &draft, predicates, terms)?;
         let id = memory
             .insert_episode(draft)
             .map_err(|_| StoreIntegrityError::InvalidEpisode {
@@ -1023,29 +396,6 @@ fn reconstruct_memory(
                 })?;
     }
     Ok(memory)
-}
-
-fn restore_feedback(connection: &Connection, memory: &mut Memory) -> Result<(), StoreError> {
-    let mut statement = connection.prepare(
-        "SELECT from_sequence, to_sequence, history_bits, sample_count
-         FROM feedback_edges
-         ORDER BY from_sequence, to_sequence",
-    )?;
-    let mut rows = statement.query([])?;
-    while let Some(row) = rows.next()? {
-        let edge = read_feedback_edge(row)?;
-
-        let from_id = AtomId::from_parts(memory.memory_id(), edge.from);
-        let to_id = AtomId::from_parts(memory.memory_id(), edge.to);
-        memory
-            .set_feedback_trace(from_id, to_id, edge.trace)
-            .map_err(|_| StoreIntegrityError::InvalidFeedback {
-                from: edge.from,
-                to: edge.to,
-                detail: "feedback edge violates core graph invariants",
-            })?;
-    }
-    Ok(())
 }
 
 fn verify_persisted_tail(
@@ -1081,63 +431,6 @@ fn verify_persisted_tail(
     }
 }
 
-fn verify_symbol_tail(
-    transaction: &Transaction<'_>,
-    namespace: SymbolNamespace,
-    state: &SymbolState,
-) -> Result<(), StoreError> {
-    let sql = format!(
-        "SELECT id FROM {} ORDER BY id DESC LIMIT 1",
-        namespace.table()
-    );
-    let tail: Option<Vec<u8>> = transaction
-        .query_row(&sql, [], |row| row.get(0))
-        .optional()?;
-    let actual_tail = tail
-        .as_deref()
-        .map(|bytes| {
-            codec::decode_u64(bytes).ok_or(StoreIntegrityError::InvalidEncoding {
-                table: namespace.table(),
-                column: "id",
-            })
-        })
-        .transpose()?;
-    if actual_tail == state.persisted_tail {
-        Ok(())
-    } else {
-        Err(StoreIntegrityError::InvalidMetadata {
-            detail: "persisted symbol tail changed outside this store session",
-        }
-        .into())
-    }
-}
-
-fn insert_pending_symbols(
-    transaction: &Transaction<'_>,
-    namespace: SymbolNamespace,
-    state: &SymbolState,
-) -> Result<(), StoreError> {
-    if state.pending.is_empty() {
-        return Ok(());
-    }
-    let mut pending: Vec<_> = state
-        .pending
-        .iter()
-        .map(|(value, &id)| (id, value))
-        .collect();
-    pending.sort_unstable_by_key(|(id, _)| *id);
-    let sql = format!(
-        "INSERT INTO {} (id, value) VALUES (?1, ?2)",
-        namespace.table()
-    );
-    let mut insert = transaction.prepare(&sql)?;
-    for (id, value) in pending {
-        let id = codec::encode_u64(id);
-        insert.execute((id.as_slice(), value))?;
-    }
-    Ok(())
-}
-
 fn append_episodes(
     transaction: &Transaction<'_>,
     memory: &Memory,
@@ -1153,235 +446,6 @@ fn append_episodes(
         insert.execute((sequence.as_slice(), payload.as_slice()))?;
     }
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FeedbackRecord {
-    from: u64,
-    to: u64,
-    trace: FeedbackTrace,
-}
-
-impl FeedbackRecord {
-    const fn key(self) -> (u64, u64) {
-        (self.from, self.to)
-    }
-}
-
-const MAX_BUFFERED_FEEDBACK_MUTATIONS: usize = 16_384;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FeedbackMutation {
-    Delete(FeedbackRecord),
-    Insert(FeedbackRecord),
-    Update(FeedbackRecord),
-}
-
-#[derive(Debug, Default)]
-struct FeedbackPlan {
-    mutations: Vec<FeedbackMutation>,
-    replace_all: bool,
-}
-
-impl FeedbackPlan {
-    fn push(&mut self, mutation: FeedbackMutation) {
-        if self.replace_all {
-            return;
-        }
-        if self.mutations.len() == MAX_BUFFERED_FEEDBACK_MUTATIONS {
-            self.mutations.clear();
-            self.replace_all = true;
-            return;
-        }
-        self.mutations.push(mutation);
-    }
-}
-
-fn reconcile_feedback(
-    transaction: &Transaction<'_>,
-    memory: &Memory,
-    persisted_episode_count: usize,
-) -> Result<(), StoreError> {
-    let mut plan = FeedbackPlan::default();
-
-    {
-        let mut statement = transaction.prepare(
-            "SELECT from_sequence, to_sequence, history_bits, sample_count
-             FROM feedback_edges
-             ORDER BY from_sequence, to_sequence",
-        )?;
-        let mut rows = statement.query([])?;
-        let persisted_episode_count = u64::try_from(persisted_episode_count)
-            .expect("an episode count always fits the atom sequence space");
-        let mut persisted = next_feedback_edge(&mut rows, persisted_episode_count)?;
-        let mut current = memory_feedback_records(memory);
-        let mut expected = current.next();
-
-        loop {
-            if plan.replace_all {
-                while persisted.is_some() {
-                    persisted = next_feedback_edge(&mut rows, persisted_episode_count)?;
-                }
-                break;
-            }
-            match (persisted, expected) {
-                (Some(found), Some(wanted)) => match found.key().cmp(&wanted.key()) {
-                    Ordering::Less => {
-                        plan.push(FeedbackMutation::Delete(found));
-                        persisted = next_feedback_edge(&mut rows, persisted_episode_count)?;
-                    }
-                    Ordering::Equal => {
-                        if found.trace != wanted.trace {
-                            plan.push(FeedbackMutation::Update(wanted));
-                        }
-                        persisted = next_feedback_edge(&mut rows, persisted_episode_count)?;
-                        expected = current.next();
-                    }
-                    Ordering::Greater => {
-                        plan.push(FeedbackMutation::Insert(wanted));
-                        expected = current.next();
-                    }
-                },
-                (Some(found), None) => {
-                    plan.push(FeedbackMutation::Delete(found));
-                    persisted = next_feedback_edge(&mut rows, persisted_episode_count)?;
-                }
-                (None, Some(wanted)) => {
-                    plan.push(FeedbackMutation::Insert(wanted));
-                    expected = current.next();
-                }
-                (None, None) => break,
-            }
-        }
-    }
-
-    if plan.replace_all {
-        transaction.execute("DELETE FROM feedback_edges", [])?;
-        let mut insert = transaction.prepare(
-            "INSERT INTO feedback_edges (
-                from_sequence,
-                to_sequence,
-                history_bits,
-                sample_count
-             ) VALUES (?1, ?2, ?3, ?4)",
-        )?;
-        for edge in memory_feedback_records(memory) {
-            let from = codec::encode_u64(edge.from);
-            let to = codec::encode_u64(edge.to);
-            insert.execute((
-                from.as_slice(),
-                to.as_slice(),
-                i64::from(edge.trace.history_bits()),
-                i64::from(edge.trace.sample_count()),
-            ))?;
-        }
-        return Ok(());
-    }
-
-    if plan.mutations.is_empty() {
-        return Ok(());
-    }
-
-    let mut delete = transaction.prepare(
-        "DELETE FROM feedback_edges
-         WHERE from_sequence = ?1 AND to_sequence = ?2",
-    )?;
-    let mut insert = transaction.prepare(
-        "INSERT INTO feedback_edges (
-            from_sequence,
-            to_sequence,
-            history_bits,
-            sample_count
-         ) VALUES (?1, ?2, ?3, ?4)",
-    )?;
-    let mut update = transaction.prepare(
-        "UPDATE feedback_edges SET history_bits = ?3, sample_count = ?4
-         WHERE from_sequence = ?1 AND to_sequence = ?2",
-    )?;
-    for mutation in plan.mutations {
-        match mutation {
-            FeedbackMutation::Delete(edge) => {
-                let from = codec::encode_u64(edge.from);
-                let to = codec::encode_u64(edge.to);
-                delete.execute((from.as_slice(), to.as_slice()))?;
-            }
-            FeedbackMutation::Insert(edge) => {
-                let from = codec::encode_u64(edge.from);
-                let to = codec::encode_u64(edge.to);
-                insert.execute((
-                    from.as_slice(),
-                    to.as_slice(),
-                    i64::from(edge.trace.history_bits()),
-                    i64::from(edge.trace.sample_count()),
-                ))?;
-            }
-            FeedbackMutation::Update(edge) => {
-                let from = codec::encode_u64(edge.from);
-                let to = codec::encode_u64(edge.to);
-                update.execute((
-                    from.as_slice(),
-                    to.as_slice(),
-                    i64::from(edge.trace.history_bits()),
-                    i64::from(edge.trace.sample_count()),
-                ))?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn memory_feedback_records(memory: &Memory) -> impl Iterator<Item = FeedbackRecord> + '_ {
-    memory.feedback_edges().map(|edge| FeedbackRecord {
-        from: edge.from().sequence(),
-        to: edge.to().sequence(),
-        trace: edge.trace(),
-    })
-}
-
-fn next_feedback_edge(
-    rows: &mut Rows<'_>,
-    persisted_episode_count: u64,
-) -> Result<Option<FeedbackRecord>, StoreError> {
-    let Some(row) = rows.next()? else {
-        return Ok(None);
-    };
-    let edge = read_feedback_edge(row)?;
-    if edge.from >= persisted_episode_count || edge.to >= persisted_episode_count {
-        return Err(StoreIntegrityError::InvalidFeedback {
-            from: edge.from,
-            to: edge.to,
-            detail: "edge endpoint is absent",
-        }
-        .into());
-    }
-    Ok(Some(edge))
-}
-
-fn read_feedback_edge(row: &Row<'_>) -> Result<FeedbackRecord, StoreError> {
-    let from = read_u64(row, 0, "feedback_edges", "from_sequence")?;
-    let to = read_u64(row, 1, "feedback_edges", "to_sequence")?;
-    if from == to {
-        return Err(StoreIntegrityError::InvalidFeedback {
-            from,
-            to,
-            detail: "self-edge",
-        }
-        .into());
-    }
-    let history_bits = read_integer(row, 2, "feedback_edges", "history_bits")?;
-    let sample_count = read_integer(row, 3, "feedback_edges", "sample_count")?;
-    let trace = u16::try_from(history_bits)
-        .ok()
-        .zip(u8::try_from(sample_count).ok())
-        .and_then(|(history_bits, sample_count)| {
-            FeedbackTrace::from_parts(history_bits, sample_count)
-        })
-        .ok_or(StoreIntegrityError::InvalidFeedback {
-            from,
-            to,
-            detail: "feedback trace is not canonical",
-        })?;
-    Ok(FeedbackRecord { from, to, trace })
 }
 
 fn read_integer(
@@ -1432,7 +496,9 @@ fn read_memory_id(
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use nao_m_e::{EpisodeDraft, PredicateId, SourceId, Statement, TermId, TimestampMs};
+    use nao_m_e::{
+        EpisodeDraft, FeedbackTrace, PredicateId, SourceId, Statement, TermId, TimestampMs,
+    };
     use rusqlite::{Connection, params};
     use tempfile::{TempDir, tempdir};
 
@@ -1505,47 +571,6 @@ mod tests {
     }
 
     #[test]
-    fn symbol_cursor_preserves_the_complete_u64_range_atomically() {
-        assert_eq!(
-            NextSymbolId::Next(u64::MAX).allocate(0),
-            Some((Vec::new(), NextSymbolId::Next(u64::MAX)))
-        );
-        assert_eq!(
-            NextSymbolId::Next(u64::MAX).allocate(1),
-            Some((vec![u64::MAX], NextSymbolId::Exhausted))
-        );
-        assert_eq!(NextSymbolId::Next(u64::MAX).allocate(2), None);
-        assert_eq!(
-            NextSymbolId::Exhausted.allocate(0),
-            Some((Vec::new(), NextSymbolId::Exhausted))
-        );
-        assert_eq!(NextSymbolId::Exhausted.allocate(1), None);
-    }
-
-    #[test]
-    fn normalized_batches_compact_raw_and_canonical_duplicates_in_input_order() {
-        let repeated = "  ZETA\t".to_owned();
-        let values = vec![
-            repeated.clone(),
-            repeated.clone(),
-            "ＺＥＴＡ".to_owned(),
-            "alpha".to_owned(),
-            "ALPHA".to_owned(),
-            "zeta".to_owned(),
-            "Beta".to_owned(),
-            repeated,
-        ];
-
-        assert_eq!(
-            normalize_batch(SymbolNamespace::Term, &values).unwrap(),
-            NormalizedBatch {
-                unique_values: vec!["zeta".to_owned(), "alpha".to_owned(), "beta".to_owned()],
-                positions: vec![0, 0, 0, 1, 1, 0, 2, 0],
-            }
-        );
-    }
-
-    #[test]
     fn failed_episode_dml_rolls_back_pending_symbols_and_revision() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("memory.sqlite3");
@@ -1574,8 +599,8 @@ mod tests {
             .unwrap();
 
         assert!(store.save().is_err());
-        assert_eq!(store.predicates.pending.len(), 1);
-        assert_eq!(store.terms.pending.len(), 1);
+        assert_eq!(store.predicates.pending_len(), 1);
+        assert_eq!(store.terms.pending_len(), 1);
         assert_eq!(store.expected_revision, 0);
         let persisted: (i64, i64, i64, i64) = store
             .connection
@@ -1884,27 +909,6 @@ mod tests {
             })
             .unwrap();
         assert_eq!(mutation_count, 0);
-    }
-
-    #[test]
-    fn feedback_plan_bounds_buffer_before_bulk_replacement() {
-        let mut plan = FeedbackPlan::default();
-        for to in 0..=MAX_BUFFERED_FEEDBACK_MUTATIONS {
-            plan.push(FeedbackMutation::Insert(FeedbackRecord {
-                from: 0,
-                to: u64::try_from(to).unwrap(),
-                trace: trace(1, 1),
-            }));
-        }
-
-        assert!(plan.replace_all);
-        assert!(plan.mutations.is_empty());
-        plan.push(FeedbackMutation::Delete(FeedbackRecord {
-            from: 1,
-            to: 2,
-            trace: trace(0, 1),
-        }));
-        assert!(plan.mutations.is_empty());
     }
 
     #[test]
