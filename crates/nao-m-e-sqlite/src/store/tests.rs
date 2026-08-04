@@ -1,43 +1,35 @@
 use std::path::{Path, PathBuf};
 
-use nao_m_e::{EpisodeDraft, FeedbackTrace, PredicateId, Statement, TermId, TimestampMs};
+use nao_m_e::{Attribute, EpisodeDraft, FeedbackTrace, SymbolId, TimestampMs};
 use rusqlite::{Connection, params};
 use tempfile::{TempDir, tempdir};
 
 use super::*;
 
-fn statement(predicate: u64, arguments: &[u64]) -> Statement {
-    Statement::new(
-        PredicateId::new(predicate),
-        arguments.iter().copied().map(TermId::new).collect(),
+fn attribute(key: u64, values: &[u64]) -> Attribute {
+    Attribute::new(
+        SymbolId::new(key),
+        values.iter().copied().map(SymbolId::new).collect(),
     )
-    .expect("test statement has arguments")
+    .expect("test attribute has values")
 }
 
 fn draft(seed: u64) -> EpisodeDraft {
-    EpisodeDraft {
-        timestamp: TimestampMs::new(-i64::try_from(seed).expect("small test seed")),
-        context: vec![statement(0, &[0])],
-        observation: statement(1, &[1, 2]),
-        action: Some(statement(2, &[3])),
-        outcome: None,
-    }
+    EpisodeDraft::new(
+        TimestampMs::new(-i64::try_from(seed).expect("small test seed")),
+        vec![attribute(0, &[1, 2]), attribute(3, &[4])],
+    )
+    .expect("test episode has attributes")
 }
 
 fn insert(store: &mut SqliteStore, episode: EpisodeDraft) -> AtomId {
     store
-        .intern_predicates(&[
-            "context".to_owned(),
-            "observation".to_owned(),
-            "action".to_owned(),
-        ])
-        .unwrap();
-    store
-        .intern_terms(&[
-            "context-term".to_owned(),
-            "observation-left".to_owned(),
-            "observation-right".to_owned(),
-            "action-term".to_owned(),
+        .intern_symbols(&[
+            "first-key".to_owned(),
+            "first-value".to_owned(),
+            "second-value".to_owned(),
+            "second-key".to_owned(),
+            "third-value".to_owned(),
         ])
         .unwrap();
     store.memory_mut().insert_episode(episode).unwrap()
@@ -74,17 +66,18 @@ fn failed_episode_dml_rolls_back_pending_symbols_and_revision() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("memory.sqlite3");
     let mut store = SqliteStore::create(&path).unwrap();
-    let predicate = store.intern_predicates(&["predicate".to_owned()]).unwrap()[0];
-    let term = store.intern_terms(&["term".to_owned()]).unwrap()[0];
+    let symbols = store
+        .intern_symbols(&["key".to_owned(), "value".to_owned()])
+        .unwrap();
     store
         .memory_mut()
-        .insert_episode(EpisodeDraft {
-            timestamp: TimestampMs::new(0),
-            context: Vec::new(),
-            observation: statement(predicate.get(), &[term.get()]),
-            action: None,
-            outcome: None,
-        })
+        .insert_episode(
+            EpisodeDraft::new(
+                TimestampMs::new(0),
+                vec![Attribute::new(symbols[0], vec![symbols[1]]).unwrap()],
+            )
+            .unwrap(),
+        )
         .unwrap();
     store
         .connection
@@ -96,22 +89,20 @@ fn failed_episode_dml_rolls_back_pending_symbols_and_revision() {
         .unwrap();
 
     assert!(store.save().is_err());
-    assert_eq!(store.predicates.pending_len(), 1);
-    assert_eq!(store.terms.pending_len(), 1);
+    assert_eq!(store.symbols.pending_len(), 2);
     assert_eq!(store.expected_revision, 0);
-    let persisted: (i64, i64, i64, i64) = store
+    let persisted: (i64, i64, i64) = store
         .connection
         .query_row(
             "SELECT snapshot_revision,
-                    (SELECT count(*) FROM predicates),
-                    (SELECT count(*) FROM terms),
+                    (SELECT count(*) FROM symbols),
                     (SELECT count(*) FROM episodes)
              FROM memory_meta",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(persisted, (0, 0, 0, 0));
+    assert_eq!(persisted, (0, 0, 0));
 }
 
 #[test]
@@ -120,7 +111,7 @@ fn non_contiguous_symbol_identifiers_are_rejected() {
     let path = saved_store(&directory, 0);
     let raw = Connection::open(&path).unwrap();
     raw.execute(
-        "INSERT INTO predicates (id, value) VALUES (?1, 'gap')",
+        "INSERT INTO symbols (id, value) VALUES (?1, 'gap')",
         [format::encode_u64(1).as_slice()],
     )
     .unwrap();
@@ -129,7 +120,6 @@ fn non_contiguous_symbol_identifiers_are_rejected() {
     assert!(matches!(
         integrity_error(&path),
         StoreIntegrityError::NonContiguousSymbolId {
-            namespace: "predicate",
             expected: 0,
             found: 1
         }
@@ -138,7 +128,7 @@ fn non_contiguous_symbol_identifiers_are_rejected() {
 
 #[test]
 fn metadata_and_unsupported_formats_fail_closed_with_specific_errors() {
-    for unsupported in [1, 2, 3, 4, format::FORMAT_VERSION + 1] {
+    for unsupported in [1, 2, 3, 4, 5, format::FORMAT_VERSION + 1] {
         let directory = tempdir().unwrap();
         let path = saved_store(&directory, 0);
         let raw = Connection::open(&path).unwrap();
@@ -179,6 +169,7 @@ fn rejected_identity_format_or_journal_mode_never_rewrites_the_file_mode() {
         Some(2),
         Some(3),
         Some(4),
+        Some(5),
         Some(format::FORMAT_VERSION),
         Some(format::FORMAT_VERSION + 1),
     ] {
@@ -249,8 +240,11 @@ fn payload_and_sequence_corruption_are_rejected() {
     let directory = tempdir().unwrap();
     let path = saved_store(&directory, 1);
     let raw = Connection::open(&path).unwrap();
-    raw.execute("UPDATE episodes SET payload = x'00'", [])
-        .unwrap();
+    raw.execute(
+        "UPDATE episodes SET payload = ?1",
+        [[0_u8; format::MIN_EPISODE_PAYLOAD_BYTES].as_slice()],
+    )
+    .unwrap();
     drop(raw);
     assert!(matches!(
         integrity_error(&path),

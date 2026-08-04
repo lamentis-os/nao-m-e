@@ -3,8 +3,8 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use nao_m_e::{
-    AtomId, EpisodeAtom, EpisodeDraft, FeedbackEdge, FeedbackTrace, Memory, MemoryId, PredicateId,
-    Statement, TermId, TimestampMs,
+    AtomId, Attribute, EpisodeAtom, EpisodeDraft, FeedbackEdge, FeedbackTrace, Memory, MemoryId,
+    SymbolId, TimestampMs,
 };
 use nao_m_e_sqlite::{SqliteStore, StoreError, StoreIntegrityError};
 use rusqlite::Connection;
@@ -29,63 +29,45 @@ fn database_path(directory: &TempDir) -> std::path::PathBuf {
     directory.path().join("memory.sqlite3")
 }
 
-fn statement(predicate: u64, arguments: &[u64]) -> Statement {
-    Statement::new(
-        PredicateId::new(predicate),
-        arguments.iter().copied().map(TermId::new).collect(),
+fn attribute(key: u64, values: &[u64]) -> Attribute {
+    Attribute::new(
+        SymbolId::new(key),
+        values.iter().copied().map(SymbolId::new).collect(),
     )
-    .expect("test statement has arguments")
+    .expect("test attribute has values")
 }
 
 fn draft(seed: u64) -> EpisodeDraft {
     let timestamp = i64::try_from(seed).expect("test seed fits an i64");
-    EpisodeDraft {
-        timestamp: TimestampMs::new(timestamp),
-        context: vec![statement(0, &[0])],
-        observation: statement(1, &[1, 2]),
-        action: Some(statement(2, &[3])),
-        outcome: Some(statement(3, &[4])),
-    }
+    EpisodeDraft::new(
+        TimestampMs::new(timestamp),
+        vec![attribute(0, &[1, 2]), attribute(3, &[4])],
+    )
+    .expect("test episode has attributes")
 }
 
-fn observation_draft(seed: u64, predicate: u64, arguments: &[u64]) -> EpisodeDraft {
+fn attribute_draft(seed: u64, key: u64, values: &[u64]) -> EpisodeDraft {
     let timestamp = i64::try_from(seed).expect("test seed fits an i64");
-    EpisodeDraft {
-        timestamp: TimestampMs::new(timestamp),
-        context: Vec::new(),
-        observation: statement(predicate, arguments),
-        action: None,
-        outcome: None,
-    }
+    EpisodeDraft::new(TimestampMs::new(timestamp), vec![attribute(key, values)])
+        .expect("test episode has attributes")
 }
 
 fn insert(store: &mut SqliteStore, episode: EpisodeDraft) -> AtomId {
-    let statements = episode
-        .context
+    let symbol_max = episode
+        .attributes()
         .iter()
-        .chain(std::iter::once(&episode.observation))
-        .chain(episode.action.iter())
-        .chain(episode.outcome.iter());
-    let predicate_max = statements
-        .clone()
-        .map(|statement| statement.predicate().get())
+        .flat_map(|attribute| {
+            std::iter::once(attribute.key()).chain(attribute.values().iter().copied())
+        })
+        .map(SymbolId::get)
         .max()
-        .expect("an episode always has an observation");
-    let term_max = statements
-        .flat_map(|statement| statement.arguments())
-        .map(|term| term.get())
-        .max()
-        .expect("every episode statement has arguments");
-    let predicate_values: Vec<_> = (0..=predicate_max)
-        .map(|id| format!("predicate-{id:020}"))
+        .expect("an episode always has symbols");
+    let symbol_values: Vec<_> = (0..=symbol_max)
+        .map(|id| format!("symbol-{id:020}"))
         .collect();
-    let term_values: Vec<_> = (0..=term_max).map(|id| format!("term-{id:020}")).collect();
     store
-        .intern_predicates(&predicate_values)
-        .expect("test predicate catalog stages");
-    store
-        .intern_terms(&term_values)
-        .expect("test term catalog stages");
+        .intern_symbols(&symbol_values)
+        .expect("test symbol catalog stages");
     store
         .memory_mut()
         .insert_episode(episode)
@@ -102,17 +84,12 @@ fn symbol_batches_normalize_stage_resolve_and_round_trip() {
     let path = database_path(&directory);
     let mut store = SqliteStore::create(&path).unwrap();
 
-    let predicates = store
-        .intern_predicates(&[
+    let symbols = store
+        .intern_symbols(&[
             "  KELVIN\t\nNAME  ".to_owned(),
             "kelvin name".to_owned(),
             "zeta".to_owned(),
             "alpha".to_owned(),
-        ])
-        .unwrap();
-    let terms = store
-        .intern_terms(&[
-            "kelvin name".to_owned(),
             "ＣＡＦÉ".to_owned(),
             "café".to_owned(),
             "İ".to_owned(),
@@ -122,29 +99,23 @@ fn symbol_batches_normalize_stage_resolve_and_round_trip() {
         ])
         .unwrap();
     assert_eq!(
-        predicates,
+        symbols,
         [
-            PredicateId::new(0),
-            PredicateId::new(0),
-            PredicateId::new(1),
-            PredicateId::new(2)
-        ]
-    );
-    assert_eq!(
-        terms,
-        [
-            TermId::new(0),
-            TermId::new(1),
-            TermId::new(1),
-            TermId::new(2),
-            TermId::new(2),
-            TermId::new(3),
-            TermId::new(3)
+            SymbolId::new(0),
+            SymbolId::new(0),
+            SymbolId::new(1),
+            SymbolId::new(2),
+            SymbolId::new(3),
+            SymbolId::new(3),
+            SymbolId::new(4),
+            SymbolId::new(4),
+            SymbolId::new(5),
+            SymbolId::new(5)
         ]
     );
     assert_eq!(
         store
-            .predicate_values(&[predicates[0], PredicateId::new(99), predicates[1]])
+            .symbol_values(&[symbols[0], SymbolId::new(99), symbols[1]])
             .unwrap(),
         [
             Some("kelvin name".to_owned()),
@@ -154,10 +125,9 @@ fn symbol_batches_normalize_stage_resolve_and_round_trip() {
     );
     assert_eq!(
         store
-            .term_values(&[terms[0], terms[1], terms[3], terms[5]])
+            .symbol_values(&[symbols[4], symbols[6], symbols[8]])
             .unwrap(),
         [
-            Some("kelvin name".to_owned()),
             Some("café".to_owned()),
             Some("i\u{0307}".to_owned()),
             Some("left right".to_owned())
@@ -165,42 +135,41 @@ fn symbol_batches_normalize_stage_resolve_and_round_trip() {
     );
 
     let raw = Connection::open(&path).unwrap();
-    let staged_counts: (i64, i64, i64) = raw
+    let staged_counts: (i64, i64) = raw
         .query_row(
             "SELECT snapshot_revision,
-                    (SELECT count(*) FROM predicates),
-                    (SELECT count(*) FROM terms)
+                    (SELECT count(*) FROM symbols)
              FROM memory_meta",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(staged_counts, (0, 0, 0));
+    assert_eq!(staged_counts, (0, 0));
     drop(raw);
 
     store
         .memory_mut()
-        .insert_episode(observation_draft(0, predicates[0].get(), &[terms[0].get()]))
+        .insert_episode(attribute_draft(0, symbols[0].get(), &[symbols[0].get()]))
         .unwrap();
     store.save().unwrap();
     drop(store);
 
     let reopened = SqliteStore::open(&path).unwrap();
     assert_eq!(
-        reopened.predicate_values(&[PredicateId::new(0)]).unwrap(),
-        [Some("kelvin name".to_owned())]
-    );
-    assert_eq!(
         reopened
-            .term_values(&[
-                TermId::new(0),
-                TermId::new(1),
-                TermId::new(2),
-                TermId::new(3)
+            .symbol_values(&[
+                SymbolId::new(0),
+                SymbolId::new(1),
+                SymbolId::new(2),
+                SymbolId::new(3),
+                SymbolId::new(4),
+                SymbolId::new(5)
             ])
             .unwrap(),
         [
             Some("kelvin name".to_owned()),
+            Some("zeta".to_owned()),
+            Some("alpha".to_owned()),
             Some("café".to_owned()),
             Some("i\u{0307}".to_owned()),
             Some("left right".to_owned())
@@ -214,10 +183,8 @@ fn invalid_symbol_batch_is_atomic_and_resolve_chunks_large_requests() {
     let path = database_path(&directory);
     let mut store = SqliteStore::create(&path).unwrap();
 
-    assert!(store.intern_predicates(&[]).unwrap().is_empty());
-    assert!(store.intern_terms(&[]).unwrap().is_empty());
-    assert!(store.predicate_values(&[]).unwrap().is_empty());
-    assert!(store.term_values(&[]).unwrap().is_empty());
+    assert!(store.intern_symbols(&[]).unwrap().is_empty());
+    assert!(store.symbol_values(&[]).unwrap().is_empty());
 
     for (values, expected_detail) in [
         (
@@ -234,8 +201,8 @@ fn invalid_symbol_batch_is_atomic_and_resolve_chunks_large_requests() {
         ),
     ] {
         assert!(matches!(
-            store.intern_predicates(&values),
-            Err(StoreError::InvalidSymbolValue { index: 1, detail, .. })
+            store.intern_symbols(&values),
+            Err(StoreError::InvalidSymbolValue { index: 1, detail })
                 if detail == expected_detail
         ));
     }
@@ -248,34 +215,33 @@ fn invalid_symbol_batch_is_atomic_and_resolve_chunks_large_requests() {
         "late\0control".to_owned(),
     ];
     assert!(matches!(
-        store.intern_predicates(&repeated_before_invalid),
+        store.intern_symbols(&repeated_before_invalid),
         Err(StoreError::InvalidSymbolValue {
-            namespace: "predicate",
             index: 4,
             detail: "normalized value contains a control character"
         })
     ));
 
     let values: Vec<_> = (0..1_801).map(|index| format!("symbol-{index}")).collect();
-    let ids = store.intern_predicates(&values).unwrap();
-    assert_eq!(ids.first(), Some(&PredicateId::new(0)));
-    assert_eq!(ids.last(), Some(&PredicateId::new(1_800)));
+    let ids = store.intern_symbols(&values).unwrap();
+    assert_eq!(ids.first(), Some(&SymbolId::new(0)));
+    assert_eq!(ids.last(), Some(&SymbolId::new(1_800)));
     store.save().unwrap();
     drop(store);
 
     let mut reopened = SqliteStore::open(&path).unwrap();
     assert_eq!(
-        reopened.intern_predicates(&values[..1_800]).unwrap(),
+        reopened.intern_symbols(&values[..1_800]).unwrap(),
         ids[..1_800]
     );
-    assert_eq!(reopened.intern_predicates(&values).unwrap(), ids);
+    assert_eq!(reopened.intern_symbols(&values).unwrap(), ids);
 
-    let unknown = PredicateId::new(9_999);
+    let unknown = SymbolId::new(9_999);
     let mut requested = Vec::with_capacity(ids.len() + 6);
     requested.extend([ids[900], unknown, ids[1_800]]);
     requested.extend(ids.iter().rev().copied());
     requested.extend([ids[900], ids[0], unknown]);
-    let resolved = reopened.predicate_values(&requested).unwrap();
+    let resolved = reopened.symbol_values(&requested).unwrap();
     assert_eq!(resolved.len(), requested.len());
     for (id, value) in requested.iter().zip(&resolved) {
         let expected = usize::try_from(id.get())
@@ -291,7 +257,7 @@ fn missing_symbol_after_open_fails_without_changing_store_and_resolution_can_ret
     let path = database_path(&directory);
     let mut store = SqliteStore::create(&path).unwrap();
     let values = ["first".to_owned(), "temporarily missing".to_owned()];
-    let ids = store.intern_predicates(&values).unwrap();
+    let ids = store.intern_symbols(&values).unwrap();
     store.save().unwrap();
     drop(store);
 
@@ -307,20 +273,19 @@ fn missing_symbol_after_open_fails_without_changing_store_and_resolution_can_ret
         .unwrap();
     let missing_id: Vec<u8> = raw
         .query_row(
-            "SELECT id FROM predicates WHERE value = ?1",
+            "SELECT id FROM symbols WHERE value = ?1",
             [&values[1]],
             |row| row.get(0),
         )
         .unwrap();
-    raw.execute("DELETE FROM predicates WHERE id = ?1", [&missing_id])
+    raw.execute("DELETE FROM symbols WHERE id = ?1", [&missing_id])
         .unwrap();
 
     let requested = [ids[0], ids[1], ids[0]];
     assert!(matches!(
-        store.predicate_values(&requested),
+        store.symbol_values(&requested),
         Err(StoreError::InvalidStore(
             StoreIntegrityError::InvalidSymbol {
-                namespace: "predicate",
                 id: 1,
                 detail: "symbol row is absent"
             }
@@ -329,7 +294,7 @@ fn missing_symbol_after_open_fails_without_changing_store_and_resolution_can_ret
     assert_eq!(snapshot(store.memory()), memory_before);
 
     raw.execute(
-        "INSERT INTO predicates (id, value) VALUES (?1, ?2)",
+        "INSERT INTO symbols (id, value) VALUES (?1, ?2)",
         (missing_id, &values[1]),
     )
     .unwrap();
@@ -342,7 +307,7 @@ fn missing_symbol_after_open_fails_without_changing_store_and_resolution_can_ret
         .unwrap();
     assert_eq!(revision_after, revision_before);
     assert_eq!(
-        store.predicate_values(&requested).unwrap(),
+        store.symbol_values(&requested).unwrap(),
         [
             Some(values[0].clone()),
             Some(values[1].clone()),
@@ -361,7 +326,7 @@ fn symbol_byte_limit_and_lowercase_without_case_folding_are_exact() {
     let exact_limit = "é".repeat(2_048);
     let over_limit = format!("{exact_limit}x");
     let ids = store
-        .intern_terms(&[
+        .intern_symbols(&[
             exact_limit.clone(),
             "Straße".to_owned(),
             "STRASSE".to_owned(),
@@ -369,17 +334,16 @@ fn symbol_byte_limit_and_lowercase_without_case_folding_are_exact() {
             "comma value".to_owned(),
         ])
         .unwrap();
-    assert_eq!(ids, (0..5).map(TermId::new).collect::<Vec<_>>());
+    assert_eq!(ids, (0..5).map(SymbolId::new).collect::<Vec<_>>());
     assert!(matches!(
-        store.intern_terms(&[over_limit]),
+        store.intern_symbols(&[over_limit]),
         Err(StoreError::InvalidSymbolValue {
-            namespace: "term",
             index: 0,
             detail: "normalized UTF-8 value exceeds 4096 bytes"
         })
     ));
     assert_eq!(
-        store.term_values(&ids).unwrap(),
+        store.symbol_values(&ids).unwrap(),
         [
             Some(exact_limit),
             Some("straße".to_owned()),
@@ -397,72 +361,62 @@ fn save_rejects_uninterned_symbols_atomically_and_can_retry() {
     let mut store = SqliteStore::create(&path).unwrap();
     store
         .memory_mut()
-        .insert_episode(observation_draft(0, 0, &[0]))
+        .insert_episode(attribute_draft(0, 0, &[1]))
         .unwrap();
 
     assert!(matches!(
         store.save(),
-        Err(StoreError::UnknownSymbolId {
-            namespace: "predicate",
-            id: 0
-        })
+        Err(StoreError::UnknownSymbolId { id: 0 })
     ));
     let raw = Connection::open(&path).unwrap();
-    let state: (i64, i64, i64, i64) = raw
+    let state: (i64, i64, i64) = raw
         .query_row(
             "SELECT snapshot_revision,
-                    (SELECT count(*) FROM predicates),
-                    (SELECT count(*) FROM terms),
+                    (SELECT count(*) FROM symbols),
                     (SELECT count(*) FROM episodes)
              FROM memory_meta",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(state, (0, 0, 0, 0));
+    assert_eq!(state, (0, 0, 0));
     drop(raw);
 
     assert_eq!(
-        store.intern_predicates(&["predicate".to_owned()]).unwrap(),
-        [PredicateId::new(0)]
+        store.intern_symbols(&["key".to_owned()]).unwrap(),
+        [SymbolId::new(0)]
     );
     assert!(matches!(
         store.save(),
-        Err(StoreError::UnknownSymbolId {
-            namespace: "term",
-            id: 0
-        })
+        Err(StoreError::UnknownSymbolId { id: 1 })
     ));
     let raw = Connection::open(&path).unwrap();
-    let state: (i64, i64, i64, i64) = raw
+    let state: (i64, i64, i64) = raw
         .query_row(
             "SELECT snapshot_revision,
-                    (SELECT count(*) FROM predicates),
-                    (SELECT count(*) FROM terms),
+                    (SELECT count(*) FROM symbols),
                     (SELECT count(*) FROM episodes)
              FROM memory_meta",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(state, (0, 0, 0, 0));
+    assert_eq!(state, (0, 0, 0));
     drop(raw);
 
     assert_eq!(
-        store.intern_terms(&["term".to_owned()]).unwrap(),
-        [TermId::new(0)]
+        store.intern_symbols(&["value".to_owned()]).unwrap(),
+        [SymbolId::new(1)]
     );
     store.save().unwrap();
     drop(store);
     let reopened = SqliteStore::open(&path).unwrap();
     assert_eq!(reopened.memory().episodes().len(), 1);
     assert_eq!(
-        reopened.predicate_values(&[PredicateId::new(0)]).unwrap(),
-        [Some("predicate".to_owned())]
-    );
-    assert_eq!(
-        reopened.term_values(&[TermId::new(0)]).unwrap(),
-        [Some("term".to_owned())]
+        reopened
+            .symbol_values(&[SymbolId::new(0), SymbolId::new(1)])
+            .unwrap(),
+        [Some("key".to_owned()), Some("value".to_owned())]
     );
 }
 
@@ -472,11 +426,12 @@ fn symbol_corruption_and_missing_episode_references_fail_closed() {
         let directory = tempdir().unwrap();
         let path = database_path(&directory);
         let mut store = SqliteStore::create(&path).unwrap();
-        let predicate = store.intern_predicates(&["predicate".to_owned()]).unwrap()[0];
-        let term = store.intern_terms(&["term".to_owned()]).unwrap()[0];
+        let symbols = store
+            .intern_symbols(&["key".to_owned(), "value".to_owned()])
+            .unwrap();
         store
             .memory_mut()
-            .insert_episode(observation_draft(0, predicate.get(), &[term.get()]))
+            .insert_episode(attribute_draft(0, symbols[0].get(), &[symbols[1].get()]))
             .unwrap();
         store.save().unwrap();
         drop(store);
@@ -484,11 +439,18 @@ fn symbol_corruption_and_missing_episode_references_fail_closed() {
         let raw = Connection::open(&path).unwrap();
         match corrupt {
             "value" => {
-                raw.execute("UPDATE predicates SET value = 'NOT NORMALIZED'", [])
-                    .unwrap();
+                raw.execute(
+                    "UPDATE symbols SET value = 'NOT NORMALIZED' WHERE id = ?1",
+                    [0_u64.to_be_bytes().as_slice()],
+                )
+                .unwrap();
             }
             "reference" => {
-                raw.execute("DELETE FROM terms", []).unwrap();
+                raw.execute(
+                    "DELETE FROM symbols WHERE id = ?1",
+                    [1_u64.to_be_bytes().as_slice()],
+                )
+                .unwrap();
             }
             _ => unreachable!(),
         }
@@ -500,7 +462,7 @@ fn symbol_corruption_and_missing_episode_references_fail_closed() {
             Err(StoreError::InvalidStore(StoreIntegrityError::InvalidEpisode { .. }))
                 if corrupt == "reference" => {}
             Err(error) => panic!("unexpected integrity error: {error}"),
-            Ok(_) => panic!("corrupt symbol store opened"),
+            Ok(_) => panic!("corrupt store opened"),
         }
     }
 }
@@ -513,12 +475,12 @@ fn concurrent_symbol_allocators_are_serialized_by_snapshot_cas() {
     let mut first = SqliteStore::open(&path).unwrap();
     let mut stale = SqliteStore::open(&path).unwrap();
     assert_eq!(
-        first.intern_predicates(&["first".to_owned()]).unwrap(),
-        [PredicateId::new(0)]
+        first.intern_symbols(&["first".to_owned()]).unwrap(),
+        [SymbolId::new(0)]
     );
     assert_eq!(
-        stale.intern_predicates(&["stale".to_owned()]).unwrap(),
-        [PredicateId::new(0)]
+        stale.intern_symbols(&["stale".to_owned()]).unwrap(),
+        [SymbolId::new(0)]
     );
     first.save().unwrap();
     assert!(matches!(
@@ -533,7 +495,7 @@ fn concurrent_symbol_allocators_are_serialized_by_snapshot_cas() {
 
     let reopened = SqliteStore::open(&path).unwrap();
     assert_eq!(
-        reopened.predicate_values(&[PredicateId::new(0)]).unwrap(),
+        reopened.symbol_values(&[SymbolId::new(0)]).unwrap(),
         [Some("first".to_owned())]
     );
 }
@@ -610,27 +572,19 @@ fn full_snapshot_round_trips_exactly_and_continues_the_sequence() {
     let path = database_path(&directory);
     let mut store = SqliteStore::create(&path).expect("new store is created");
 
-    let low_context = statement(0, &[0]);
-    let high_context = statement(1, &[1, 2]);
+    let low_attribute = attribute(0, &[1]);
+    let high_attribute = attribute(2, &[0, 2, 3]);
     let first = insert(
         &mut store,
-        EpisodeDraft {
-            timestamp: TimestampMs::new(i64::MIN),
-            context: vec![high_context.clone(), low_context.clone(), high_context],
-            observation: statement(2, &[0, 2, 3]),
-            action: Some(statement(3, &[3, 0])),
-            outcome: Some(statement(0, &[1])),
-        },
+        EpisodeDraft::new(
+            TimestampMs::new(i64::MIN),
+            vec![high_attribute, low_attribute, attribute(2, &[4, 0])],
+        )
+        .unwrap(),
     );
     let second = insert(
         &mut store,
-        EpisodeDraft {
-            timestamp: TimestampMs::new(i64::MAX),
-            context: Vec::new(),
-            observation: statement(1, &[3]),
-            action: None,
-            outcome: None,
-        },
+        EpisodeDraft::new(TimestampMs::new(i64::MAX), vec![attribute(1, &[3])]).unwrap(),
     );
     let third = insert(&mut store, draft(7));
 
@@ -720,9 +674,9 @@ fn cue_derived_recall_is_identical_after_reopen_without_feedback() {
     let directory = tempdir().expect("temporary directory is available");
     let path = database_path(&directory);
     let mut store = SqliteStore::create(&path).expect("new store is created");
-    let source = insert(&mut store, observation_draft(1, 10, &[7, 8]));
-    let target = insert(&mut store, observation_draft(2, 10, &[7, 9]));
-    insert(&mut store, observation_draft(3, 20, &[30]));
+    let source = insert(&mut store, attribute_draft(1, 10, &[7, 8]));
+    let target = insert(&mut store, attribute_draft(2, 10, &[7, 9]));
+    insert(&mut store, attribute_draft(3, 20, &[30]));
 
     let before = store
         .memory()
@@ -730,7 +684,7 @@ fn cue_derived_recall_is_identical_after_reopen_without_feedback() {
         .expect("source is known");
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].atom_id, target);
-    assert_eq!(before[0].activation.as_ppm(), 177_777);
+    assert_eq!(before[0].activation.as_ppm(), 171_428);
     assert_eq!(store.memory().feedback_edges().count(), 0);
     let persisted = snapshot(store.memory());
 
@@ -831,8 +785,8 @@ fn stale_writer_fails_without_overwriting_the_committed_snapshot() {
             .episodes()
             .nth(1)
             .expect("unsaved episode remains in memory")
-            .observation(),
-        &draft(99).observation
+            .attributes(),
+        draft(99).attributes()
     );
     drop(first_writer);
     drop(stale_writer);
@@ -845,8 +799,8 @@ fn stale_writer_fails_without_overwriting_the_committed_snapshot() {
             .episodes()
             .nth(1)
             .expect("first writer episode was persisted")
-            .observation(),
-        &draft(1).observation
+            .attributes(),
+        draft(1).attributes()
     );
 }
 
@@ -872,10 +826,7 @@ fn identical_episodes_remain_distinct_occurrences_after_reopen() {
     assert_eq!(episodes[1].id(), AtomId::from_parts(memory_id, 1));
     assert_ne!(episodes[0], episodes[1]);
     assert_eq!(episodes[0].timestamp(), episodes[1].timestamp());
-    assert_eq!(episodes[0].context(), episodes[1].context());
-    assert_eq!(episodes[0].observation(), episodes[1].observation());
-    assert_eq!(episodes[0].action(), episodes[1].action());
-    assert_eq!(episodes[0].outcome(), episodes[1].outcome());
+    assert_eq!(episodes[0].attributes(), episodes[1].attributes());
 }
 
 #[test]

@@ -1,25 +1,23 @@
-use nao_m_e::{EpisodeAtom, EpisodeDraft, MemoryId, PredicateId, Statement, TermId, TimestampMs};
+use nao_m_e::{Attribute, EpisodeAtom, EpisodeDraft, MemoryId, SymbolId, TimestampMs};
 
 const MEMORY_ID_BYTES: usize = 16;
 const U64_BYTES: usize = 8;
 
-const ACTION_PRESENT: u8 = 1 << 0;
-const OUTCOME_PRESENT: u8 = 1 << 1;
-const KNOWN_FLAGS: u8 = ACTION_PRESENT | OUTCOME_PRESENT;
-const FIXED_EPISODE_PREFIX_BYTES: usize = 1 + U64_BYTES;
-const MIN_STATEMENT_BYTES: usize = U64_BYTES + 1 + U64_BYTES;
+const FIXED_EPISODE_PREFIX_BYTES: usize = U64_BYTES;
+const MIN_ATTRIBUTE_BYTES: usize = U64_BYTES + 1 + U64_BYTES;
 pub(crate) const MIN_EPISODE_PAYLOAD_BYTES: usize =
-    FIXED_EPISODE_PREFIX_BYTES + 1 + MIN_STATEMENT_BYTES;
+    FIXED_EPISODE_PREFIX_BYTES + 1 + MIN_ATTRIBUTE_BYTES;
 
 const TRUNCATED_EPISODE: &str = "episode blob is truncated";
-const RESERVED_FLAGS: &str = "episode flags contain reserved bits";
 const TRUNCATED_COUNT: &str = "count ULEB128 is truncated";
 const OVERFLOWING_COUNT: &str = "count ULEB128 overflows u64";
 const NON_CANONICAL_COUNT: &str = "count ULEB128 is not canonical";
-const STATEMENT_COUNT_EXCEEDS_REST: &str = "episode statement count exceeds remaining bytes";
-const EMPTY_ARGUMENTS: &str = "statement has no arguments";
-const ARGUMENT_COUNT_EXCEEDS_REST: &str = "statement argument count exceeds remaining bytes";
-const NON_CANONICAL_CONTEXT: &str = "context is not strictly sorted and duplicate-free";
+const EMPTY_ATTRIBUTES: &str = "episode has no attributes";
+const ATTRIBUTE_COUNT_EXCEEDS_REST: &str = "episode attribute count exceeds remaining bytes";
+const EMPTY_VALUES: &str = "attribute has no values";
+const VALUE_COUNT_EXCEEDS_REST: &str = "attribute value count exceeds remaining bytes";
+const NON_CANONICAL_ATTRIBUTE_KEYS: &str = "attribute keys are not strictly sorted and unique";
+const NON_CANONICAL_ATTRIBUTE_VALUES: &str = "attribute values are not strictly sorted and unique";
 const TRAILING_BYTES: &str = "episode blob has trailing bytes";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,82 +56,45 @@ pub(crate) fn decode_u64(bytes: &[u8]) -> Option<u64> {
 
 pub(crate) fn encode_episode(episode: &EpisodeAtom, encoded: &mut Vec<u8>) {
     encoded.clear();
-    let mut flags = 0;
-    if episode.action().is_some() {
-        flags |= ACTION_PRESENT;
-    }
-    if episode.outcome().is_some() {
-        flags |= OUTCOME_PRESENT;
-    }
-    encoded.push(flags);
     encoded.extend_from_slice(&episode.timestamp().get().to_be_bytes());
-    encode_count(episode.context().len(), encoded);
-    for statement in episode.context() {
-        encode_statement(statement, encoded);
-    }
-    encode_statement(episode.observation(), encoded);
-    if let Some(action) = episode.action() {
-        encode_statement(action, encoded);
-    }
-    if let Some(outcome) = episode.outcome() {
-        encode_statement(outcome, encoded);
+    encode_count(episode.attributes().len(), encoded);
+    for attribute in episode.attributes() {
+        encode_attribute(attribute, encoded);
     }
 }
 
 pub(crate) fn decode_episode(bytes: &[u8]) -> Result<EpisodeDraft, EpisodeDecodeError> {
     let mut decoder = Decoder::new(bytes);
-    let flags = decoder.read_byte(TRUNCATED_EPISODE)?;
-    if flags & !KNOWN_FLAGS != 0 {
-        return Err(EpisodeDecodeError::new(RESERVED_FLAGS));
-    }
-
     let timestamp = TimestampMs::new(decoder.read_i64()?);
-    let context_count = decoder.read_uleb128()?;
-    let trailing_statement_count =
-        1_u64 + u64::from(flags & ACTION_PRESENT != 0) + u64::from(flags & OUTCOME_PRESENT != 0);
-    let statement_count = context_count
-        .checked_add(trailing_statement_count)
-        .ok_or_else(|| EpisodeDecodeError::new(STATEMENT_COUNT_EXCEEDS_REST))?;
+    let attribute_count = decoder.read_uleb128()?;
+    if attribute_count == 0 {
+        return Err(EpisodeDecodeError::new(EMPTY_ATTRIBUTES));
+    }
     if !count_fits_remaining(
-        statement_count,
-        MIN_STATEMENT_BYTES,
+        attribute_count,
+        MIN_ATTRIBUTE_BYTES,
         decoder.remaining_len(),
     ) {
-        return Err(EpisodeDecodeError::new(STATEMENT_COUNT_EXCEEDS_REST));
+        return Err(EpisodeDecodeError::new(ATTRIBUTE_COUNT_EXCEEDS_REST));
     }
-    let context_count = usize::try_from(context_count)
-        .map_err(|_| EpisodeDecodeError::new(STATEMENT_COUNT_EXCEEDS_REST))?;
+    let attribute_count = usize::try_from(attribute_count)
+        .map_err(|_| EpisodeDecodeError::new(ATTRIBUTE_COUNT_EXCEEDS_REST))?;
 
-    let mut context = Vec::with_capacity(context_count);
-    for _ in 0..context_count {
-        context.push(decoder.read_statement()?);
+    let mut attributes = Vec::with_capacity(attribute_count);
+    for _ in 0..attribute_count {
+        attributes.push(decoder.read_attribute()?);
     }
-    if context.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(EpisodeDecodeError::new(NON_CANONICAL_CONTEXT));
+    if attributes
+        .windows(2)
+        .any(|pair| pair[0].key() >= pair[1].key())
+    {
+        return Err(EpisodeDecodeError::new(NON_CANONICAL_ATTRIBUTE_KEYS));
     }
-
-    let observation = decoder.read_statement()?;
-    let action = if flags & ACTION_PRESENT != 0 {
-        Some(decoder.read_statement()?)
-    } else {
-        None
-    };
-    let outcome = if flags & OUTCOME_PRESENT != 0 {
-        Some(decoder.read_statement()?)
-    } else {
-        None
-    };
     if decoder.remaining_len() != 0 {
         return Err(EpisodeDecodeError::new(TRAILING_BYTES));
     }
 
-    Ok(EpisodeDraft {
-        timestamp,
-        context,
-        observation,
-        action,
-        outcome,
-    })
+    EpisodeDraft::new(timestamp, attributes).map_err(|_| EpisodeDecodeError::new(EMPTY_ATTRIBUTES))
 }
 
 fn encode_count(count: usize, encoded: &mut Vec<u8>) {
@@ -155,11 +116,11 @@ fn encode_uleb128(mut value: u64, encoded: &mut Vec<u8>) {
     }
 }
 
-fn encode_statement(statement: &Statement, encoded: &mut Vec<u8>) {
-    encoded.extend_from_slice(&statement.predicate().get().to_be_bytes());
-    encode_count(statement.arguments().len(), encoded);
-    for term in statement.arguments() {
-        encoded.extend_from_slice(&term.get().to_be_bytes());
+fn encode_attribute(attribute: &Attribute, encoded: &mut Vec<u8>) {
+    encoded.extend_from_slice(&attribute.key().get().to_be_bytes());
+    encode_count(attribute.values().len(), encoded);
+    for value in attribute.values() {
+        encoded.extend_from_slice(&value.get().to_be_bytes());
     }
 }
 
@@ -228,22 +189,25 @@ impl<'a> Decoder<'a> {
         Err(EpisodeDecodeError::new(OVERFLOWING_COUNT))
     }
 
-    fn read_statement(&mut self) -> Result<Statement, EpisodeDecodeError> {
-        let predicate = PredicateId::new(self.read_u64()?);
-        let argument_count = self.read_uleb128()?;
-        if argument_count == 0 {
-            return Err(EpisodeDecodeError::new(EMPTY_ARGUMENTS));
+    fn read_attribute(&mut self) -> Result<Attribute, EpisodeDecodeError> {
+        let key = SymbolId::new(self.read_u64()?);
+        let value_count = self.read_uleb128()?;
+        if value_count == 0 {
+            return Err(EpisodeDecodeError::new(EMPTY_VALUES));
         }
-        if !count_fits_remaining(argument_count, U64_BYTES, self.remaining_len()) {
-            return Err(EpisodeDecodeError::new(ARGUMENT_COUNT_EXCEEDS_REST));
+        if !count_fits_remaining(value_count, U64_BYTES, self.remaining_len()) {
+            return Err(EpisodeDecodeError::new(VALUE_COUNT_EXCEEDS_REST));
         }
-        let argument_count = usize::try_from(argument_count)
-            .map_err(|_| EpisodeDecodeError::new(ARGUMENT_COUNT_EXCEEDS_REST))?;
-        let mut arguments = Vec::with_capacity(argument_count);
-        for _ in 0..argument_count {
-            arguments.push(TermId::new(self.read_u64()?));
+        let value_count = usize::try_from(value_count)
+            .map_err(|_| EpisodeDecodeError::new(VALUE_COUNT_EXCEEDS_REST))?;
+        let mut values = Vec::with_capacity(value_count);
+        for _ in 0..value_count {
+            values.push(SymbolId::new(self.read_u64()?));
         }
-        Statement::new(predicate, arguments).map_err(|_| EpisodeDecodeError::new(EMPTY_ARGUMENTS))
+        if values.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(EpisodeDecodeError::new(NON_CANONICAL_ATTRIBUTE_VALUES));
+        }
+        Attribute::new(key, values).map_err(|_| EpisodeDecodeError::new(EMPTY_VALUES))
     }
 }
 

@@ -21,35 +21,36 @@ state and is rebuilt by replaying the atom sequence.
 
 ## Symbolic episodes
 
-A statement consists of a caller-owned predicate identifier and one or more
-ordered, caller-owned term identifiers. An episode contains one timestamp,
-context statements, one observation, an optional action, and an optional
-outcome.
+An episode consists of one timestamp and a non-empty set of symbolic
+attributes. A caller-owned `SymbolId` can identify either an attribute key or
+an attribute value. The kernel does not interpret these identifiers or assign
+meaning to particular keys.
 
-Insertion sorts and deduplicates the context list by predicate identifier and
-then lexicographically by the ordered argument identifiers. It does not reorder
-a statement's arguments or otherwise interpret caller-owned identifiers.
+An attribute contains one key and a non-empty, unordered set of values.
+Construction sorts and deduplicates each value set. Episode construction sorts
+attributes by key and merges repeated keys by set union. The canonical episode
+therefore has strictly increasing keys, and each attribute has strictly
+increasing values. Attribute or value input order is not retained, and there is
+no positional meaning within a value set.
+
 The timestamp is a signed number of milliseconds since the Unix epoch,
 `1970-01-01T00:00:00Z`. It does not drive recall or feedback, establish
 insertion order, or require the kernel to read a clock.
 
-Recall derives a set of symbolic cues from every statement in an episode. The
-statement roles are `Context`, `Observation`, `Action`, and `Outcome`. For a
-statement with role `r`, predicate `p`, and zero-based ordered arguments `t_i`,
-the cues and their fixed weights are:
+Recall derives these unit-weight cues from every attribute with key `k` and
+each value `v`:
 
 ```text
-Predicate(p)                 1
-Term(t_i)                    1
-RolePredicate(r, p)          2
-RoleArgument(r, p, i, t_i)   4
+Key(k)
+Value(v)
+KeyValue(k, v)
 ```
 
-Each distinct cue occurs at most once in an episode's cue set, even if several
-statements produce it. Predicate and term cues can therefore match across
-roles, while role-predicate and role-argument cues preserve their stated role;
-role-argument cues additionally preserve predicate and argument position.
-The timestamp does not produce cues.
+Each distinct cue occurs at most once in an episode's cue set. Reusing a value
+under different keys can match through `Value(v)`, while `KeyValue(k, v)`
+preserves the exact binding. The cue variants remain distinct, so an identifier
+used as a key does not match the same identifier used only as a value. The
+timestamp does not produce cues.
 
 ## Identity and membership
 
@@ -158,15 +159,14 @@ candidate lookup in that `Memory` then traverses only the source cues and
 their postings plus its direct feedback row rather than globally scanning
 episodes. A target present through several cues or both paths occurs only once.
 
-For source cue set `C_s` and target cue set `C_t`, let `w(c)` be the fixed cue
-weight above. Weighted intersection and union are:
+For source cue set `C_s` and target cue set `C_t`, intersection and union are:
 
 ```text
-intersection = sum(w(c) for c in C_s intersect C_t)
-union        = sum(w(c) for c in C_s union C_t)
+intersection = |C_s intersect C_t|
+union        = |C_s union C_t|
 ```
 
-The structural contribution is weighted Jaccard similarity with integer floor:
+The structural contribution is ordinary Jaccard similarity with integer floor:
 
 ```text
 structural = floor(intersection * STRUCTURAL_GAIN_PPM / union)
@@ -214,7 +214,7 @@ Incoming edges, other source rows, and multi-hop paths do not contribute.
 ## Kernel boundary
 
 The kernel's logical state contains atoms and bounded feedback traces only.
-`Memory` may also hold cue postings and cue-weight totals derived
+`Memory` may also hold cue postings and cue counts derived
 deterministically from immutable atoms; they are neither independently mutable
 nor persistent. The kernel performs no persistence, loading, synchronization,
 or multi-writer coordination. It also performs no free-text processing,

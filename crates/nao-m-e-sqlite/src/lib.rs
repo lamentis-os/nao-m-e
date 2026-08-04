@@ -5,7 +5,7 @@
 //!
 //! A [`SqliteStore`] owns one [`nao_m_e::Memory`]. Mutations remain in
 //! memory until an explicit [`SqliteStore::save`] atomically commits staged
-//! predicate and term symbols, newly appended episodes, and feedback changes.
+//! symbols, newly appended episodes, and feedback changes.
 
 mod error;
 mod format;

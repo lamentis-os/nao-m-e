@@ -1,6 +1,6 @@
 use nao_m_e::{AtomId, EpisodeDraft, GraphError, Memory, TimestampMs};
 
-use super::support::{draft, insert, memory_id, new_memory, statement, trace};
+use super::support::{attribute, insert, memory_id, new_memory, trace};
 
 #[test]
 fn replaying_the_same_atom_sequence_recreates_durable_ids() {
@@ -19,11 +19,16 @@ fn replaying_the_same_atom_sequence_recreates_durable_ids() {
 }
 
 #[test]
-fn insertion_canonicalizes_context_but_keeps_occurrences_distinct() {
-    let low = statement(1, &[1]);
-    let high = statement(2, &[1]);
-    let mut episode = draft(1);
-    episode.context = vec![high.clone(), low.clone(), high];
+fn construction_unions_duplicate_keys_and_values_but_keeps_occurrences_distinct() {
+    let episode = EpisodeDraft::new(
+        TimestampMs::new(1),
+        vec![
+            attribute(2, &[3, 1, 3]),
+            attribute(1, &[4]),
+            attribute(2, &[2, 1]),
+        ],
+    )
+    .expect("episode is non-empty");
 
     let mut memory = new_memory(1);
     let first = memory
@@ -32,39 +37,31 @@ fn insertion_canonicalizes_context_but_keeps_occurrences_distinct() {
     let second = memory.insert_episode(episode).expect("duplicate inserts");
     assert_ne!(first, second);
     assert_eq!(
-        memory.episode(first).expect("atom exists").context(),
-        &[low, statement(2, &[1])]
+        memory.episode(first).expect("atom exists").attributes(),
+        &[attribute(1, &[4]), attribute(2, &[1, 2, 3])]
     );
 }
 
 #[test]
-fn statements_and_timestamp_extremes_preserve_caller_semantics() {
-    let ordered = statement(7, &[30, 20, 10]);
+fn attributes_and_timestamp_extremes_preserve_canonical_caller_semantics() {
+    let canonical = attribute(7, &[30, 20, 10]);
     let mut memory = new_memory(1);
     let earliest = memory
-        .insert_episode(EpisodeDraft {
-            timestamp: TimestampMs::new(i64::MIN),
-            context: Vec::new(),
-            observation: ordered.clone(),
-            action: Some(statement(8, &[1])),
-            outcome: Some(statement(9, &[2])),
-        })
+        .insert_episode(
+            EpisodeDraft::new(TimestampMs::new(i64::MIN), vec![canonical.clone()])
+                .expect("episode is non-empty"),
+        )
         .expect("episode inserts");
     let latest = memory
-        .insert_episode(EpisodeDraft {
-            timestamp: TimestampMs::new(i64::MAX),
-            context: Vec::new(),
-            observation: ordered.clone(),
-            action: Some(statement(8, &[1])),
-            outcome: Some(statement(9, &[2])),
-        })
+        .insert_episode(
+            EpisodeDraft::new(TimestampMs::new(i64::MAX), vec![canonical.clone()])
+                .expect("episode is non-empty"),
+        )
         .expect("episode inserts");
     let stored = memory.episode(earliest).expect("episode exists");
 
     assert_eq!(stored.timestamp(), TimestampMs::new(i64::MIN));
-    assert_eq!(stored.observation(), &ordered);
-    assert_eq!(stored.action(), Some(&statement(8, &[1])));
-    assert_eq!(stored.outcome(), Some(&statement(9, &[2])));
+    assert_eq!(stored.attributes(), &[canonical]);
     assert_eq!(
         memory.episode(latest).expect("episode exists").timestamp(),
         TimestampMs::new(i64::MAX)

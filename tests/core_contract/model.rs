@@ -1,7 +1,7 @@
 use nao_m_e::{
-    Activation, AtomId, FEEDBACK_HISTORY_CAPACITY, FEEDBACK_PRIOR_MASS, FeedbackTrace,
-    LEARNED_GAIN_PPM, MAX_FEEDBACK_TARGETS, MemoryId, MemoryIdError, ModelError, PredicateId,
-    SCALE, STRUCTURAL_GAIN_PPM, Statement, ValueError,
+    Activation, AtomId, Attribute, EpisodeDraft, FEEDBACK_HISTORY_CAPACITY, FEEDBACK_PRIOR_MASS,
+    FeedbackTrace, LEARNED_GAIN_PPM, MAX_FEEDBACK_TARGETS, MemoryId, MemoryIdError, ModelError,
+    SCALE, STRUCTURAL_GAIN_PPM, SymbolId, TimestampMs, ValueError,
 };
 
 use super::support::{memory_id, trace};
@@ -13,9 +13,31 @@ fn model_constructors_and_feedback_parameters_enforce_their_boundaries() {
     assert_eq!(LEARNED_GAIN_PPM, 400_000);
     assert_eq!(MAX_FEEDBACK_TARGETS, 10_000);
     assert_eq!(STRUCTURAL_GAIN_PPM, 400_000);
+    let symbol = SymbolId::from(u64::MAX);
+    assert_eq!(symbol.get(), u64::MAX);
+
+    let attribute = Attribute::new(
+        SymbolId::new(7),
+        vec![SymbolId::new(3), SymbolId::new(1), SymbolId::new(3)],
+    )
+    .expect("attribute has values");
+    assert_eq!(attribute.key(), SymbolId::new(7));
+    assert_eq!(attribute.values(), &[SymbolId::new(1), SymbolId::new(3)]);
     assert_eq!(
-        Statement::new(PredicateId::new(1), Vec::new()),
-        Err(ModelError::EmptyArguments)
+        Attribute::new(SymbolId::new(1), Vec::new()),
+        Err(ModelError::EmptyAttributeValues)
+    );
+    assert_eq!(
+        EpisodeDraft::new(TimestampMs::new(0), Vec::new()),
+        Err(ModelError::EmptyEpisodeAttributes)
+    );
+    assert_eq!(
+        ModelError::EmptyAttributeValues.to_string(),
+        "an attribute requires at least one value"
+    );
+    assert_eq!(
+        ModelError::EmptyEpisodeAttributes.to_string(),
+        "an episode requires at least one attribute"
     );
     assert_eq!(
         Activation::from_ppm(SCALE + 1),

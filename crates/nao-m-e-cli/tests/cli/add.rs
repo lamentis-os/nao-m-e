@@ -1,7 +1,7 @@
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nao_m_e::{EpisodeAtom, Statement};
+use nao_m_e::{Attribute, EpisodeAtom};
 use nao_m_e_sqlite::SqliteStore;
 use tempfile::TempDir;
 
@@ -9,35 +9,33 @@ use super::support::{
     add_minimal, assert_silent_success, cli, failure, init, invoke, success_text,
 };
 
-fn assert_statement(store: &SqliteStore, actual: &Statement, predicate: &str, terms: &[&str]) {
+fn assert_attribute(store: &SqliteStore, actual: &Attribute, key: &str, values: &[&str]) {
     assert_eq!(
         store
-            .predicate_values(&[actual.predicate()])
-            .expect("predicate symbol resolves"),
-        [Some(predicate.to_owned())]
+            .symbol_values(&[actual.key()])
+            .expect("attribute key resolves"),
+        [Some(key.to_owned())]
     );
     assert_eq!(
         store
-            .term_values(actual.arguments())
-            .expect("term symbols resolve"),
-        terms
+            .symbol_values(actual.values())
+            .expect("attribute values resolve"),
+        values
             .iter()
-            .map(|term| Some((*term).to_owned()))
+            .map(|value| Some((*value).to_owned()))
             .collect::<Vec<_>>()
     );
 }
 
 fn assert_minimal_episode(store: &SqliteStore, atom: &EpisodeAtom, seed: u64) {
     assert_eq!(atom.timestamp().get(), i64::try_from(seed).unwrap());
-    assert!(atom.context().is_empty());
-    assert_statement(
+    assert_eq!(atom.attributes().len(), 1);
+    assert_attribute(
         store,
-        atom.observation(),
-        &format!("predicate-{seed}"),
-        &[&format!("term-{seed}")],
+        &atom.attributes()[0],
+        &format!("attribute-{seed}"),
+        &[&format!("value-{seed}")],
     );
-    assert_eq!(atom.action(), None);
-    assert_eq!(atom.outcome(), None);
 }
 
 #[test]
@@ -51,33 +49,33 @@ fn direct_add_outputs_only_the_assigned_sequence_and_quiet_is_silent() {
         .arg(&database)
         .arg("--timestamp")
         .arg("-5")
-        .arg("--predicate")
-        .arg("  OBSERVE: Build  ")
-        .arg("--term")
-        .arg(" Linux, ARM64 ")
-        .arg("--term")
-        .arg("Release Candidate")
-        .arg("--context")
+        .arg("--attribute")
         .arg(" Environment ")
-        .arg("--context-term")
+        .arg("--value")
         .arg(" CI : Linux ")
-        .arg("--context")
+        .arg("--attribute")
         .arg("Project")
-        .arg("--context-term")
+        .arg("--value")
         .arg(" Nao M E ")
-        .arg("--context")
+        .arg("--attribute")
         .arg("environment")
-        .arg("--context-term")
+        .arg("--value")
         .arg("ci : linux")
-        .arg("--action")
+        .arg("--attribute")
+        .arg("  OBSERVE: Build  ")
+        .arg("--value")
+        .arg(" Linux, ARM64 ")
+        .arg("--value")
+        .arg("Release Candidate")
+        .arg("--attribute")
         .arg(" Execute ")
-        .arg("--action-term")
+        .arg("--value")
         .arg(" Cargo Test ")
-        .arg("--outcome")
+        .arg("--attribute")
         .arg(" Result ")
-        .arg("--outcome-term")
+        .arg("--value")
         .arg(" Pass ")
-        .arg("--outcome-term")
+        .arg("--value")
         .arg("No Warnings");
     assert_eq!(success_text(invoke(rich, None)), "0\n");
     assert_silent_success(add_minimal(&database, 8, true));
@@ -86,9 +84,9 @@ fn direct_add_outputs_only_the_assigned_sequence_and_quiet_is_silent() {
         .arg("add")
         .arg(&database)
         .args(["--timestamp", "9"])
-        .arg("--predicate")
+        .arg("--attribute")
         .arg("--quiet")
-        .arg("--term")
+        .arg("--value")
         .arg("--many")
         .arg("--quiet");
     assert_silent_success(invoke(option_like_text, None));
@@ -98,35 +96,35 @@ fn direct_add_outputs_only_the_assigned_sequence_and_quiet_is_silent() {
     assert_eq!(atoms.len(), 3);
     assert_eq!(atoms[0].id().sequence(), 0);
     assert_eq!(atoms[0].timestamp().get(), -5);
-    assert_eq!(atoms[0].context().len(), 2);
-    assert_statement(
+    assert_eq!(atoms[0].attributes().len(), 5);
+    assert_attribute(
         &store,
-        &atoms[0].context()[0],
+        &atoms[0].attributes()[0],
         "environment",
         &["ci : linux"],
     );
-    assert_statement(&store, &atoms[0].context()[1], "project", &["nao m e"]);
-    assert_statement(
+    assert_attribute(&store, &atoms[0].attributes()[1], "project", &["nao m e"]);
+    assert_attribute(
         &store,
-        atoms[0].observation(),
+        &atoms[0].attributes()[2],
         "observe: build",
         &["linux, arm64", "release candidate"],
     );
-    assert_statement(
+    assert_attribute(
         &store,
-        atoms[0].action().expect("action is stored"),
+        &atoms[0].attributes()[3],
         "execute",
         &["cargo test"],
     );
-    assert_statement(
+    assert_attribute(
         &store,
-        atoms[0].outcome().expect("outcome is stored"),
+        &atoms[0].attributes()[4],
         "result",
         &["pass", "no warnings"],
     );
     assert_eq!(atoms[1].id().sequence(), 1);
     assert_minimal_episode(&store, atoms[1], 8);
-    assert_statement(&store, atoms[2].observation(), "--quiet", &["--many"]);
+    assert_attribute(&store, &atoms[2].attributes()[0], "--quiet", &["--many"]);
 }
 
 #[test]
@@ -142,9 +140,9 @@ fn direct_add_round_trips_integer_boundaries() {
             .arg(&database)
             .arg("--timestamp")
             .arg(timestamp.to_string())
-            .arg("--predicate")
+            .arg("--attribute")
             .arg("Boundary")
-            .arg("--term")
+            .arg("--value")
             .arg(timestamp.to_string());
         assert_eq!(success_text(invoke(command, None)), format!("{sequence}\n"));
     }
@@ -166,7 +164,7 @@ fn add_defaults_to_current_unix_milliseconds() {
     command
         .arg("add")
         .arg(&database)
-        .args(["--predicate", "Now", "--term", "Default"]);
+        .args(["--attribute", "Now", "--value", "Default"]);
     assert_eq!(success_text(invoke(command, None)), "0\n");
     let after = unix_milliseconds_now();
 
@@ -197,7 +195,7 @@ fn many_add_shares_one_default_timestamp_preserves_explicit_values_and_is_atomic
     let database = directory.path().join("memory.sqlite3");
     init(&database);
 
-    let input = "# ignored comment\n\n--predicate 'Predicate-1' --term 'Term-1' # trailing comment\r\n  \n--timestamp -3 --predicate \"Predicate 2\" --term 'Term 2' --term 'Term, 3' --context 'Context: Value' --context-term 'Context Term' --action Action --action-term 'Action Term' --outcome Outcome --outcome-term 'Outcome Term'\n--predicate '--quiet' --term '--many' --term escaped\\ value --term \"quoted \\\"value\\\"\"\n";
+    let input = "# ignored comment\n\n--attribute 'Attribute-1' --value 'Value-1' # trailing comment\r\n  \n--timestamp -3 --attribute \"Attribute 2\" --value 'Value 2' --value 'Value, 3' --attribute 'Context: Value' --value 'Context Value' --attribute Action --value 'Action Value' --attribute Outcome --value 'Outcome Value'\n--attribute '--quiet' --value '--many' --value escaped\\ value --value \"quoted \\\"value\\\"\"\n";
     let before_default = unix_milliseconds_now();
     let mut many = cli();
     many.arg("add").arg(&database).arg("--many");
@@ -208,7 +206,7 @@ fn many_add_shares_one_default_timestamp_preserves_explicit_values_and_is_atomic
     quiet.arg("add").arg(&database).arg("--many").arg("--quiet");
     assert_silent_success(invoke(
         quiet,
-        Some("--timestamp 3 --predicate 'Predicate-3' --term 'Term-3'\n"),
+        Some("--timestamp 3 --attribute 'Attribute-3' --value 'Value-3'\n"),
     ));
 
     let store = SqliteStore::open(&database).unwrap();
@@ -217,36 +215,42 @@ fn many_add_shares_one_default_timestamp_preserves_explicit_values_and_is_atomic
     let default_timestamp = atoms[0].timestamp().get();
     assert!((before_default..=after_default).contains(&default_timestamp));
     assert_eq!(atoms[2].timestamp().get(), default_timestamp);
-    assert_statement(&store, atoms[0].observation(), "predicate-1", &["term-1"]);
+    assert_attribute(
+        &store,
+        &atoms[0].attributes()[0],
+        "attribute-1",
+        &["value-1"],
+    );
     assert_eq!(atoms[1].id().sequence(), 1);
     assert_eq!(atoms[1].timestamp().get(), -3);
-    assert_statement(
+    assert_eq!(atoms[1].attributes().len(), 4);
+    assert_attribute(
         &store,
-        atoms[1].observation(),
-        "predicate 2",
-        &["term 2", "term, 3"],
+        &atoms[1].attributes()[0],
+        "attribute 2",
+        &["value 2", "value, 3"],
     );
-    assert_statement(
+    assert_attribute(
         &store,
-        &atoms[1].context()[0],
+        &atoms[1].attributes()[1],
         "context: value",
-        &["context term"],
+        &["context value"],
     );
-    assert_statement(
+    assert_attribute(
         &store,
-        atoms[1].action().unwrap(),
+        &atoms[1].attributes()[2],
         "action",
-        &["action term"],
+        &["action value"],
     );
-    assert_statement(
+    assert_attribute(
         &store,
-        atoms[1].outcome().unwrap(),
+        &atoms[1].attributes()[3],
         "outcome",
-        &["outcome term"],
+        &["outcome value"],
     );
-    assert_statement(
+    assert_attribute(
         &store,
-        atoms[2].observation(),
+        &atoms[2].attributes()[0],
         "--quiet",
         &["--many", "escaped value", "quoted \"value\""],
     );
@@ -255,7 +259,7 @@ fn many_add_shares_one_default_timestamp_preserves_explicit_values_and_is_atomic
 
     let before = fs::read(&database).expect("database is readable before rejected batch");
     let invalid =
-        "--timestamp 4 --predicate Four --term Four\n--timestamp 5 --predicate Five --term\n";
+        "--timestamp 4 --attribute Four --value Four\n--timestamp 5 --attribute Five --value\n";
     let mut rejected = cli();
     rejected.arg("add").arg(&database).arg("--many");
     failure(invoke(rejected, Some(invalid)), 1);
@@ -266,18 +270,27 @@ fn many_add_shares_one_default_timestamp_preserves_explicit_values_and_is_atomic
     let stderr = failure(
         invoke(
             invalid_quote,
-            Some("--timestamp 4 --predicate 'unterminated --term value\n"),
+            Some("--timestamp 4 --attribute 'unterminated --value value\n"),
         ),
         1,
     );
     assert!(stderr.contains("invalid shell quoting"));
+
+    let mut row_quiet = cli();
+    row_quiet.arg("add").arg(&database).arg("--many");
+    let stderr = failure(
+        invoke(row_quiet, Some("--attribute value --value value --quiet\n")),
+        1,
+    );
+    assert!(stderr.contains("`--quiet` is not valid inside an add --many row"));
+    assert_eq!(fs::read(&database).unwrap(), before);
 
     let mut invalid_symbol = cli();
     invalid_symbol.arg("add").arg(&database).arg("--many");
     failure(
         invoke(
             invalid_symbol,
-            Some("--timestamp 4 --predicate Four --term '   '\n"),
+            Some("--timestamp 4 --attribute Four --value '   '\n"),
         ),
         1,
     );
@@ -326,20 +339,32 @@ fn many_add_rejects_duplicate_flags_and_episode_options_without_changing_the_sto
 }
 
 #[test]
-fn removed_episode_metadata_flags_are_rejected_without_changing_the_store() {
+fn removed_episode_role_and_metadata_flags_are_rejected_without_changing_the_store() {
     let directory = TempDir::new().expect("temporary directory");
     let database = directory.path().join("memory.sqlite3");
     init(&database);
     let before = fs::read(&database).expect("database is readable before rejected commands");
 
-    for option in ["--occurred", "--recorded", "--source"] {
+    for option in [
+        "--predicate",
+        "--term",
+        "--context",
+        "--context-term",
+        "--action",
+        "--action-term",
+        "--outcome",
+        "--outcome-term",
+        "--occurred",
+        "--recorded",
+        "--source",
+    ] {
         let mut command = cli();
         command
             .arg("add")
             .arg(&database)
             .arg(option)
             .arg("1")
-            .args(["--predicate", "Observation", "--term", "Value"]);
+            .args(["--attribute", "valid", "--value", "value"]);
         let stderr = failure(invoke(command, None), 2);
         assert!(stderr.contains(&format!("unknown episode option `{option}`")));
         assert_eq!(fs::read(&database).unwrap(), before);

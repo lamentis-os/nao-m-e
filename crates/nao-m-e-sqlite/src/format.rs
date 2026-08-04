@@ -13,13 +13,13 @@ use nao_m_e::MemoryId;
 use rusqlite::{Connection, Error, Result, TransactionBehavior, params};
 
 pub(crate) const APPLICATION_ID: i64 = 0x4E41_4F4D;
-pub(crate) const FORMAT_VERSION: i64 = 5;
+pub(crate) const FORMAT_VERSION: i64 = 6;
 pub(crate) const MAX_SYMBOL_BYTES: usize = 4_096;
 
 const SCHEMA: &str = r#"
 CREATE TABLE memory_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    format_version INTEGER NOT NULL CHECK (format_version = 5),
+    format_version INTEGER NOT NULL CHECK (format_version = 6),
     memory_id BLOB NOT NULL
         CHECK (
             typeof(memory_id) = 'blob'
@@ -29,7 +29,7 @@ CREATE TABLE memory_meta (
     snapshot_revision INTEGER NOT NULL CHECK (snapshot_revision >= 0)
 ) STRICT, WITHOUT ROWID;
 
-CREATE TABLE predicates (
+CREATE TABLE symbols (
     id BLOB PRIMARY KEY
         CHECK (typeof(id) = 'blob' AND length(id) = 8),
     value TEXT NOT NULL
@@ -39,27 +39,14 @@ CREATE TABLE predicates (
         )
 ) STRICT, WITHOUT ROWID;
 
-CREATE UNIQUE INDEX predicates_value_unique
-    ON predicates(value COLLATE BINARY);
-
-CREATE TABLE terms (
-    id BLOB PRIMARY KEY
-        CHECK (typeof(id) = 'blob' AND length(id) = 8),
-    value TEXT NOT NULL
-        CHECK (
-            typeof(value) = 'text'
-            AND length(CAST(value AS BLOB)) BETWEEN 1 AND 4096
-        )
-) STRICT, WITHOUT ROWID;
-
-CREATE UNIQUE INDEX terms_value_unique
-    ON terms(value COLLATE BINARY);
+CREATE UNIQUE INDEX symbols_value_unique
+    ON symbols(value COLLATE BINARY);
 
 CREATE TABLE episodes (
     sequence BLOB PRIMARY KEY
         CHECK (typeof(sequence) = 'blob' AND length(sequence) = 8),
     payload BLOB NOT NULL
-        CHECK (typeof(payload) = 'blob' AND length(payload) > 0)
+        CHECK (typeof(payload) = 'blob' AND length(payload) >= 26)
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE feedback_edges (
@@ -86,12 +73,10 @@ CREATE TABLE feedback_edges (
 "#;
 
 static CANONICAL_SCHEMA: OnceLock<Vec<SchemaObject>> = OnceLock::new();
-const SCHEMA_OBJECTS: [(&str, &str, &str); 7] = [
+const SCHEMA_OBJECTS: [(&str, &str, &str); 5] = [
     ("table", "memory_meta", "memory_meta"),
-    ("table", "predicates", "predicates"),
-    ("index", "predicates_value_unique", "predicates"),
-    ("table", "terms", "terms"),
-    ("index", "terms_value_unique", "terms"),
+    ("table", "symbols", "symbols"),
+    ("index", "symbols_value_unique", "symbols"),
     ("table", "episodes", "episodes"),
     ("table", "feedback_edges", "feedback_edges"),
 ];

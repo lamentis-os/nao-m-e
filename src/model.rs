@@ -3,34 +3,6 @@ use std::fmt;
 
 use crate::parameters::SCALE;
 
-macro_rules! unsigned_id {
-    ($name:ident, $description:literal) => {
-        #[doc = $description]
-        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-        pub struct $name(u64);
-
-        impl $name {
-            #[doc = concat!("Creates a new ", stringify!($name), ".")]
-            #[must_use]
-            pub const fn new(value: u64) -> Self {
-                Self(value)
-            }
-
-            #[doc = concat!("Returns the numeric value of this ", stringify!($name), ".")]
-            #[must_use]
-            pub const fn get(self) -> u64 {
-                self.0
-            }
-        }
-
-        impl From<u64> for $name {
-            fn from(value: u64) -> Self {
-                Self::new(value)
-            }
-        }
-    };
-}
-
 /// Non-zero 128-bit identifier for one logical memory.
 ///
 /// Persist its canonical bytes. [`fmt::Display`] emits exactly 32 lowercase
@@ -126,14 +98,29 @@ impl fmt::Display for AtomId {
     }
 }
 
-unsigned_id!(
-    PredicateId,
-    "Caller-owned identifier for the predicate of a statement."
-);
-unsigned_id!(
-    TermId,
-    "Caller-owned identifier for an entity, value, or other symbolic term."
-);
+/// Caller-owned identifier for a symbolic attribute key or value.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SymbolId(u64);
+
+impl SymbolId {
+    /// Creates a new symbol identifier.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the numeric value of this symbol identifier.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for SymbolId {
+    fn from(value: u64) -> Self {
+        Self::new(value)
+    }
+}
 
 /// Signed milliseconds since the Unix epoch, `1970-01-01T00:00:00Z`.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -159,52 +146,123 @@ impl From<i64> for TimestampMs {
     }
 }
 
-/// A symbolic predicate applied to one or more ordered arguments.
+/// A symbolic attribute key associated with one or more unordered values.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct Statement {
-    predicate: PredicateId,
-    arguments: Box<[TermId]>,
+pub struct Attribute {
+    key: SymbolId,
+    values: Box<[SymbolId]>,
 }
 
-impl Statement {
-    /// Constructs a statement, rejecting an empty argument list.
-    pub fn new(predicate: PredicateId, arguments: Vec<TermId>) -> Result<Self, ModelError> {
-        if arguments.is_empty() {
-            return Err(ModelError::EmptyArguments);
+impl Attribute {
+    /// Constructs an attribute, rejecting an empty value list.
+    ///
+    /// Values are treated as an unordered set and therefore sorted and
+    /// deduplicated by identifier.
+    pub fn new(key: SymbolId, mut values: Vec<SymbolId>) -> Result<Self, ModelError> {
+        if values.is_empty() {
+            return Err(ModelError::EmptyAttributeValues);
         }
+        if values.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Ok(Self {
+                key,
+                values: values.into_boxed_slice(),
+            });
+        }
+        values.sort_unstable();
+        values.dedup();
 
         Ok(Self {
-            predicate,
-            arguments: arguments.into_boxed_slice(),
+            key,
+            values: values.into_boxed_slice(),
         })
     }
 
-    /// Returns the predicate identifier.
+    /// Returns the attribute key identifier.
     #[must_use]
-    pub const fn predicate(&self) -> PredicateId {
-        self.predicate
+    pub const fn key(&self) -> SymbolId {
+        self.key
     }
 
-    /// Returns the ordered argument identifiers.
+    /// Returns the sorted, duplicate-free value identifiers.
     #[must_use]
-    pub fn arguments(&self) -> &[TermId] {
-        &self.arguments
+    pub fn values(&self) -> &[SymbolId] {
+        &self.values
     }
 }
 
 /// Construction data for one episode atom.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EpisodeDraft {
-    /// Unix timestamp associated with the represented episode.
-    pub timestamp: TimestampMs,
-    /// Context statements, sorted and deduplicated on insertion.
-    pub context: Vec<Statement>,
-    /// Observation recorded by the episode.
-    pub observation: Statement,
-    /// Action performed during the episode, if any.
-    pub action: Option<Statement>,
-    /// Observed outcome, if any.
-    pub outcome: Option<Statement>,
+    timestamp: TimestampMs,
+    attributes: Box<[Attribute]>,
+}
+
+impl EpisodeDraft {
+    /// Constructs a non-empty episode draft in canonical attribute order.
+    ///
+    /// Attributes with the same key are merged by set union. The resulting
+    /// keys and every attribute's values are strictly sorted and duplicate-free.
+    pub fn new(timestamp: TimestampMs, mut attributes: Vec<Attribute>) -> Result<Self, ModelError> {
+        if attributes.is_empty() {
+            return Err(ModelError::EmptyEpisodeAttributes);
+        }
+        if attributes.windows(2).all(|pair| pair[0].key < pair[1].key) {
+            return Ok(Self {
+                timestamp,
+                attributes: attributes.into_boxed_slice(),
+            });
+        }
+        attributes.sort_unstable_by_key(Attribute::key);
+        if attributes.windows(2).all(|pair| pair[0].key != pair[1].key) {
+            return Ok(Self {
+                timestamp,
+                attributes: attributes.into_boxed_slice(),
+            });
+        }
+
+        let mut merged: Vec<Attribute> = Vec::with_capacity(attributes.len());
+        let mut attributes = attributes.into_iter().peekable();
+        while let Some(attribute) = attributes.next() {
+            let key = attribute.key;
+            if attributes.peek().is_none_or(|next| next.key != key) {
+                merged.push(attribute);
+                continue;
+            }
+
+            let mut values = attribute.values.into_vec();
+            while attributes.peek().is_some_and(|next| next.key == key) {
+                values.extend(
+                    attributes
+                        .next()
+                        .expect("peeked attribute remains available")
+                        .values
+                        .into_vec(),
+                );
+            }
+            values.sort_unstable();
+            values.dedup();
+            merged.push(Attribute {
+                key,
+                values: values.into_boxed_slice(),
+            });
+        }
+        Ok(Self {
+            timestamp,
+            attributes: merged.into_boxed_slice(),
+        })
+    }
+
+    /// Returns the Unix timestamp associated with the represented episode.
+    #[must_use]
+    pub const fn timestamp(&self) -> TimestampMs {
+        self.timestamp
+    }
+
+    /// Returns the canonical, non-empty attribute set.
+    #[must_use]
+    pub fn attributes(&self) -> &[Attribute] {
+        &self.attributes
+    }
 }
 
 /// An immutable episode stored in a [`crate::Memory`].
@@ -212,24 +270,15 @@ pub struct EpisodeDraft {
 pub struct EpisodeAtom {
     id: AtomId,
     timestamp: TimestampMs,
-    context: Box<[Statement]>,
-    observation: Statement,
-    action: Option<Statement>,
-    outcome: Option<Statement>,
+    attributes: Box<[Attribute]>,
 }
 
 impl EpisodeAtom {
-    pub(crate) fn from_draft(id: AtomId, mut draft: EpisodeDraft) -> Self {
-        draft.context.sort_unstable();
-        draft.context.dedup();
-
+    pub(crate) fn from_draft(id: AtomId, draft: EpisodeDraft) -> Self {
         Self {
             id,
             timestamp: draft.timestamp,
-            context: draft.context.into_boxed_slice(),
-            observation: draft.observation,
-            action: draft.action,
-            outcome: draft.outcome,
+            attributes: draft.attributes,
         }
     }
 
@@ -245,28 +294,10 @@ impl EpisodeAtom {
         self.timestamp
     }
 
-    /// Returns the sorted, duplicate-free context.
+    /// Returns the canonical, non-empty attribute set.
     #[must_use]
-    pub fn context(&self) -> &[Statement] {
-        &self.context
-    }
-
-    /// Returns the required observation.
-    #[must_use]
-    pub const fn observation(&self) -> &Statement {
-        &self.observation
-    }
-
-    /// Returns the optional action.
-    #[must_use]
-    pub const fn action(&self) -> Option<&Statement> {
-        self.action.as_ref()
-    }
-
-    /// Returns the optional outcome.
-    #[must_use]
-    pub const fn outcome(&self) -> Option<&Statement> {
-        self.outcome.as_ref()
+    pub fn attributes(&self) -> &[Attribute] {
+        &self.attributes
     }
 }
 
@@ -366,15 +397,20 @@ impl FeedbackTrace {
 /// Failure while constructing a symbolic model value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModelError {
-    /// A statement was constructed without arguments.
-    EmptyArguments,
+    /// An attribute was constructed without values.
+    EmptyAttributeValues,
+    /// An episode was constructed without attributes.
+    EmptyEpisodeAttributes,
 }
 
 impl fmt::Display for ModelError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptyArguments => {
-                formatter.write_str("a statement requires at least one argument")
+            Self::EmptyAttributeValues => {
+                formatter.write_str("an attribute requires at least one value")
+            }
+            Self::EmptyEpisodeAttributes => {
+                formatter.write_str("an episode requires at least one attribute")
             }
         }
     }

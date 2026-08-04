@@ -8,17 +8,17 @@ use super::support::{
     add_minimal, assert_silent_success, cli, failure, feedback, init, invoke, recall, success_text,
 };
 
-fn add_observation(database: &Path, timestamp: i64, predicate: &str, terms: &[&str]) {
+fn add_episode(database: &Path, timestamp: i64, attribute: &str, values: &[&str]) {
     let mut command = cli();
     command
         .arg("add")
         .arg(database)
         .arg("--timestamp")
         .arg(timestamp.to_string())
-        .arg("--predicate")
-        .arg(predicate);
-    for term in terms {
-        command.arg("--term").arg(term);
+        .arg("--attribute")
+        .arg(attribute);
+    for value in values {
+        command.arg("--value").arg(value);
     }
     command.arg("--quiet");
     assert_silent_success(invoke(command, None));
@@ -63,25 +63,25 @@ fn bounded_feedback_learns_reverses_and_suppresses_structural_matches_across_pro
     let database = directory.path().join("memory.sqlite3");
     init(&database);
 
-    for (timestamp, predicate, terms) in [
+    for (timestamp, attribute, values) in [
         (1, "category", &["seven", "eight"][..]),
         (3, "category", &["seven", "nine"][..]),
         (5, "category", &["nine", "ten"][..]),
         (7, "other", &["seven"][..]),
         (9, "learned only", &["thirty"][..]),
     ] {
-        add_observation(&database, timestamp, predicate, terms);
+        add_episode(&database, timestamp, attribute, values);
     }
 
     assert_eq!(
         recall_scores(&database, 0),
-        vec![(1, 177_777), (2, 52_173), (3, 20_000)]
+        vec![(1, 171_428), (3, 57_142), (2, 44_444)]
     );
 
     let positive_checkpoints = [
         (1, 71_875, 1),
         (2, 127_777, 1),
-        (3, 172_500, 1),
+        (3, 172_500, 0),
         (4, 209_090, 0),
         (8, 306_666, 0),
         (16, 400_000, 0),
@@ -111,7 +111,7 @@ fn bounded_feedback_learns_reverses_and_suppresses_structural_matches_across_pro
         }
     }
 
-    for expected_score in [Some(105_902), Some(50_000), Some(5_277), None] {
+    for expected_score in [Some(99_553), Some(43_651), None, None] {
         assert_silent_success(feedback(&database, 0, false, "1"));
         assert_eq!(score_for(&recall_scores(&database, 0), 1), expected_score);
     }

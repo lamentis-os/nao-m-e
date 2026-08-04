@@ -19,8 +19,7 @@ pub struct SqliteStore {
     memory: Memory,
     persisted_episode_count: usize,
     expected_revision: i64,
-    predicates: symbols::SymbolState,
-    terms: symbols::SymbolState,
+    symbols: symbols::SymbolState,
 }
 
 impl SqliteStore {
@@ -58,8 +57,7 @@ impl SqliteStore {
             memory: loaded.memory,
             persisted_episode_count: loaded.episode_count,
             expected_revision: loaded.revision,
-            predicates: loaded.predicates,
-            terms: loaded.terms,
+            symbols: loaded.symbols,
         })
     }
 
@@ -93,8 +91,7 @@ impl SqliteStore {
             memory,
             persisted_episode_count,
             expected_revision,
-            predicates,
-            terms,
+            symbols,
         } = self;
 
         let episode_count = memory.episodes().len();
@@ -126,13 +123,8 @@ impl SqliteStore {
             return Err(StoreError::RevisionExhausted);
         }
         verify_persisted_tail(&transaction, *persisted_episode_count)?;
-        symbols::verify_symbol_tail(
-            &transaction,
-            symbols::SymbolNamespace::Predicate,
-            predicates,
-        )?;
-        symbols::verify_symbol_tail(&transaction, symbols::SymbolNamespace::Term, terms)?;
-        symbols::validate_new_episode_symbols(memory, *persisted_episode_count, predicates, terms)?;
+        symbols::verify_symbol_tail(&transaction, symbols)?;
+        symbols::validate_new_episode_symbols(memory, *persisted_episode_count, symbols)?;
 
         let next_revision = actual_revision + 1;
         let changed = transaction.execute(
@@ -146,20 +138,14 @@ impl SqliteStore {
             .into());
         }
 
-        symbols::insert_pending_symbols(
-            &transaction,
-            symbols::SymbolNamespace::Predicate,
-            predicates,
-        )?;
-        symbols::insert_pending_symbols(&transaction, symbols::SymbolNamespace::Term, terms)?;
+        symbols::insert_pending_symbols(&transaction, symbols)?;
         append_episodes(&transaction, memory, *persisted_episode_count)?;
         feedback::reconcile(&transaction, memory, *persisted_episode_count)?;
         transaction.commit()?;
 
         *expected_revision = next_revision;
         *persisted_episode_count = episode_count;
-        predicates.mark_saved();
-        terms.mark_saved();
+        symbols.mark_saved();
         Ok(())
     }
 }
@@ -196,8 +182,7 @@ fn build_initial_database(
     if loaded.memory.memory_id() != memory_id
         || loaded.episode_count != 0
         || loaded.revision != 0
-        || !loaded.predicates.is_persisted_empty()
-        || !loaded.terms.is_persisted_empty()
+        || !loaded.symbols.is_persisted_empty()
     {
         return Err(StoreIntegrityError::InvalidMetadata {
             detail: "new store differs from its initialized empty snapshot",
@@ -215,8 +200,7 @@ struct LoadedStore {
     memory: Memory,
     episode_count: usize,
     revision: i64,
-    predicates: symbols::SymbolState,
-    terms: symbols::SymbolState,
+    symbols: symbols::SymbolState,
 }
 
 fn load_memory(connection: &mut Connection) -> Result<LoadedStore, StoreError> {
@@ -225,10 +209,8 @@ fn load_memory(connection: &mut Connection) -> Result<LoadedStore, StoreError> {
     let (memory_id, revision) = read_metadata(&transaction)?;
     verify_schema(&transaction)?;
     verify_quick_check(&transaction)?;
-    let predicates =
-        symbols::validate_symbol_catalog(&transaction, symbols::SymbolNamespace::Predicate)?;
-    let terms = symbols::validate_symbol_catalog(&transaction, symbols::SymbolNamespace::Term)?;
-    let mut memory = reconstruct_memory(&transaction, memory_id, &predicates, &terms)?;
+    let symbols = symbols::validate_symbol_catalog(&transaction)?;
+    let mut memory = reconstruct_memory(&transaction, memory_id, &symbols)?;
     feedback::restore(&transaction, &mut memory)?;
     let episode_count = memory.episodes().len();
     transaction.commit()?;
@@ -236,8 +218,7 @@ fn load_memory(connection: &mut Connection) -> Result<LoadedStore, StoreError> {
         memory,
         episode_count,
         revision,
-        predicates,
-        terms,
+        symbols,
     })
 }
 
@@ -339,8 +320,7 @@ fn read_metadata(connection: &Connection) -> Result<(MemoryId, i64), StoreError>
 fn reconstruct_memory(
     connection: &Connection,
     memory_id: MemoryId,
-    predicates: &symbols::SymbolState,
-    terms: &symbols::SymbolState,
+    symbols: &symbols::SymbolState,
 ) -> Result<Memory, StoreError> {
     let mut statement = connection.prepare(
         "SELECT sequence, payload
@@ -373,7 +353,7 @@ fn reconstruct_memory(
                 detail: error.detail(),
             }
         })?;
-        symbols::validate_persisted_episode_symbols(sequence, &draft, predicates, terms)?;
+        symbols::validate_persisted_episode_symbols(sequence, &draft, symbols)?;
         let id = memory
             .insert_episode(draft)
             .map_err(|_| StoreIntegrityError::InvalidEpisode {

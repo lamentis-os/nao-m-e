@@ -4,7 +4,7 @@ use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nao_m_e::{EpisodeDraft, PredicateId, Statement, TermId, TimestampMs};
+use nao_m_e::{Attribute, EpisodeDraft, SymbolId, TimestampMs};
 use nao_m_e_sqlite::SqliteStore;
 
 use super::{CliResult, Command, ParsedArgs, is_help_request, open_store, parse_number, save};
@@ -12,14 +12,12 @@ use super::{CliResult, Command, ParsedArgs, is_help_request, open_store, parse_n
 const ADD_HELP: &str = "Append symbolic episodes and save atomically.
 
 Usage:
-  nao-m-e add <DATABASE> [--quiet] [--timestamp <UNIX_MS>] --predicate <TEXT> --term <TEXT>... [EPISODE OPTIONS]
+  nao-m-e add <DATABASE> [--quiet] [--timestamp <UNIX_MS>] --attribute <TEXT> --value <TEXT>... [ATTRIBUTE OPTIONS]
   nao-m-e add <DATABASE> --many [--quiet]
 
-Episode options:
-  --timestamp <UNIX_MS>                       Set signed Unix milliseconds; defaults to current time
-  --context <TEXT> --context-term <TEXT>...   Add one context; repeatable
-  --action <TEXT> --action-term <TEXT>...      Set the optional action
-  --outcome <TEXT> --outcome-term <TEXT>...   Set the optional outcome
+Attribute options:
+  --attribute <TEXT> --value <TEXT>...   Add one set-valued attribute; repeatable
+  --timestamp <UNIX_MS>                  Set signed Unix milliseconds; defaults to current time
 
 With --many, standard input contains one shell-quoted single-episode flag row
 per episode. Blank lines and shell comments are ignored. The command parses and
@@ -28,9 +26,9 @@ per episode unless --quiet is present. Missing timestamps share one current-time
 default per invocation.
 ";
 
-struct TextStatement {
-    predicate: String,
-    terms: Vec<String>,
+struct TextAttribute {
+    key: String,
+    values: Vec<String>,
 }
 
 enum EpisodeToken<'a> {
@@ -59,55 +57,12 @@ impl EpisodeToken<'_> {
 
 pub(super) struct TextEpisodeDraft {
     timestamp: Option<TimestampMs>,
-    context: Vec<TextStatement>,
-    observation: TextStatement,
-    action: Option<TextStatement>,
-    outcome: Option<TextStatement>,
+    attributes: Vec<TextAttribute>,
 }
 
 struct EpisodeShape {
     timestamp: TimestampMs,
-    context_term_counts: Vec<usize>,
-    observation_term_count: usize,
-    action_term_count: Option<usize>,
-    outcome_term_count: Option<usize>,
-}
-
-#[derive(Clone, Copy)]
-enum ActiveStatement {
-    Context(usize),
-    Observation,
-    Action,
-    Outcome,
-}
-
-impl ActiveStatement {
-    fn term_option(self) -> &'static str {
-        match self {
-            Self::Context(_) => "--context-term",
-            Self::Observation => "--term",
-            Self::Action => "--action-term",
-            Self::Outcome => "--outcome-term",
-        }
-    }
-
-    fn description(self) -> &'static str {
-        match self {
-            Self::Context(_) => "context",
-            Self::Observation => "observation",
-            Self::Action => "action",
-            Self::Outcome => "outcome",
-        }
-    }
-
-    fn term_description(self) -> &'static str {
-        match self {
-            Self::Context(_) => "context term",
-            Self::Observation => "observation term",
-            Self::Action => "action term",
-            Self::Outcome => "outcome term",
-        }
-    }
+    value_counts: Vec<usize>,
 }
 
 pub(super) fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
@@ -126,35 +81,15 @@ pub(super) fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
         }));
     }
 
-    let (episode_options, quiet) = extract_quiet(options)?;
-    let draft = parse_episode_flags(episode_options.into_iter().map(EpisodeToken::Borrowed))?;
+    let (draft, quiet) = parse_episode_flags(
+        options.iter().map(|value| EpisodeToken::Borrowed(value)),
+        true,
+    )?;
     Ok(ParsedArgs::Execute(Command::Add {
         database: PathBuf::from(database),
         draft: Box::new(draft),
         quiet,
     }))
-}
-
-fn extract_quiet(options: &[OsString]) -> CliResult<(Vec<&OsStr>, bool)> {
-    let mut episode_options = Vec::with_capacity(options.len());
-    let mut quiet = false;
-    let mut index = 0;
-    while index < options.len() {
-        if options[index].as_os_str() == OsStr::new("--quiet") {
-            if quiet {
-                return Err("`--quiet` may be specified only once".to_owned());
-            }
-            quiet = true;
-            index += 1;
-            continue;
-        }
-        episode_options.push(options[index].as_os_str());
-        if let Some(value) = options.get(index + 1) {
-            episode_options.push(value.as_os_str());
-        }
-        index += 2;
-    }
-    Ok((episode_options, quiet))
 }
 
 fn parse_many_options(options: &[OsString]) -> Result<bool, String> {
@@ -177,14 +112,12 @@ fn parse_many_options(options: &[OsString]) -> Result<bool, String> {
 
 fn parse_episode_flags<'a>(
     args: impl IntoIterator<Item = EpisodeToken<'a>>,
-) -> CliResult<TextEpisodeDraft> {
+    allow_quiet: bool,
+) -> CliResult<(TextEpisodeDraft, bool)> {
     let mut timestamp = None;
-    let mut predicate = None;
-    let mut terms = Vec::new();
-    let mut context = Vec::new();
-    let mut action = None;
-    let mut outcome = None;
-    let mut active: Option<ActiveStatement> = None;
+    let mut attributes: Vec<TextAttribute> = Vec::new();
+    let mut active_attribute = None;
+    let mut quiet = false;
     let mut args = args.into_iter();
 
     while let Some(option) = args.next() {
@@ -192,143 +125,73 @@ fn parse_episode_flags<'a>(
             .as_os_str()
             .to_str()
             .ok_or_else(|| "episode options must be valid UTF-8".to_owned())?;
+
+        if option == "--quiet" {
+            if !allow_quiet {
+                return Err("`--quiet` is not valid inside an add --many row".to_owned());
+            }
+            close_attribute(active_attribute.take(), &attributes)?;
+            if quiet {
+                return Err("`--quiet` may be specified only once".to_owned());
+            }
+            quiet = true;
+            continue;
+        }
+
         let value = args
             .next()
             .ok_or_else(|| format!("`{option}` requires a value"))?;
 
-        if matches!(
-            option,
-            "--term" | "--context-term" | "--action-term" | "--outcome-term"
-        ) {
-            let active_statement = active.ok_or_else(|| {
-                format!("`{option}` must immediately follow its statement and terms")
+        if option == "--value" {
+            let index = active_attribute.ok_or_else(|| {
+                "`--value` must immediately follow its attribute and values".to_owned()
             })?;
-            if option != active_statement.term_option() {
-                return Err(format!(
-                    "`{option}` cannot be used in an active {} statement; expected `{}`",
-                    active_statement.description(),
-                    active_statement.term_option()
-                ));
-            }
-            active_terms_mut(
-                active_statement,
-                &mut terms,
-                &mut context,
-                &mut action,
-                &mut outcome,
-            )
-            .push(value.into_text(active_statement.term_description())?);
+            attributes[index]
+                .values
+                .push(value.into_text("attribute value")?);
             continue;
         }
 
-        close_active_statement(
-            active.take(),
-            &mut terms,
-            &mut context,
-            &mut action,
-            &mut outcome,
-        )?;
-
+        close_attribute(active_attribute.take(), &attributes)?;
         match option {
-            "--timestamp" => set_once(
-                &mut timestamp,
-                TimestampMs::new(parse_number(value.as_os_str(), "Unix timestamp")?),
-                option,
-            )?,
-            "--predicate" => {
-                set_once(&mut predicate, value.into_text("predicate")?, option)?;
-                active = Some(ActiveStatement::Observation);
+            "--timestamp" => {
+                if timestamp
+                    .replace(TimestampMs::new(parse_number(
+                        value.as_os_str(),
+                        "Unix timestamp",
+                    )?))
+                    .is_some()
+                {
+                    return Err("`--timestamp` may be specified only once".to_owned());
+                }
             }
-            "--context" => {
-                context.push(TextStatement {
-                    predicate: value.into_text("context predicate")?,
-                    terms: Vec::new(),
+            "--attribute" => {
+                attributes.push(TextAttribute {
+                    key: value.into_text("attribute key")?,
+                    values: Vec::new(),
                 });
-                active = Some(ActiveStatement::Context(context.len() - 1));
-            }
-            "--action" => {
-                set_once(
-                    &mut action,
-                    TextStatement {
-                        predicate: value.into_text("action predicate")?,
-                        terms: Vec::new(),
-                    },
-                    option,
-                )?;
-                active = Some(ActiveStatement::Action);
-            }
-            "--outcome" => {
-                set_once(
-                    &mut outcome,
-                    TextStatement {
-                        predicate: value.into_text("outcome predicate")?,
-                        terms: Vec::new(),
-                    },
-                    option,
-                )?;
-                active = Some(ActiveStatement::Outcome);
+                active_attribute = Some(attributes.len() - 1);
             }
             _ => return Err(format!("unknown episode option `{option}`")),
         }
     }
 
-    close_active_statement(active, &mut terms, &mut context, &mut action, &mut outcome)?;
-
-    let predicate = predicate.ok_or_else(|| "episode requires `--predicate`".to_owned())?;
-
-    Ok(TextEpisodeDraft {
-        timestamp,
-        context,
-        observation: TextStatement { predicate, terms },
-        action,
-        outcome,
-    })
-}
-
-fn active_terms_mut<'a>(
-    active: ActiveStatement,
-    observation_terms: &'a mut Vec<String>,
-    context: &'a mut [TextStatement],
-    action: &'a mut Option<TextStatement>,
-    outcome: &'a mut Option<TextStatement>,
-) -> &'a mut Vec<String> {
-    match active {
-        ActiveStatement::Context(index) => &mut context[index].terms,
-        ActiveStatement::Observation => observation_terms,
-        ActiveStatement::Action => &mut action.as_mut().expect("an active action exists").terms,
-        ActiveStatement::Outcome => &mut outcome.as_mut().expect("an active outcome exists").terms,
+    close_attribute(active_attribute, &attributes)?;
+    if attributes.is_empty() {
+        return Err("episode requires at least one `--attribute`".to_owned());
     }
+    Ok((
+        TextEpisodeDraft {
+            timestamp,
+            attributes,
+        },
+        quiet,
+    ))
 }
 
-fn close_active_statement(
-    active: Option<ActiveStatement>,
-    observation_terms: &mut Vec<String>,
-    context: &mut [TextStatement],
-    action: &mut Option<TextStatement>,
-    outcome: &mut Option<TextStatement>,
-) -> CliResult<()> {
-    if let Some(active) = active {
-        require_terms(
-            active_terms_mut(active, observation_terms, context, action, outcome),
-            active.description(),
-            active.term_option(),
-        )?;
-    }
-    Ok(())
-}
-
-fn set_once<T>(slot: &mut Option<T>, value: T, option: &str) -> CliResult<()> {
-    if slot.replace(value).is_some() {
-        return Err(format!("`{option}` may be specified only once"));
-    }
-    Ok(())
-}
-
-fn require_terms(terms: &[String], statement: &str, option: &str) -> CliResult<()> {
-    if terms.is_empty() {
-        return Err(format!(
-            "{statement} requires at least one `{option}` value"
-        ));
+fn close_attribute(active: Option<usize>, attributes: &[TextAttribute]) -> CliResult<()> {
+    if active.is_some_and(|index| attributes[index].values.is_empty()) {
+        return Err("attribute requires at least one `--value` value".to_owned());
     }
     Ok(())
 }
@@ -341,11 +204,13 @@ pub(super) fn read_many_drafts() -> CliResult<Vec<TextEpisodeDraft>> {
             line.map_err(|error| format!("could not read add --many line {line_number}: {error}"))?;
         let words = shlex::split(&line)
             .ok_or_else(|| format!("add --many line {line_number}: invalid shell quoting"))?;
+        drop(line);
         if words.is_empty() {
             continue;
         }
-        let draft = parse_episode_flags(words.into_iter().map(EpisodeToken::Owned))
+        let (draft, quiet) = parse_episode_flags(words.into_iter().map(EpisodeToken::Owned), false)
             .map_err(|error| format!("add --many line {line_number}: {error}"))?;
+        debug_assert!(!quiet);
         drafts.push(draft);
     }
     if drafts.is_empty() {
@@ -403,138 +268,72 @@ fn intern_drafts(
     store: &mut SqliteStore,
     drafts: Vec<TextEpisodeDraft>,
 ) -> CliResult<Vec<EpisodeDraft>> {
-    let (predicate_values, term_values, shapes) = flatten_drafts(drafts);
-    let predicate_ids = store
-        .intern_predicates(&predicate_values)
+    let (symbol_values, shapes) = flatten_drafts(drafts);
+    let symbol_ids = store
+        .intern_symbols(&symbol_values)
         .map_err(|error| error.to_string())?;
-    let term_ids = store
-        .intern_terms(&term_values)
-        .map_err(|error| error.to_string())?;
-    resolve_drafts(shapes, predicate_ids, term_ids)
+    drop(symbol_values);
+    resolve_drafts(shapes, symbol_ids)
 }
 
-fn flatten_drafts(drafts: Vec<TextEpisodeDraft>) -> (Vec<String>, Vec<String>, Vec<EpisodeShape>) {
-    let statement_count = drafts
+fn flatten_drafts(drafts: Vec<TextEpisodeDraft>) -> (Vec<String>, Vec<EpisodeShape>) {
+    let symbol_count = drafts
         .iter()
-        .map(|draft| {
-            draft.context.len()
-                + 1
-                + usize::from(draft.action.is_some())
-                + usize::from(draft.outcome.is_some())
-        })
+        .flat_map(|draft| &draft.attributes)
+        .map(|attribute| 1 + attribute.values.len())
         .sum();
-    let term_count = drafts
-        .iter()
-        .map(|draft| {
-            draft
-                .context
-                .iter()
-                .map(|statement| statement.terms.len())
-                .sum::<usize>()
-                + draft.observation.terms.len()
-                + draft
-                    .action
-                    .as_ref()
-                    .map_or(0, |statement| statement.terms.len())
-                + draft
-                    .outcome
-                    .as_ref()
-                    .map_or(0, |statement| statement.terms.len())
-        })
-        .sum();
-    let mut predicate_values = Vec::with_capacity(statement_count);
-    let mut term_values = Vec::with_capacity(term_count);
+    let mut symbol_values = Vec::with_capacity(symbol_count);
     let mut shapes = Vec::with_capacity(drafts.len());
 
     for draft in drafts {
-        let context_term_counts = draft
-            .context
-            .into_iter()
-            .map(|statement| flatten_statement(statement, &mut predicate_values, &mut term_values))
-            .collect();
-        let observation_term_count =
-            flatten_statement(draft.observation, &mut predicate_values, &mut term_values);
-        let action_term_count = draft
-            .action
-            .map(|statement| flatten_statement(statement, &mut predicate_values, &mut term_values));
-        let outcome_term_count = draft
-            .outcome
-            .map(|statement| flatten_statement(statement, &mut predicate_values, &mut term_values));
+        let mut value_counts = Vec::with_capacity(draft.attributes.len());
+        for attribute in draft.attributes {
+            symbol_values.push(attribute.key);
+            value_counts.push(attribute.values.len());
+            symbol_values.extend(attribute.values);
+        }
         shapes.push(EpisodeShape {
             timestamp: draft
                 .timestamp
                 .expect("missing timestamps are filled before interning"),
-            context_term_counts,
-            observation_term_count,
-            action_term_count,
-            outcome_term_count,
+            value_counts,
         });
     }
-
-    (predicate_values, term_values, shapes)
-}
-
-fn flatten_statement(
-    statement: TextStatement,
-    predicates: &mut Vec<String>,
-    terms: &mut Vec<String>,
-) -> usize {
-    predicates.push(statement.predicate);
-    let term_count = statement.terms.len();
-    terms.extend(statement.terms);
-    term_count
+    (symbol_values, shapes)
 }
 
 fn resolve_drafts(
     shapes: Vec<EpisodeShape>,
-    predicate_ids: Vec<PredicateId>,
-    term_ids: Vec<TermId>,
+    symbol_ids: Vec<SymbolId>,
 ) -> CliResult<Vec<EpisodeDraft>> {
-    let mut predicates = predicate_ids.into_iter();
-    let mut terms = term_ids.into_iter();
+    let mut symbols = symbol_ids.into_iter();
     let drafts = shapes
         .into_iter()
         .map(|shape| {
-            let context = shape
-                .context_term_counts
+            let attributes = shape
+                .value_counts
                 .into_iter()
-                .map(|term_count| resolve_statement(&mut predicates, &mut terms, term_count))
+                .map(|value_count| resolve_attribute(&mut symbols, value_count))
                 .collect::<CliResult<Vec<_>>>()?;
-            let observation =
-                resolve_statement(&mut predicates, &mut terms, shape.observation_term_count)?;
-            let action = shape
-                .action_term_count
-                .map(|term_count| resolve_statement(&mut predicates, &mut terms, term_count))
-                .transpose()?;
-            let outcome = shape
-                .outcome_term_count
-                .map(|term_count| resolve_statement(&mut predicates, &mut terms, term_count))
-                .transpose()?;
-            Ok(EpisodeDraft {
-                timestamp: shape.timestamp,
-                context,
-                observation,
-                action,
-                outcome,
-            })
+            EpisodeDraft::new(shape.timestamp, attributes).map_err(|error| error.to_string())
         })
         .collect::<CliResult<Vec<_>>>()?;
-    debug_assert!(predicates.next().is_none());
-    debug_assert!(terms.next().is_none());
+    if symbols.next().is_some() {
+        return Err("symbol interning returned an oversized result".to_owned());
+    }
     Ok(drafts)
 }
 
-fn resolve_statement(
-    predicates: &mut impl Iterator<Item = PredicateId>,
-    terms: &mut impl Iterator<Item = TermId>,
-    term_count: usize,
-) -> CliResult<Statement> {
-    let predicate = predicates
+fn resolve_attribute(
+    symbols: &mut impl Iterator<Item = SymbolId>,
+    value_count: usize,
+) -> CliResult<Attribute> {
+    let key = symbols
         .next()
-        .ok_or_else(|| "predicate interning returned an incomplete result".to_owned())?;
-    let arguments = terms.by_ref().take(term_count).collect::<Vec<_>>();
-    if arguments.len() != term_count {
-        return Err("term interning returned an incomplete result".to_owned());
+        .ok_or_else(|| "symbol interning returned an incomplete result".to_owned())?;
+    let values = symbols.by_ref().take(value_count).collect::<Vec<_>>();
+    if values.len() != value_count {
+        return Err("symbol interning returned an incomplete result".to_owned());
     }
-    Statement::new(predicate, arguments).map_err(|error| error.to_string())
+    Attribute::new(key, values).map_err(|error| error.to_string())
 }

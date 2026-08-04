@@ -3,9 +3,7 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BinaryHeap};
 
 use super::{Memory, RecallHit};
-use crate::model::{
-    Activation, AtomId, EpisodeAtom, FeedbackTrace, GraphError, PredicateId, Statement, TermId,
-};
+use crate::model::{Activation, AtomId, EpisodeAtom, FeedbackTrace, GraphError, SymbolId};
 use crate::parameters::{
     FEEDBACK_HISTORY_CAPACITY, FEEDBACK_PRIOR_MASS, LEARNED_GAIN_PPM, STRUCTURAL_GAIN_PPM,
 };
@@ -29,70 +27,42 @@ impl PartialOrd for RankedRecallHit {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum StatementRole {
-    Context,
-    Observation,
-    Action,
-    Outcome,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Cue {
-    Predicate(PredicateId),
-    Term(TermId),
-    RolePredicate {
-        role: StatementRole,
-        predicate: PredicateId,
-    },
-    RoleArgument {
-        role: StatementRole,
-        predicate: PredicateId,
-        position: u64,
-        term: TermId,
-    },
-}
-
-impl Cue {
-    const fn weight(self) -> u64 {
-        match self {
-            Self::Predicate(_) | Self::Term(_) => 1,
-            Self::RolePredicate { .. } => 2,
-            Self::RoleArgument { .. } => 4,
-        }
-    }
+    Key(SymbolId),
+    Value(SymbolId),
+    KeyValue { key: SymbolId, value: SymbolId },
 }
 
 fn episode_cues(episode: &EpisodeAtom) -> Vec<Cue> {
-    let mut cues = Vec::new();
-    for statement in episode.context() {
-        append_statement_cues(&mut cues, StatementRole::Context, statement);
-    }
-    append_statement_cues(&mut cues, StatementRole::Observation, episode.observation());
-    if let Some(statement) = episode.action() {
-        append_statement_cues(&mut cues, StatementRole::Action, statement);
-    }
-    if let Some(statement) = episode.outcome() {
-        append_statement_cues(&mut cues, StatementRole::Outcome, statement);
-    }
-    cues.sort_unstable();
-    cues.dedup();
-    cues
-}
+    let value_count = episode
+        .attributes()
+        .iter()
+        .map(|attribute| attribute.values().len())
+        .sum::<usize>();
+    let capacity = episode
+        .attributes()
+        .len()
+        .saturating_add(value_count.saturating_mul(2));
+    let mut cues = Vec::with_capacity(capacity);
 
-fn append_statement_cues(cues: &mut Vec<Cue>, role: StatementRole, statement: &Statement) {
-    let predicate = statement.predicate();
-    cues.push(Cue::Predicate(predicate));
-    cues.push(Cue::RolePredicate { role, predicate });
-    for (position, term) in statement.arguments().iter().copied().enumerate() {
-        cues.push(Cue::Term(term));
-        cues.push(Cue::RoleArgument {
-            role,
-            predicate,
-            position: u64::try_from(position)
-                .expect("a statement argument position fits in u64 on supported platforms"),
-            term,
-        });
+    for attribute in episode.attributes() {
+        cues.push(Cue::Key(attribute.key()));
     }
+    let values_start = cues.len();
+    for attribute in episode.attributes() {
+        for value in attribute.values().iter().copied() {
+            cues.push(Cue::Value(value));
+        }
+    }
+    cues[values_start..].sort_unstable();
+    cues.dedup();
+    for attribute in episode.attributes() {
+        let key = attribute.key();
+        for value in attribute.values().iter().copied() {
+            cues.push(Cue::KeyValue { key, value });
+        }
+    }
+    cues
 }
 
 enum PostingList {
@@ -127,7 +97,6 @@ impl PostingList {
 struct PostingCursor<'a> {
     postings: &'a [usize],
     position: usize,
-    weight: u64,
 }
 
 struct PostingMerge<'a> {
@@ -137,20 +106,16 @@ struct PostingMerge<'a> {
 }
 
 impl<'a> PostingMerge<'a> {
-    fn new(streams: impl IntoIterator<Item = (&'a [usize], u64)>, excluded_target: usize) -> Self {
+    fn new(streams: impl IntoIterator<Item = &'a [usize]>, excluded_target: usize) -> Self {
         let mut cursors = Vec::new();
         let mut heads = BinaryHeap::new();
-        for (postings, weight) in streams {
+        for postings in streams {
             let position = usize::from(postings.first() == Some(&excluded_target));
             let Some(&target_index) = postings.get(position) else {
                 continue;
             };
             let cursor_index = cursors.len();
-            cursors.push(PostingCursor {
-                postings,
-                position,
-                weight,
-            });
+            cursors.push(PostingCursor { postings, position });
             heads.push(Reverse((target_index, cursor_index)));
         }
         Self {
@@ -160,11 +125,10 @@ impl<'a> PostingMerge<'a> {
         }
     }
 
-    fn pop_head(&mut self) -> Option<(usize, u64)> {
+    fn pop_head(&mut self) -> Option<usize> {
         let Reverse((target_index, cursor_index)) = self.heads.pop()?;
         let cursor = &mut self.cursors[cursor_index];
         debug_assert_eq!(cursor.postings[cursor.position], target_index);
-        let weight = cursor.weight;
         cursor.position += 1;
         if cursor.postings.get(cursor.position) == Some(&self.excluded_target) {
             cursor.position += 1;
@@ -172,7 +136,7 @@ impl<'a> PostingMerge<'a> {
         if let Some(&next_target) = cursor.postings.get(cursor.position) {
             self.heads.push(Reverse((next_target, cursor_index)));
         }
-        Some((target_index, weight))
+        Some(target_index)
     }
 }
 
@@ -180,33 +144,31 @@ impl Iterator for PostingMerge<'_> {
     type Item = (usize, u64);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let (target_index, mut shared_weight) = self.pop_head()?;
+        let target_index = self.pop_head()?;
+        let mut shared_count = 1_u64;
         while self
             .heads
             .peek()
             .is_some_and(|Reverse((next_target, _))| *next_target == target_index)
         {
-            let (_, weight) = self
-                .pop_head()
+            self.pop_head()
                 .expect("a matching posting head remains available");
-            shared_weight = shared_weight
-                .checked_add(weight)
-                .expect("shared cue weight is bounded by each episode's cue weight");
+            shared_count += 1;
         }
-        Some((target_index, shared_weight))
+        Some((target_index, shared_count))
     }
 }
 
 pub(super) struct CueIndex {
     postings: BTreeMap<Cue, PostingList>,
-    weight_totals: Vec<u64>,
+    cue_counts: Vec<u64>,
 }
 
 impl CueIndex {
     fn from_atoms(atoms: &[EpisodeAtom]) -> Self {
         let mut index = Self {
             postings: BTreeMap::new(),
-            weight_totals: Vec::with_capacity(atoms.len()),
+            cue_counts: Vec::with_capacity(atoms.len()),
         };
         for (atom_index, atom) in atoms.iter().enumerate() {
             index.insert(atom_index, atom);
@@ -215,13 +177,11 @@ impl CueIndex {
     }
 
     pub(super) fn insert(&mut self, atom_index: usize, atom: &EpisodeAtom) {
-        debug_assert_eq!(atom_index, self.weight_totals.len());
+        debug_assert_eq!(atom_index, self.cue_counts.len());
         let cues = episode_cues(atom);
-        let mut weight_total = 0_u64;
+        let cue_count =
+            u64::try_from(cues.len()).expect("an in-memory episode's cue count fits in u64");
         for cue in cues {
-            weight_total = weight_total
-                .checked_add(cue.weight())
-                .expect("an in-memory episode's cue weight fits in u64");
             match self.postings.entry(cue) {
                 Entry::Vacant(entry) => {
                     entry.insert(PostingList::One(atom_index));
@@ -229,7 +189,7 @@ impl CueIndex {
                 Entry::Occupied(mut entry) => entry.get_mut().push(atom_index),
             }
         }
-        self.weight_totals.push(weight_total);
+        self.cue_counts.push(cue_count);
     }
 }
 
@@ -260,7 +220,7 @@ impl Memory {
         let source_cues = episode_cues(&self.atoms[source_index]);
         let posting_streams = source_cues.into_iter().filter_map(|cue| {
             let postings = cue_index.postings.get(&cue)?.as_slice();
-            Some((postings, cue.weight()))
+            Some(postings)
         });
         let mut structural = PostingMerge::new(posting_streams, source_index).peekable();
         let mut feedback = outgoing.map(|row| row.iter().peekable());
@@ -275,7 +235,7 @@ impl Memory {
                 (None, Some(feedback)) => feedback,
                 (None, None) => return None,
             };
-            let shared_weight = if structural_target == Some(target) {
+            let shared_count = if structural_target == Some(target) {
                 structural
                     .next()
                     .expect("peeked structural candidate remains available")
@@ -294,15 +254,15 @@ impl Memory {
             } else {
                 None
             };
-            Some((target, shared_weight, trace))
+            Some((target, shared_count, trace))
         });
 
-        let source_cue_weight = cue_index.weight_totals[source_index];
-        let hits = candidates.filter_map(|(target_index, shared_weight, trace)| {
+        let source_cue_count = cue_index.cue_counts[source_index];
+        let hits = candidates.filter_map(|(target_index, shared_count, trace)| {
             let structural_score = Self::structural_score(
-                shared_weight,
-                source_cue_weight,
-                cue_index.weight_totals[target_index],
+                shared_count,
+                source_cue_count,
+                cue_index.cue_counts[target_index],
             );
             let learned_score = trace.map_or(0, Self::project_feedback);
             let score = (i64::from(structural_score) + i64::from(learned_score)).clamp(
@@ -321,15 +281,15 @@ impl Memory {
         Ok(Self::rank_hits(hits, limit))
     }
 
-    fn structural_score(shared_weight: u64, source_weight: u64, target_weight: u64) -> u32 {
-        if shared_weight == 0 {
+    fn structural_score(shared_count: u64, source_count: u64, target_count: u64) -> u32 {
+        if shared_count == 0 {
             return 0;
         }
-        debug_assert!(shared_weight <= source_weight);
-        debug_assert!(shared_weight <= target_weight);
-        let union_weight =
-            u128::from(source_weight) + u128::from(target_weight) - u128::from(shared_weight);
-        let score = u128::from(shared_weight) * u128::from(STRUCTURAL_GAIN_PPM) / union_weight;
+        debug_assert!(shared_count <= source_count);
+        debug_assert!(shared_count <= target_count);
+        let union_count =
+            u128::from(source_count) + u128::from(target_count) - u128::from(shared_count);
+        let score = u128::from(shared_count) * u128::from(STRUCTURAL_GAIN_PPM) / union_count;
         u32::try_from(score).expect("structural recall score is bounded by its gain")
     }
 
@@ -405,16 +365,16 @@ mod tests {
         assert_eq!(
             PostingMerge::new(
                 [
-                    (&first[..], 1),
-                    (&second[..], 2),
-                    (&third[..], 4),
-                    (&source_last[..], 8),
-                    (&source_only[..], 16),
+                    &first[..],
+                    &second[..],
+                    &third[..],
+                    &source_last[..],
+                    &source_only[..],
                 ],
                 3,
             )
             .collect::<Vec<_>>(),
-            [(0, 8), (1, 3), (2, 6), (4, 4), (5, 3)]
+            [(0, 1), (1, 2), (2, 2), (4, 1), (5, 2)]
         );
     }
 }
