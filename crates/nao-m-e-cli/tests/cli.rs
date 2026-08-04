@@ -13,7 +13,7 @@ mod recall;
 #[path = "cli/support.rs"]
 mod support;
 
-use support::{add_minimal, cli, failure, init, invoke, recall, success_text};
+use support::{add_minimal, cli, failure, feedback, init, invoke, recall, success_text};
 
 fn rewrite_format_version(database: &Path, memory_id: [u8; 16], from: u8, to: u8) {
     let mut bytes = fs::read(database).expect("database is readable");
@@ -200,6 +200,11 @@ fn malformed_direct_arguments_are_syntax_errors_but_store_errors_are_runtime_err
     assert!(stderr.contains("unknown atom"));
 
     let missing = directory.path().join("missing.sqlite3");
-    let stderr = failure(add_minimal(&missing, 1, false), 1);
-    assert!(stderr.contains("could not open"));
+    let add_error = failure(add_minimal(&missing, 1, false), 1);
+    let recall_error = failure(recall(&missing, 0, None), 1);
+    let feedback_error = failure(feedback(&missing, 0, true, "1"), 1);
+    assert!(add_error.contains("could not open"));
+    assert_eq!(recall_error, add_error);
+    assert_eq!(feedback_error, add_error);
+    assert!(!missing.exists());
 }

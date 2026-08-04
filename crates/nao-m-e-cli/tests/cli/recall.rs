@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs;
 
 use nao_m_e::AtomId;
@@ -88,6 +89,34 @@ fn recall_emits_exact_ranked_blocks_and_honors_limit() {
     assert_eq!(
         fs::read(&database).expect("database is readable after recall"),
         before
+    );
+
+    const UNIQUE_TERM_COUNT: usize = 901;
+    let mut wide_input = String::from(
+        "--occurred 12 --recorded 13 --source 12 --predicate batch-symbol --term shared-symbol\n\
+         --occurred 13 --recorded 14 --source 13 --predicate batch-symbol --term shared-symbol --term shared-symbol",
+    );
+    for index in 0..UNIQUE_TERM_COUNT {
+        write!(wide_input, " --term unique-term-{index:04}")
+            .expect("writing to a String cannot fail");
+    }
+    wide_input.push('\n');
+    let mut many = cli();
+    many.arg("add").arg(&database).arg("--many").arg("--quiet");
+    assert_silent_success(invoke(many, Some(&wide_input)));
+
+    let before_wide_recall = fs::read(&database).expect("wide database is readable before recall");
+    let mut expected_wide = String::from(
+        "sequence 13\nactivation_ppm 708\noccurred 13\nrecorded 14\nsource 13\npredicate batch-symbol\nterm shared-symbol\nterm shared-symbol\n",
+    );
+    for index in 0..UNIQUE_TERM_COUNT {
+        writeln!(expected_wide, "term unique-term-{index:04}")
+            .expect("writing to a String cannot fail");
+    }
+    assert_eq!(success_text(recall(&database, 12, Some(1))), expected_wide);
+    assert_eq!(
+        fs::read(&database).expect("wide database is readable after recall"),
+        before_wide_recall
     );
 }
 

@@ -235,8 +235,7 @@ fn execute_feedback(
     target_sequences: &[u64],
     helpful: bool,
 ) -> CliResult<Vec<u8>> {
-    let mut store = SqliteStore::open(database)
-        .map_err(|error| format!("could not open `{}`: {error}", database.display()))?;
+    let mut store = open_store(database)?;
     let memory_id = store.memory_id();
     let source = AtomId::from_parts(memory_id, source_sequence);
     let targets = target_sequences
@@ -249,6 +248,11 @@ fn execute_feedback(
         .map_err(|error| error.to_string())?;
     save(&mut store, database)?;
     Ok(Vec::new())
+}
+
+fn open_store(database: &Path) -> CliResult<SqliteStore> {
+    SqliteStore::open(database)
+        .map_err(|error| format!("could not open `{}`: {error}", database.display()))
 }
 
 fn save(store: &mut SqliteStore, database: &Path) -> CliResult<()> {
