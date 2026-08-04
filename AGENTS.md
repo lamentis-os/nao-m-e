@@ -24,8 +24,14 @@ format and lifecycle are defined in `docs/sqlite-contract.md`.
 - `crates/nao-m-e-sqlite/src/store/tests.rs` exercises private lifecycle,
   revision, corruption, and transaction invariants.
 - `crates/nao-m-e-sqlite/tests` exercises the public adapter contract.
-- `crates/nao-m-e-cli` owns the strict CLI argument and text-output grammar,
-  command execution, and cross-process CLI tests.
+- `crates/nao-m-e-cli/src/main.rs` owns the process boundary, root dispatch,
+  initialization, feedback, and shared save/output handling.
+- `crates/nao-m-e-cli/src/add.rs` owns Add grammar, text-episode parsing,
+  symbol interning, and atomic Add execution.
+- `crates/nao-m-e-cli/src/recall.rs` owns Recall grammar, symbol resolution, and
+  deterministic text output.
+- `crates/nao-m-e-cli/tests/cli.rs` and `tests/cli` form one cross-process CLI
+  contract target.
 
 ## Contract guardrails
 
