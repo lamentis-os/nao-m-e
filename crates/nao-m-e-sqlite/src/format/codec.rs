@@ -1,6 +1,4 @@
-use nao_m_e::{
-    EpisodeAtom, EpisodeDraft, MemoryId, PredicateId, SourceId, Statement, TermId, TimestampMs,
-};
+use nao_m_e::{EpisodeAtom, EpisodeDraft, MemoryId, PredicateId, Statement, TermId, TimestampMs};
 
 const MEMORY_ID_BYTES: usize = 16;
 const U64_BYTES: usize = 8;
@@ -8,9 +6,10 @@ const U64_BYTES: usize = 8;
 const ACTION_PRESENT: u8 = 1 << 0;
 const OUTCOME_PRESENT: u8 = 1 << 1;
 const KNOWN_FLAGS: u8 = ACTION_PRESENT | OUTCOME_PRESENT;
-#[cfg(test)]
-const FIXED_EPISODE_PREFIX_BYTES: usize = 1 + 3 * U64_BYTES;
+const FIXED_EPISODE_PREFIX_BYTES: usize = 1 + U64_BYTES;
 const MIN_STATEMENT_BYTES: usize = U64_BYTES + 1 + U64_BYTES;
+pub(crate) const MIN_EPISODE_PAYLOAD_BYTES: usize =
+    FIXED_EPISODE_PREFIX_BYTES + 1 + MIN_STATEMENT_BYTES;
 
 const TRUNCATED_EPISODE: &str = "episode blob is truncated";
 const RESERVED_FLAGS: &str = "episode flags contain reserved bits";
@@ -57,8 +56,8 @@ pub(crate) fn decode_u64(bytes: &[u8]) -> Option<u64> {
         .map(u64::from_be_bytes)
 }
 
-pub(crate) fn encode_episode(episode: &EpisodeAtom) -> Vec<u8> {
-    let mut encoded = Vec::new();
+pub(crate) fn encode_episode(episode: &EpisodeAtom, encoded: &mut Vec<u8>) {
+    encoded.clear();
     let mut flags = 0;
     if episode.action().is_some() {
         flags |= ACTION_PRESENT;
@@ -67,21 +66,18 @@ pub(crate) fn encode_episode(episode: &EpisodeAtom) -> Vec<u8> {
         flags |= OUTCOME_PRESENT;
     }
     encoded.push(flags);
-    encoded.extend_from_slice(&episode.occurred_at().get().to_be_bytes());
-    encoded.extend_from_slice(&episode.recorded_at().get().to_be_bytes());
-    encoded.extend_from_slice(&episode.source().get().to_be_bytes());
-    encode_count(episode.context().len(), &mut encoded);
+    encoded.extend_from_slice(&episode.timestamp().get().to_be_bytes());
+    encode_count(episode.context().len(), encoded);
     for statement in episode.context() {
-        encode_statement(statement, &mut encoded);
+        encode_statement(statement, encoded);
     }
-    encode_statement(episode.observation(), &mut encoded);
+    encode_statement(episode.observation(), encoded);
     if let Some(action) = episode.action() {
-        encode_statement(action, &mut encoded);
+        encode_statement(action, encoded);
     }
     if let Some(outcome) = episode.outcome() {
-        encode_statement(outcome, &mut encoded);
+        encode_statement(outcome, encoded);
     }
-    encoded
 }
 
 pub(crate) fn decode_episode(bytes: &[u8]) -> Result<EpisodeDraft, EpisodeDecodeError> {
@@ -91,9 +87,7 @@ pub(crate) fn decode_episode(bytes: &[u8]) -> Result<EpisodeDraft, EpisodeDecode
         return Err(EpisodeDecodeError::new(RESERVED_FLAGS));
     }
 
-    let occurred_at = TimestampMs::new(decoder.read_i64()?);
-    let recorded_at = TimestampMs::new(decoder.read_i64()?);
-    let source = SourceId::new(decoder.read_u64()?);
+    let timestamp = TimestampMs::new(decoder.read_i64()?);
     let context_count = decoder.read_uleb128()?;
     let trailing_statement_count =
         1_u64 + u64::from(flags & ACTION_PRESENT != 0) + u64::from(flags & OUTCOME_PRESENT != 0);
@@ -134,13 +128,11 @@ pub(crate) fn decode_episode(bytes: &[u8]) -> Result<EpisodeDraft, EpisodeDecode
     }
 
     Ok(EpisodeDraft {
-        occurred_at,
-        recorded_at,
+        timestamp,
         context,
         observation,
         action,
         outcome,
-        source,
     })
 }
 

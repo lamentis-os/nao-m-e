@@ -101,11 +101,11 @@ fn commands_reject_unsupported_format_before_execution_without_changing_it() {
     let store = SqliteStore::open(&database).expect("created SQLite store opens");
     let memory_id = store.memory_id().to_be_bytes();
     drop(store);
-    rewrite_format_version(&database, memory_id, 4, 5);
+    rewrite_format_version(&database, memory_id, 5, 6);
     let before = fs::read(&database).expect("unsupported-format store is readable");
 
     let stderr = failure(recall(&database, 0, None), 1);
-    assert!(stderr.contains("unsupported SQLite memory format version 5"));
+    assert!(stderr.contains("unsupported SQLite memory format version 6"));
     assert_eq!(fs::read(&database).unwrap(), before);
 }
 
@@ -136,18 +136,10 @@ fn malformed_direct_arguments_are_syntax_errors_but_store_errors_are_runtime_err
     }
 
     let mut malformed_statement = cli();
-    malformed_statement.arg("add").arg(&database).args([
-        "--occurred",
-        "1",
-        "--recorded",
-        "2",
-        "--source",
-        "3",
-        "--predicate",
-        "4",
-        "--terms",
-        "1,",
-    ]);
+    malformed_statement
+        .arg("add")
+        .arg(&database)
+        .args(["--predicate", "4", "--terms", "1,"]);
     failure(invoke(malformed_statement, None), 2);
 
     for episode_options in [
@@ -191,11 +183,7 @@ fn malformed_direct_arguments_are_syntax_errors_but_store_errors_are_runtime_err
         ],
     ] {
         let mut command = cli();
-        command
-            .arg("add")
-            .arg(&database)
-            .args(["--occurred", "1", "--recorded", "2", "--source", "3"])
-            .args(episode_options);
+        command.arg("add").arg(&database).args(episode_options);
         failure(invoke(command, None), 2);
     }
 

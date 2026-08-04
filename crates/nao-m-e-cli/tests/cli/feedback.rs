@@ -8,17 +8,13 @@ use super::support::{
     add_minimal, assert_silent_success, cli, failure, feedback, init, invoke, recall, success_text,
 };
 
-fn add_observation(database: &Path, occurred: i64, predicate: &str, terms: &[&str]) {
+fn add_observation(database: &Path, timestamp: i64, predicate: &str, terms: &[&str]) {
     let mut command = cli();
     command
         .arg("add")
         .arg(database)
-        .arg("--occurred")
-        .arg(occurred.to_string())
-        .arg("--recorded")
-        .arg((occurred + 1).to_string())
-        .arg("--source")
-        .arg(occurred.to_string())
+        .arg("--timestamp")
+        .arg(timestamp.to_string())
         .arg("--predicate")
         .arg(predicate);
     for term in terms {
@@ -67,14 +63,14 @@ fn bounded_feedback_learns_reverses_and_suppresses_structural_matches_across_pro
     let database = directory.path().join("memory.sqlite3");
     init(&database);
 
-    for (occurred, predicate, terms) in [
+    for (timestamp, predicate, terms) in [
         (1, "category", &["seven", "eight"][..]),
         (3, "category", &["seven", "nine"][..]),
         (5, "category", &["nine", "ten"][..]),
         (7, "other", &["seven"][..]),
         (9, "learned only", &["thirty"][..]),
     ] {
-        add_observation(&database, occurred, predicate, terms);
+        add_observation(&database, timestamp, predicate, terms);
     }
 
     assert_eq!(

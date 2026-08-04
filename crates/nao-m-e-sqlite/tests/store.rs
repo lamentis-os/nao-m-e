@@ -4,7 +4,7 @@ use std::thread;
 
 use nao_m_e::{
     AtomId, EpisodeAtom, EpisodeDraft, FeedbackEdge, FeedbackTrace, Memory, MemoryId, PredicateId,
-    SourceId, Statement, TermId, TimestampMs,
+    Statement, TermId, TimestampMs,
 };
 use nao_m_e_sqlite::{SqliteStore, StoreError, StoreIntegrityError};
 use rusqlite::Connection;
@@ -40,26 +40,22 @@ fn statement(predicate: u64, arguments: &[u64]) -> Statement {
 fn draft(seed: u64) -> EpisodeDraft {
     let timestamp = i64::try_from(seed).expect("test seed fits an i64");
     EpisodeDraft {
-        occurred_at: TimestampMs::new(timestamp),
-        recorded_at: TimestampMs::new(timestamp + 10),
+        timestamp: TimestampMs::new(timestamp),
         context: vec![statement(0, &[0])],
         observation: statement(1, &[1, 2]),
         action: Some(statement(2, &[3])),
         outcome: Some(statement(3, &[4])),
-        source: SourceId::new(50 + seed),
     }
 }
 
 fn observation_draft(seed: u64, predicate: u64, arguments: &[u64]) -> EpisodeDraft {
     let timestamp = i64::try_from(seed).expect("test seed fits an i64");
     EpisodeDraft {
-        occurred_at: TimestampMs::new(timestamp),
-        recorded_at: TimestampMs::new(timestamp + 1),
+        timestamp: TimestampMs::new(timestamp),
         context: Vec::new(),
         observation: statement(predicate, arguments),
         action: None,
         outcome: None,
-        source: SourceId::new(seed + 100),
     }
 }
 
@@ -619,25 +615,21 @@ fn full_snapshot_round_trips_exactly_and_continues_the_sequence() {
     let first = insert(
         &mut store,
         EpisodeDraft {
-            occurred_at: TimestampMs::new(i64::MIN),
-            recorded_at: TimestampMs::new(i64::MAX),
+            timestamp: TimestampMs::new(i64::MIN),
             context: vec![high_context.clone(), low_context.clone(), high_context],
             observation: statement(2, &[0, 2, 3]),
             action: Some(statement(3, &[3, 0])),
             outcome: Some(statement(0, &[1])),
-            source: SourceId::new(u64::MAX),
         },
     );
     let second = insert(
         &mut store,
         EpisodeDraft {
-            occurred_at: TimestampMs::new(i64::MAX),
-            recorded_at: TimestampMs::new(i64::MIN),
+            timestamp: TimestampMs::new(i64::MAX),
             context: Vec::new(),
             observation: statement(1, &[3]),
             action: None,
             outcome: None,
-            source: SourceId::new(1_u64 << 63),
         },
     );
     let third = insert(&mut store, draft(7));
@@ -879,13 +871,11 @@ fn identical_episodes_remain_distinct_occurrences_after_reopen() {
     assert_eq!(episodes[0].id(), AtomId::from_parts(memory_id, 0));
     assert_eq!(episodes[1].id(), AtomId::from_parts(memory_id, 1));
     assert_ne!(episodes[0], episodes[1]);
-    assert_eq!(episodes[0].occurred_at(), episodes[1].occurred_at());
-    assert_eq!(episodes[0].recorded_at(), episodes[1].recorded_at());
+    assert_eq!(episodes[0].timestamp(), episodes[1].timestamp());
     assert_eq!(episodes[0].context(), episodes[1].context());
     assert_eq!(episodes[0].observation(), episodes[1].observation());
     assert_eq!(episodes[0].action(), episodes[1].action());
     assert_eq!(episodes[0].outcome(), episodes[1].outcome());
-    assert_eq!(episodes[0].source(), episodes[1].source());
 }
 
 #[test]

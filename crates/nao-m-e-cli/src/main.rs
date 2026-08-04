@@ -16,7 +16,7 @@ const ROOT_HELP: &str = "NAO-M-E symbolic memory command-line interface
 
 Usage:
   nao-m-e init <DATABASE>
-  nao-m-e add <DATABASE> [--quiet] --occurred <MS> --recorded <MS> --source <ID> --predicate <TEXT> --term <TEXT>... [EPISODE OPTIONS]
+  nao-m-e add <DATABASE> [--quiet] [--timestamp <UNIX_MS>] --predicate <TEXT> --term <TEXT>... [EPISODE OPTIONS]
   nao-m-e add <DATABASE> --many [--quiet]
   nao-m-e recall <DATABASE> --from <SEQUENCE> [--limit <N>]
   nao-m-e feedback <DATABASE> --from <SEQUENCE> --helpful <SEQUENCE,...>

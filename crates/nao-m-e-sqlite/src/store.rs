@@ -435,13 +435,17 @@ fn append_episodes(
     memory: &Memory,
     start: usize,
 ) -> Result<(), StoreError> {
+    if start == memory.episodes().len() {
+        return Ok(());
+    }
     let mut insert = transaction.prepare(
         "INSERT INTO episodes (sequence, payload)
          VALUES (?1, ?2)",
     )?;
+    let mut payload = Vec::with_capacity(format::MIN_EPISODE_PAYLOAD_BYTES);
     for episode in memory.episodes().skip(start) {
         let sequence = format::encode_u64(episode.id().sequence());
-        let payload = format::encode_episode(episode);
+        format::encode_episode(episode, &mut payload);
         insert.execute((sequence.as_slice(), payload.as_slice()))?;
     }
     Ok(())

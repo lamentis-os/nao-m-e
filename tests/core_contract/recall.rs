@@ -1,4 +1,4 @@
-use nao_m_e::{AtomId, GraphError};
+use nao_m_e::{AtomId, GraphError, TimestampMs};
 
 use super::support::{
     activation, feedback_snapshot, insert, insert_observation, memory_id, new_memory,
@@ -118,6 +118,42 @@ fn recall_ranking_is_deterministic_for_every_limit() {
             "limit {limit}"
         );
     }
+}
+
+#[test]
+fn timestamps_do_not_change_structural_scores_or_tie_breaking() {
+    let mut memory = new_memory(1);
+    let mut source_draft = observation_draft(1, 10, &[100]);
+    source_draft.timestamp = TimestampMs::new(i64::MIN);
+    let source = memory.insert_episode(source_draft).expect("source inserts");
+
+    let mut first_draft = observation_draft(2, 10, &[100]);
+    first_draft.timestamp = TimestampMs::new(i64::MAX);
+    let first = memory
+        .insert_episode(first_draft)
+        .expect("first target inserts");
+
+    let mut second_draft = observation_draft(3, 10, &[100]);
+    second_draft.timestamp = TimestampMs::new(0);
+    let second = memory
+        .insert_episode(second_draft)
+        .expect("second target inserts");
+
+    assert_eq!(
+        memory
+            .recall_from(source, usize::MAX)
+            .expect("source is known"),
+        vec![
+            nao_m_e::RecallHit {
+                atom_id: first,
+                activation: activation(400_000),
+            },
+            nao_m_e::RecallHit {
+                atom_id: second,
+                activation: activation(400_000),
+            },
+        ]
+    );
 }
 
 #[test]
