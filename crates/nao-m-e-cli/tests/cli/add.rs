@@ -174,10 +174,10 @@ fn many_add_ignores_empty_lines_is_atomic_and_assigns_input_order() {
     let database = directory.path().join("memory.sqlite3");
     init(&database);
 
-    let input = "# ignored comment\n\n--occurred 1 --recorded 2 --source 1 --predicate 'Predicate-1' --term 'Term-1' # trailing comment\r\n  \n--occurred -3 --recorded -2 --source 2 --predicate \"Predicate 2\" --term 'Term 2' --term 'Term, 3' --context 'Context: Value' --context-term 'Context Term' --action Action --action-term 'Action Term' --outcome Outcome --outcome-term 'Outcome Term'\n";
+    let input = "# ignored comment\n\n--occurred 1 --recorded 2 --source 1 --predicate 'Predicate-1' --term 'Term-1' # trailing comment\r\n  \n--occurred -3 --recorded -2 --source 2 --predicate \"Predicate 2\" --term 'Term 2' --term 'Term, 3' --context 'Context: Value' --context-term 'Context Term' --action Action --action-term 'Action Term' --outcome Outcome --outcome-term 'Outcome Term'\n--occurred 5 --recorded 6 --source 5 --predicate '--quiet' --term '--many' --term escaped\\ value --term \"quoted \\\"value\\\"\"\n";
     let mut many = cli();
     many.arg("add").arg(&database).arg("--many");
-    assert_eq!(success_text(invoke(many, Some(input))), "0\n1\n");
+    assert_eq!(success_text(invoke(many, Some(input))), "0\n1\n2\n");
 
     let mut quiet = cli();
     quiet.arg("add").arg(&database).arg("--many").arg("--quiet");
@@ -188,7 +188,7 @@ fn many_add_ignores_empty_lines_is_atomic_and_assigns_input_order() {
 
     let store = SqliteStore::open(&database).unwrap();
     let atoms: Vec<_> = store.memory().episodes().collect();
-    assert_eq!(atoms.len(), 3);
+    assert_eq!(atoms.len(), 4);
     assert_minimal_episode(&store, atoms[0], 1);
     assert_eq!(atoms[1].id().sequence(), 1);
     assert_eq!(atoms[1].occurred_at().get(), -3);
@@ -216,7 +216,16 @@ fn many_add_ignores_empty_lines_is_atomic_and_assigns_input_order() {
         "outcome",
         &["outcome term"],
     );
-    assert_minimal_episode(&store, atoms[2], 3);
+    assert_eq!(atoms[2].occurred_at().get(), 5);
+    assert_eq!(atoms[2].recorded_at().get(), 6);
+    assert_eq!(atoms[2].source().get(), 5);
+    assert_statement(
+        &store,
+        atoms[2].observation(),
+        "--quiet",
+        &["--many", "escaped value", "quoted \"value\""],
+    );
+    assert_minimal_episode(&store, atoms[3], 3);
     drop(store);
 
     let before = fs::read(&database).expect("database is readable before rejected batch");
@@ -257,6 +266,35 @@ fn many_add_ignores_empty_lines_is_atomic_and_assigns_input_order() {
             .memory()
             .episodes()
             .len(),
-        3
+        4
     );
+}
+
+#[test]
+fn many_add_rejects_duplicate_flags_and_episode_options_without_changing_the_store() {
+    let directory = TempDir::new().expect("temporary directory");
+    let database = directory.path().join("memory.sqlite3");
+    init(&database);
+    let before = fs::read(&database).expect("database is readable before rejected commands");
+
+    for (options, error) in [
+        (
+            &["--many", "--many"][..],
+            "`--many` may be specified only once",
+        ),
+        (
+            &["--many", "--quiet", "--quiet"][..],
+            "`--quiet` may be specified only once",
+        ),
+        (
+            &["--many", "--occurred"][..],
+            "`--many` cannot be combined with episode option `--occurred`",
+        ),
+    ] {
+        let mut command = cli();
+        command.arg("add").arg(&database).args(options);
+        let stderr = failure(invoke(command, None), 2);
+        assert!(stderr.starts_with(&format!("nao-m-e: {error}\n\n")));
+        assert_eq!(fs::read(&database).unwrap(), before);
+    }
 }

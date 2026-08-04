@@ -226,10 +226,9 @@ This first recall has no feedback trace. The two episodes share only term
 `nao-m-e`, whose cue weight is one; their total cue weights are 20 and 16.
 Weighted Jaccard similarity therefore produces
 `floor(1 * 400000 / 35) = 11428` ppm.
-Cue-derived candidates come from a private index rebuilt from the immutable
-episodes. Recall creates no stored activation state and does not save or mutate
-the logical episode or feedback state; its first successful query with a
-positive limit may initialize that private cache even when it finds no hits.
+Cue-derived candidates come from immutable episodes. Recall creates no stored
+activation state, does not save, and does not mutate logical episode or feedback
+state.
 
 One helpful assessment creates a one-sample feedback trace. Its learned
 contribution is `71,875 ppm` and is added to the unchanged structural score:

@@ -61,7 +61,10 @@ fn help_version_and_top_level_syntax_have_stable_exit_categories() {
 
     let mut version = cli();
     version.arg("--version");
-    assert!(success_text(invoke(version, None)).starts_with("nao-m-e 0.0.1"));
+    assert_eq!(
+        success_text(invoke(version, None)),
+        format!("nao-m-e {}\n", env!("CARGO_PKG_VERSION"))
+    );
 
     let stderr = failure(invoke(cli(), None), 2);
     assert!(stderr.contains("command"));

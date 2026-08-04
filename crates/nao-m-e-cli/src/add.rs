@@ -30,6 +30,30 @@ struct TextStatement {
     terms: Vec<String>,
 }
 
+enum EpisodeToken<'a> {
+    Borrowed(&'a OsStr),
+    Owned(String),
+}
+
+impl EpisodeToken<'_> {
+    fn as_os_str(&self) -> &OsStr {
+        match self {
+            Self::Borrowed(value) => value,
+            Self::Owned(value) => OsStr::new(value.as_str()),
+        }
+    }
+
+    fn into_text(self, description: &str) -> CliResult<String> {
+        match self {
+            Self::Borrowed(value) => value
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{description} must be valid UTF-8")),
+            Self::Owned(value) => Ok(value),
+        }
+    }
+}
+
 pub(super) struct TextEpisodeDraft {
     occurred_at: TimestampMs,
     recorded_at: TimestampMs,
@@ -76,6 +100,15 @@ impl ActiveStatement {
             Self::Outcome => "outcome",
         }
     }
+
+    fn term_description(self) -> &'static str {
+        match self {
+            Self::Context(_) => "context term",
+            Self::Observation => "observation term",
+            Self::Action => "action term",
+            Self::Outcome => "outcome term",
+        }
+    }
 }
 
 pub(super) fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
@@ -87,7 +120,7 @@ pub(super) fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     };
     let options = &args[1..];
     if options.first().is_some_and(|value| value == "--many") {
-        let quiet = parse_mode_options(options, "--many")?;
+        let quiet = parse_many_options(&options[1..])?;
         return Ok(ParsedArgs::Execute(Command::AddMany {
             database: PathBuf::from(database),
             quiet,
@@ -95,7 +128,7 @@ pub(super) fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     }
 
     let (episode_options, quiet) = extract_quiet(options)?;
-    let draft = parse_episode_flags(episode_options)?;
+    let draft = parse_episode_flags(episode_options.into_iter().map(EpisodeToken::Borrowed))?;
     Ok(ParsedArgs::Execute(Command::Add {
         database: PathBuf::from(database),
         draft: Box::new(draft),
@@ -125,20 +158,16 @@ fn extract_quiet(options: &[OsString]) -> CliResult<(Vec<&OsStr>, bool)> {
     Ok((episode_options, quiet))
 }
 
-fn parse_mode_options(options: &[OsString], required: &str) -> Result<bool, String> {
-    let mut required_seen = false;
+fn parse_many_options(options: &[OsString]) -> Result<bool, String> {
     let mut quiet = false;
     for option in options {
         match option.to_str() {
-            Some(value) if value == required && !required_seen => required_seen = true,
-            Some(value) if value == required => {
-                return Err(format!("`{required}` may be specified only once"));
-            }
+            Some("--many") => return Err("`--many` may be specified only once".to_owned()),
             Some("--quiet") if !quiet => quiet = true,
             Some("--quiet") => return Err("`--quiet` may be specified only once".to_owned()),
             Some(value) => {
                 return Err(format!(
-                    "`{required}` cannot be combined with episode option `{value}`"
+                    "`--many` cannot be combined with episode option `{value}`"
                 ));
             }
             None => return Err("add options must be valid UTF-8".to_owned()),
@@ -148,7 +177,7 @@ fn parse_mode_options(options: &[OsString], required: &str) -> Result<bool, Stri
 }
 
 fn parse_episode_flags<'a>(
-    args: impl IntoIterator<Item = &'a OsStr>,
+    args: impl IntoIterator<Item = EpisodeToken<'a>>,
 ) -> CliResult<TextEpisodeDraft> {
     let mut occurred_at = None;
     let mut recorded_at = None;
@@ -163,6 +192,7 @@ fn parse_episode_flags<'a>(
 
     while let Some(option) = args.next() {
         let option = option
+            .as_os_str()
             .to_str()
             .ok_or_else(|| "episode options must be valid UTF-8".to_owned())?;
         let value = args
@@ -190,10 +220,7 @@ fn parse_episode_flags<'a>(
                 &mut action,
                 &mut outcome,
             )
-            .push(parse_text(
-                value,
-                &format!("{} term", active_statement.description()),
-            )?);
+            .push(value.into_text(active_statement.term_description())?);
             continue;
         }
 
@@ -208,26 +235,26 @@ fn parse_episode_flags<'a>(
         match option {
             "--occurred" => set_once(
                 &mut occurred_at,
-                TimestampMs::new(parse_number(value, "occurred timestamp")?),
+                TimestampMs::new(parse_number(value.as_os_str(), "occurred timestamp")?),
                 option,
             )?,
             "--recorded" => set_once(
                 &mut recorded_at,
-                TimestampMs::new(parse_number(value, "recorded timestamp")?),
+                TimestampMs::new(parse_number(value.as_os_str(), "recorded timestamp")?),
                 option,
             )?,
             "--source" => set_once(
                 &mut source,
-                SourceId::new(parse_number(value, "source ID")?),
+                SourceId::new(parse_number(value.as_os_str(), "source ID")?),
                 option,
             )?,
             "--predicate" => {
-                set_once(&mut predicate, parse_text(value, "predicate")?, option)?;
+                set_once(&mut predicate, value.into_text("predicate")?, option)?;
                 active = Some(ActiveStatement::Observation);
             }
             "--context" => {
                 context.push(TextStatement {
-                    predicate: parse_text(value, "context predicate")?,
+                    predicate: value.into_text("context predicate")?,
                     terms: Vec::new(),
                 });
                 active = Some(ActiveStatement::Context(context.len() - 1));
@@ -236,7 +263,7 @@ fn parse_episode_flags<'a>(
                 set_once(
                     &mut action,
                     TextStatement {
-                        predicate: parse_text(value, "action predicate")?,
+                        predicate: value.into_text("action predicate")?,
                         terms: Vec::new(),
                     },
                     option,
@@ -247,7 +274,7 @@ fn parse_episode_flags<'a>(
                 set_once(
                     &mut outcome,
                     TextStatement {
-                        predicate: parse_text(value, "outcome predicate")?,
+                        predicate: value.into_text("outcome predicate")?,
                         terms: Vec::new(),
                     },
                     option,
@@ -315,13 +342,6 @@ fn set_once<T>(slot: &mut Option<T>, value: T, option: &str) -> CliResult<()> {
     Ok(())
 }
 
-fn parse_text(value: &OsStr, description: &str) -> CliResult<String> {
-    value
-        .to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| format!("{description} must be valid UTF-8"))
-}
-
 fn require_terms(terms: &[String], statement: &str, option: &str) -> CliResult<()> {
     if terms.is_empty() {
         return Err(format!(
@@ -342,7 +362,7 @@ pub(super) fn read_many_drafts() -> CliResult<Vec<TextEpisodeDraft>> {
         if words.is_empty() {
             continue;
         }
-        let draft = parse_episode_flags(words.iter().map(String::as_str).map(OsStr::new))
+        let draft = parse_episode_flags(words.into_iter().map(EpisodeToken::Owned))
             .map_err(|error| format!("add --many line {line_number}: {error}"))?;
         drafts.push(draft);
     }

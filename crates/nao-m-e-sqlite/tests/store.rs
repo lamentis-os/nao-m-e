@@ -274,16 +274,86 @@ fn invalid_symbol_batch_is_atomic_and_resolve_chunks_large_requests() {
     );
     assert_eq!(reopened.intern_predicates(&values).unwrap(), ids);
 
-    let mut requested = ids.clone();
-    requested.push(ids[0]);
-    requested.push(PredicateId::new(9_999));
+    let unknown = PredicateId::new(9_999);
+    let mut requested = Vec::with_capacity(ids.len() + 6);
+    requested.extend([ids[900], unknown, ids[1_800]]);
+    requested.extend(ids.iter().rev().copied());
+    requested.extend([ids[900], ids[0], unknown]);
     let resolved = reopened.predicate_values(&requested).unwrap();
-    assert_eq!(resolved.len(), 1_803);
-    for index in [0, 899, 900, 1_799, 1_800] {
-        assert_eq!(resolved[index], Some(format!("symbol-{index}")));
+    assert_eq!(resolved.len(), requested.len());
+    for (id, value) in requested.iter().zip(&resolved) {
+        let expected = usize::try_from(id.get())
+            .ok()
+            .and_then(|index| values.get(index));
+        assert_eq!(value.as_ref(), expected);
     }
-    assert_eq!(resolved[1_801], Some("symbol-0".to_owned()));
-    assert_eq!(resolved[1_802], None);
+}
+
+#[test]
+fn missing_symbol_after_open_fails_without_changing_store_and_resolution_can_retry() {
+    let directory = tempdir().unwrap();
+    let path = database_path(&directory);
+    let mut store = SqliteStore::create(&path).unwrap();
+    let values = ["first".to_owned(), "temporarily missing".to_owned()];
+    let ids = store.intern_predicates(&values).unwrap();
+    store.save().unwrap();
+    drop(store);
+
+    let store = SqliteStore::open(&path).unwrap();
+    let memory_before = snapshot(store.memory());
+    let raw = Connection::open(&path).unwrap();
+    let revision_before: i64 = raw
+        .query_row(
+            "SELECT snapshot_revision FROM memory_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let missing_id: Vec<u8> = raw
+        .query_row(
+            "SELECT id FROM predicates WHERE value = ?1",
+            [&values[1]],
+            |row| row.get(0),
+        )
+        .unwrap();
+    raw.execute("DELETE FROM predicates WHERE id = ?1", [&missing_id])
+        .unwrap();
+
+    let requested = [ids[0], ids[1], ids[0]];
+    assert!(matches!(
+        store.predicate_values(&requested),
+        Err(StoreError::InvalidStore(
+            StoreIntegrityError::InvalidSymbol {
+                namespace: "predicate",
+                id: 1,
+                detail: "symbol row is absent"
+            }
+        ))
+    ));
+    assert_eq!(snapshot(store.memory()), memory_before);
+
+    raw.execute(
+        "INSERT INTO predicates (id, value) VALUES (?1, ?2)",
+        (missing_id, &values[1]),
+    )
+    .unwrap();
+    let revision_after: i64 = raw
+        .query_row(
+            "SELECT snapshot_revision FROM memory_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(revision_after, revision_before);
+    assert_eq!(
+        store.predicate_values(&requested).unwrap(),
+        [
+            Some(values[0].clone()),
+            Some(values[1].clone()),
+            Some(values[0].clone())
+        ]
+    );
+    assert_eq!(snapshot(store.memory()), memory_before);
 }
 
 #[test]
