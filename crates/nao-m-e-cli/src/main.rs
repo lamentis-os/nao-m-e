@@ -117,7 +117,7 @@ enum Command {
     },
     Add {
         database: PathBuf,
-        draft: TextEpisodeDraft,
+        draft: Box<TextEpisodeDraft>,
         quiet: bool,
     },
     AddMany {
@@ -242,7 +242,7 @@ fn parse_add_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     let draft = parse_episode_flags(episode_options)?;
     Ok(ParsedArgs::Execute(Command::Add {
         database: PathBuf::from(database),
-        draft,
+        draft: Box::new(draft),
         quiet,
     }))
 }
@@ -576,7 +576,7 @@ fn execute(command: Command) -> CliResult<Vec<u8>> {
             database,
             draft,
             quiet,
-        } => execute_add(&database, vec![draft], quiet),
+        } => execute_add(&database, vec![*draft], quiet),
         Command::AddMany { database, quiet } => {
             let drafts = read_many_drafts()?;
             execute_add(&database, drafts, quiet)
