@@ -13,3 +13,5 @@ getrandom = "0.4.3"
 nao-m-e = { path = "../.." }
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 tempfile = "3.27.0"
+unicode-case-mapping = "=1.0.0"
+unicode-normalization = "=0.1.24"

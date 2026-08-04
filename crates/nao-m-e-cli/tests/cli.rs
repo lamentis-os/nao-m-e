@@ -3,10 +3,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use nao_m_e::{
-    AtomId, EpisodeAtom, EpisodeDraft, FeedbackTrace, MAX_FEEDBACK_TARGETS, PredicateId, SourceId,
-    Statement, TermId, TimestampMs,
-};
+use nao_m_e::{AtomId, EpisodeAtom, FeedbackTrace, MAX_FEEDBACK_TARGETS, Statement};
 use nao_m_e_sqlite::SqliteStore;
 use tempfile::TempDir;
 
@@ -74,9 +71,9 @@ fn add_minimal(database: &Path, seed: i64, quiet: bool) -> Output {
         .arg("--source")
         .arg(source.to_string())
         .arg("--predicate")
-        .arg((source + 10).to_string())
-        .arg("--terms")
-        .arg((source + 100).to_string());
+        .arg(format!("predicate-{source}"))
+        .arg("--term")
+        .arg(format!("term-{source}"));
     if quiet {
         command.arg("--quiet");
     }
@@ -108,58 +105,47 @@ fn feedback(database: &Path, source: u64, helpful: bool, targets: &str) -> Outpu
     invoke(command, None)
 }
 
-fn statement(predicate: u64, terms: &[u64]) -> Statement {
-    Statement::new(
-        PredicateId::new(predicate),
-        terms.iter().copied().map(TermId::new).collect(),
-    )
-    .expect("test statement has terms")
-}
-
-fn draft(seed: u64) -> EpisodeDraft {
-    EpisodeDraft {
-        occurred_at: TimestampMs::new(i64::try_from(seed).expect("small test seed")),
-        recorded_at: TimestampMs::new(i64::try_from(seed + 1).expect("small test seed")),
-        context: Vec::new(),
-        observation: statement(seed + 10, &[seed + 100]),
-        action: None,
-        outcome: None,
-        source: SourceId::new(seed),
-    }
-}
-
-fn assert_statement(actual: &Statement, predicate: u64, terms: &[u64]) {
-    assert_eq!(actual.predicate().get(), predicate);
+fn assert_statement(store: &SqliteStore, actual: &Statement, predicate: &str, terms: &[&str]) {
     assert_eq!(
-        actual
-            .arguments()
-            .iter()
-            .map(|term| term.get())
-            .collect::<Vec<_>>(),
+        store
+            .predicate_values(&[actual.predicate()])
+            .expect("predicate symbol resolves"),
+        [Some(predicate.to_owned())]
+    );
+    assert_eq!(
+        store
+            .term_values(actual.arguments())
+            .expect("term symbols resolve"),
         terms
+            .iter()
+            .map(|term| Some((*term).to_owned()))
+            .collect::<Vec<_>>()
     );
 }
 
-fn assert_minimal_episode(atom: &EpisodeAtom, seed: u64) {
+fn assert_minimal_episode(store: &SqliteStore, atom: &EpisodeAtom, seed: u64) {
     assert_eq!(atom.occurred_at().get(), i64::try_from(seed).unwrap());
     assert_eq!(atom.recorded_at().get(), i64::try_from(seed + 1).unwrap());
     assert_eq!(atom.source().get(), seed);
     assert!(atom.context().is_empty());
-    assert_statement(atom.observation(), seed + 10, &[seed + 100]);
+    assert_statement(
+        store,
+        atom.observation(),
+        &format!("predicate-{seed}"),
+        &[&format!("term-{seed}")],
+    );
     assert_eq!(atom.action(), None);
     assert_eq!(atom.outcome(), None);
 }
 
 fn minimal_recall_block(sequence: u64, activation_ppm: u32) -> String {
     format!(
-        "sequence {sequence}\nactivation_ppm {activation_ppm}\noccurred {sequence}\nrecorded {}\nsource {sequence}\npredicate {}\nterms {}",
-        sequence + 1,
-        sequence + 10,
-        sequence + 100
+        "sequence {sequence}\nactivation_ppm {activation_ppm}\noccurred {sequence}\nrecorded {}\nsource {sequence}\npredicate predicate-{sequence}\nterm term-{sequence}",
+        sequence + 1
     )
 }
 
-fn add_observation(database: &Path, occurred: i64, predicate: u64, terms: &str) {
+fn add_observation(database: &Path, occurred: i64, predicate: &str, terms: &[&str]) {
     let mut command = cli();
     command
         .arg("add")
@@ -171,10 +157,11 @@ fn add_observation(database: &Path, occurred: i64, predicate: u64, terms: &str) 
         .arg("--source")
         .arg(occurred.to_string())
         .arg("--predicate")
-        .arg(predicate.to_string())
-        .arg("--terms")
-        .arg(terms)
-        .arg("--quiet");
+        .arg(predicate);
+    for term in terms {
+        command.arg("--term").arg(term);
+    }
+    command.arg("--quiet");
     assert_silent_success(invoke(command, None));
 }
 
@@ -294,11 +281,11 @@ fn commands_reject_unsupported_format_before_execution_without_changing_it() {
     let store = SqliteStore::open(&database).expect("created SQLite store opens");
     let memory_id = store.memory_id().to_be_bytes();
     drop(store);
-    rewrite_format_version(&database, memory_id, 3, 4);
+    rewrite_format_version(&database, memory_id, 4, 5);
     let before = fs::read(&database).expect("unsupported-format store is readable");
 
     let stderr = failure(recall(&database, 0, None), 1);
-    assert!(stderr.contains("unsupported SQLite memory format version 4"));
+    assert!(stderr.contains("unsupported SQLite memory format version 5"));
     assert_eq!(fs::read(&database).unwrap(), before);
 }
 
@@ -318,41 +305,83 @@ fn direct_add_outputs_only_the_assigned_sequence_and_quiet_is_silent() {
         .arg("--source")
         .arg("7")
         .arg("--predicate")
-        .arg("20")
-        .arg("--terms")
-        .arg("200,201")
+        .arg("  OBSERVE: Build  ")
+        .arg("--term")
+        .arg(" Linux, ARM64 ")
+        .arg("--term")
+        .arg("Release Candidate")
         .arg("--context")
-        .arg("12:120,121")
+        .arg(" Environment ")
+        .arg("--context-term")
+        .arg(" CI : Linux ")
         .arg("--context")
-        .arg("11:110")
+        .arg("Project")
+        .arg("--context-term")
+        .arg(" Nao M E ")
         .arg("--context")
-        .arg("11:110")
+        .arg("environment")
+        .arg("--context-term")
+        .arg("ci : linux")
         .arg("--action")
-        .arg("21:210")
+        .arg(" Execute ")
+        .arg("--action-term")
+        .arg(" Cargo Test ")
         .arg("--outcome")
-        .arg("22:220,221");
+        .arg(" Result ")
+        .arg("--outcome-term")
+        .arg(" Pass ")
+        .arg("--outcome-term")
+        .arg("No Warnings");
     assert_eq!(success_text(invoke(rich, None)), "0\n");
     assert_silent_success(add_minimal(&database, 8, true));
+    let mut option_like_text = cli();
+    option_like_text
+        .arg("add")
+        .arg(&database)
+        .args(["--occurred", "9", "--recorded", "10", "--source", "9"])
+        .arg("--predicate")
+        .arg("--quiet")
+        .arg("--term")
+        .arg("--many")
+        .arg("--quiet");
+    assert_silent_success(invoke(option_like_text, None));
 
     let store = SqliteStore::open(&database).expect("added episodes reopen");
     let atoms: Vec<_> = store.memory().episodes().collect();
-    assert_eq!(atoms.len(), 2);
+    assert_eq!(atoms.len(), 3);
     assert_eq!(atoms[0].id().sequence(), 0);
     assert_eq!(atoms[0].occurred_at().get(), -5);
     assert_eq!(atoms[0].recorded_at().get(), 6);
     assert_eq!(atoms[0].source().get(), 7);
     assert_eq!(atoms[0].context().len(), 2);
-    assert_statement(&atoms[0].context()[0], 11, &[110]);
-    assert_statement(&atoms[0].context()[1], 12, &[120, 121]);
-    assert_statement(atoms[0].observation(), 20, &[200, 201]);
-    assert_statement(atoms[0].action().expect("action is stored"), 21, &[210]);
     assert_statement(
+        &store,
+        &atoms[0].context()[0],
+        "environment",
+        &["ci : linux"],
+    );
+    assert_statement(&store, &atoms[0].context()[1], "project", &["nao m e"]);
+    assert_statement(
+        &store,
+        atoms[0].observation(),
+        "observe: build",
+        &["linux, arm64", "release candidate"],
+    );
+    assert_statement(
+        &store,
+        atoms[0].action().expect("action is stored"),
+        "execute",
+        &["cargo test"],
+    );
+    assert_statement(
+        &store,
         atoms[0].outcome().expect("outcome is stored"),
-        22,
-        &[220, 221],
+        "result",
+        &["pass", "no warnings"],
     );
     assert_eq!(atoms[1].id().sequence(), 1);
-    assert_minimal_episode(atoms[1], 8);
+    assert_minimal_episode(&store, atoms[1], 8);
+    assert_statement(&store, atoms[2].observation(), "--quiet", &["--many"]);
 }
 
 #[test]
@@ -372,9 +401,11 @@ fn direct_add_round_trips_integer_boundaries() {
         .arg("--source")
         .arg(u64::MAX.to_string())
         .arg("--predicate")
-        .arg((u64::MAX - 1).to_string())
-        .arg("--terms")
-        .arg(format!("0,{}", u64::MAX));
+        .arg("Boundary")
+        .arg("--term")
+        .arg("Zero")
+        .arg("--term")
+        .arg("Maximum");
     assert_eq!(success_text(invoke(command, None)), "0\n");
 
     let store = SqliteStore::open(&database).unwrap();
@@ -382,7 +413,7 @@ fn direct_add_round_trips_integer_boundaries() {
     assert_eq!(atom.occurred_at().get(), i64::MIN);
     assert_eq!(atom.recorded_at().get(), i64::MAX);
     assert_eq!(atom.source().get(), u64::MAX);
-    assert_statement(atom.observation(), u64::MAX - 1, &[0, u64::MAX]);
+    assert_statement(&store, atom.observation(), "boundary", &["zero", "maximum"]);
 }
 
 #[test]
@@ -391,7 +422,7 @@ fn many_add_ignores_empty_lines_is_atomic_and_assigns_input_order() {
     let database = directory.path().join("memory.sqlite3");
     init(&database);
 
-    let input = "\n--occurred 1 --recorded 2 --source 1 --predicate 11 --terms 101\r\n  \n--occurred -3 --recorded -2 --source 2 --predicate 12 --terms 102,103 --context 20:200 --action 30:300 --outcome 40:400\n";
+    let input = "# ignored comment\n\n--occurred 1 --recorded 2 --source 1 --predicate 'Predicate-1' --term 'Term-1' # trailing comment\r\n  \n--occurred -3 --recorded -2 --source 2 --predicate \"Predicate 2\" --term 'Term 2' --term 'Term, 3' --context 'Context: Value' --context-term 'Context Term' --action Action --action-term 'Action Term' --outcome Outcome --outcome-term 'Outcome Term'\n";
     let mut many = cli();
     many.arg("add").arg(&database).arg("--many");
     assert_eq!(success_text(invoke(many, Some(input))), "0\n1\n");
@@ -400,26 +431,70 @@ fn many_add_ignores_empty_lines_is_atomic_and_assigns_input_order() {
     quiet.arg("add").arg(&database).arg("--many").arg("--quiet");
     assert_silent_success(invoke(
         quiet,
-        Some("--occurred 3 --recorded 4 --source 3 --predicate 13 --terms 103\n"),
+        Some("--occurred 3 --recorded 4 --source 3 --predicate 'Predicate-3' --term 'Term-3'\n"),
     ));
 
     let store = SqliteStore::open(&database).unwrap();
     let atoms: Vec<_> = store.memory().episodes().collect();
     assert_eq!(atoms.len(), 3);
-    assert_minimal_episode(atoms[0], 1);
+    assert_minimal_episode(&store, atoms[0], 1);
     assert_eq!(atoms[1].id().sequence(), 1);
     assert_eq!(atoms[1].occurred_at().get(), -3);
-    assert_statement(atoms[1].observation(), 12, &[102, 103]);
-    assert_statement(&atoms[1].context()[0], 20, &[200]);
-    assert_statement(atoms[1].action().unwrap(), 30, &[300]);
-    assert_statement(atoms[1].outcome().unwrap(), 40, &[400]);
-    assert_minimal_episode(atoms[2], 3);
+    assert_statement(
+        &store,
+        atoms[1].observation(),
+        "predicate 2",
+        &["term 2", "term, 3"],
+    );
+    assert_statement(
+        &store,
+        &atoms[1].context()[0],
+        "context: value",
+        &["context term"],
+    );
+    assert_statement(
+        &store,
+        atoms[1].action().unwrap(),
+        "action",
+        &["action term"],
+    );
+    assert_statement(
+        &store,
+        atoms[1].outcome().unwrap(),
+        "outcome",
+        &["outcome term"],
+    );
+    assert_minimal_episode(&store, atoms[2], 3);
     drop(store);
 
-    let invalid = "--occurred 4 --recorded 5 --source 4 --predicate 14 --terms 104\n--occurred 5 --recorded 6 --source 5 --predicate 15 --terms\n";
+    let before = fs::read(&database).expect("database is readable before rejected batch");
+    let invalid = "--occurred 4 --recorded 5 --source 4 --predicate Four --term Four\n--occurred 5 --recorded 6 --source 5 --predicate Five --term\n";
     let mut rejected = cli();
     rejected.arg("add").arg(&database).arg("--many");
     failure(invoke(rejected, Some(invalid)), 1);
+    assert_eq!(fs::read(&database).unwrap(), before);
+
+    let mut invalid_quote = cli();
+    invalid_quote.arg("add").arg(&database).arg("--many");
+    let stderr = failure(
+        invoke(
+            invalid_quote,
+            Some("--occurred 4 --recorded 5 --source 4 --predicate 'unterminated --term value\n"),
+        ),
+        1,
+    );
+    assert!(stderr.contains("invalid shell quoting"));
+
+    let mut invalid_symbol = cli();
+    invalid_symbol.arg("add").arg(&database).arg("--many");
+    failure(
+        invoke(
+            invalid_symbol,
+            Some("--occurred 4 --recorded 5 --source 4 --predicate Four --term '   '\n"),
+        ),
+        1,
+    );
+    assert_eq!(fs::read(&database).unwrap(), before);
 
     let mut empty = cli();
     empty.arg("add").arg(&database).arg("--many");
@@ -438,26 +513,27 @@ fn many_add_ignores_empty_lines_is_atomic_and_assigns_input_order() {
 fn recall_emits_exact_ranked_blocks_and_honors_limit() {
     let directory = TempDir::new().expect("temporary directory");
     let database = directory.path().join("memory.sqlite3");
-    let mut store = SqliteStore::create(&database).expect("SQLite store is created");
-    let source = store.memory_mut().insert_episode(draft(0)).unwrap();
-    let rich = store
-        .memory_mut()
-        .insert_episode(EpisodeDraft {
-            occurred_at: TimestampMs::new(-7),
-            recorded_at: TimestampMs::new(8),
-            context: vec![
-                statement(12, &[120, 121]),
-                statement(11, &[110]),
-                statement(11, &[110]),
-            ],
-            observation: statement(20, &[200, 201]),
-            action: Some(statement(21, &[210])),
-            outcome: Some(statement(22, &[220, 221])),
-            source: SourceId::new(9),
-        })
-        .unwrap();
+    init(&database);
+    let mut input = String::from(
+        "--occurred 0 --recorded 1 --source 0 --predicate predicate-0 --term term-0\n\
+         --occurred -7 --recorded 8 --source 9 --context context-b --context-term context-b-1 --context-term context-b-2 --context context-a --context-term context-a-1 --context context-a --context-term context-a-1 --predicate observation --term observation-1 --term observation-2 --action action --action-term action-1 --outcome outcome --outcome-term outcome-1 --outcome-term outcome-2\n",
+    );
+    for seed in 2..=11 {
+        input.push_str(&format!(
+            "--occurred {seed} --recorded {} --source {seed} --predicate predicate-{seed} --term term-{seed}\n",
+            seed + 1
+        ));
+    }
+    let mut many = cli();
+    many.arg("add").arg(&database).arg("--many").arg("--quiet");
+    assert_silent_success(invoke(many, Some(&input)));
+
+    let mut store = SqliteStore::open(&database).expect("seeded store opens");
+    let memory_id = store.memory_id();
+    let source = AtomId::from_parts(memory_id, 0);
+    let rich = AtomId::from_parts(memory_id, 1);
     let targets = (2..=11)
-        .map(|seed| store.memory_mut().insert_episode(draft(seed)).unwrap())
+        .map(|sequence| AtomId::from_parts(memory_id, sequence))
         .collect::<Vec<_>>();
     for _ in 0..16 {
         store
@@ -475,8 +551,9 @@ fn recall_emits_exact_ranked_blocks_and_honors_limit() {
     }
     store.save().unwrap();
     drop(store);
+    let before = fs::read(&database).expect("database is readable before recall");
 
-    let rich_block = "sequence 1\nactivation_ppm 400000\noccurred -7\nrecorded 8\nsource 9\ncontext 11:110\ncontext 12:120,121\npredicate 20\nterms 200,201\naction 21:210\noutcome 22:220,221";
+    let rich_block = "sequence 1\nactivation_ppm 400000\noccurred -7\nrecorded 8\nsource 9\ncontext context-b\ncontext-term context-b-1\ncontext-term context-b-2\ncontext context-a\ncontext-term context-a-1\npredicate observation\nterm observation-1\nterm observation-2\naction action\naction-term action-1\noutcome outcome\noutcome-term outcome-1\noutcome-term outcome-2";
     let mut blocks = vec![rich_block.to_owned()];
     blocks.extend(
         [
@@ -504,6 +581,10 @@ fn recall_emits_exact_ranked_blocks_and_honors_limit() {
         success_text(recall(&database, 0, Some(11))),
         expected_eleven
     );
+    assert_eq!(
+        fs::read(&database).expect("database is readable after recall"),
+        before
+    );
 }
 
 #[test]
@@ -513,9 +594,9 @@ fn cold_recall_rebuilds_cue_candidates_without_feedback() {
     init(&database);
 
     for (sequence, occurred, source, predicate, terms) in [
-        (0, 1, 100, 10, "7,8"),
-        (1, 3, 101, 10, "7,9"),
-        (2, 5, 102, 20, "30"),
+        (0, 1, 100, "category", &["seven", "eight"][..]),
+        (1, 3, 101, "category", &["seven", "nine"][..]),
+        (2, 5, 102, "other", &["thirty"][..]),
     ] {
         let mut command = cli();
         command
@@ -528,15 +609,16 @@ fn cold_recall_rebuilds_cue_candidates_without_feedback() {
             .arg("--source")
             .arg(source.to_string())
             .arg("--predicate")
-            .arg(predicate.to_string())
-            .arg("--terms")
-            .arg(terms);
+            .arg(predicate);
+        for term in terms {
+            command.arg("--term").arg(term);
+        }
         assert_eq!(success_text(invoke(command, None)), format!("{sequence}\n"));
     }
 
     assert_eq!(
         success_text(recall(&database, 0, None)),
-        "sequence 1\nactivation_ppm 177777\noccurred 3\nrecorded 4\nsource 101\npredicate 10\nterms 7,9\n"
+        "sequence 1\nactivation_ppm 177777\noccurred 3\nrecorded 4\nsource 101\npredicate category\nterm seven\nterm nine\n"
     );
     assert_eq!(
         SqliteStore::open(&database)
@@ -555,11 +637,11 @@ fn bounded_feedback_learns_reverses_and_suppresses_structural_matches_across_pro
     init(&database);
 
     for (occurred, predicate, terms) in [
-        (1, 10, "7,8"),
-        (3, 10, "7,9"),
-        (5, 10, "9,10"),
-        (7, 20, "7"),
-        (9, 30, "30"),
+        (1, "category", &["seven", "eight"][..]),
+        (3, "category", &["seven", "nine"][..]),
+        (5, "category", &["nine", "ten"][..]),
+        (7, "other", &["seven"][..]),
+        (9, "learned only", &["thirty"][..]),
     ] {
         add_observation(&database, occurred, predicate, terms);
     }
@@ -624,13 +706,19 @@ fn recall_with_no_hits_is_silent_and_does_not_advance_the_store() {
     let database = directory.path().join("memory.sqlite3");
     init(&database);
     assert_eq!(success_text(add_minimal(&database, 1, false)), "0\n");
+    assert_eq!(success_text(add_minimal(&database, 2, false)), "1\n");
+    let before = fs::read(&database).expect("database is readable before recall");
     assert_silent_success(recall(&database, 0, None));
     assert_silent_success(recall(&database, 0, Some(0)));
+    assert_eq!(
+        fs::read(&database).expect("database is readable after recall"),
+        before
+    );
 
     let mut writer = SqliteStore::open(&database).expect("writer opens before recall");
     let source = AtomId::from_parts(writer.memory_id(), 0);
+    let target = AtomId::from_parts(writer.memory_id(), 1);
     assert_silent_success(recall(&database, 0, None));
-    let target = writer.memory_mut().insert_episode(draft(2)).unwrap();
     writer
         .memory_mut()
         .apply_feedback(source, &[target], true)
@@ -728,6 +816,55 @@ fn malformed_direct_arguments_are_syntax_errors_but_store_errors_are_runtime_err
         "1,",
     ]);
     failure(invoke(malformed_statement, None), 2);
+
+    for episode_options in [
+        vec![
+            "--predicate",
+            "observation",
+            "--context",
+            "context",
+            "--term",
+            "late observation term",
+            "--context-term",
+            "context term",
+        ],
+        vec![
+            "--predicate",
+            "observation",
+            "--term",
+            "observation term",
+            "--context",
+            "context",
+            "--context-term",
+            "context term",
+            "--term",
+            "late observation term",
+        ],
+        vec![
+            "--predicate",
+            "observation",
+            "--term",
+            "observation term",
+            "--action",
+            "action",
+            "--action-term",
+            "action term",
+            "--outcome",
+            "outcome",
+            "--outcome-term",
+            "outcome term",
+            "--action-term",
+            "late action term",
+        ],
+    ] {
+        let mut command = cli();
+        command
+            .arg("add")
+            .arg(&database)
+            .args(["--occurred", "1", "--recorded", "2", "--source", "3"])
+            .args(episode_options);
+        failure(invoke(command, None), 2);
+    }
 
     let stderr = failure(recall(&database, 99, None), 1);
     assert!(stderr.contains("unknown atom"));

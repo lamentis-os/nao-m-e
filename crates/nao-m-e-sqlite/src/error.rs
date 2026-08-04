@@ -22,6 +22,27 @@ pub enum StoreError {
     },
     /// The non-negative SQLite revision counter reached its maximum value.
     RevisionExhausted,
+    /// A caller-supplied symbol value cannot be normalized into the contract.
+    InvalidSymbolValue {
+        /// Symbol namespace containing the rejected batch entry.
+        namespace: &'static str,
+        /// Zero-based position of the rejected value in the batch.
+        index: usize,
+        /// Violated value invariant.
+        detail: &'static str,
+    },
+    /// A symbol namespace has assigned every unsigned 64-bit identifier.
+    SymbolIdExhausted {
+        /// Exhausted symbol namespace.
+        namespace: &'static str,
+    },
+    /// A caller referred to an identifier absent from a symbol namespace.
+    UnknownSymbolId {
+        /// Symbol namespace that did not contain the identifier.
+        namespace: &'static str,
+        /// Missing unsigned identifier.
+        id: u64,
+    },
 }
 
 impl fmt::Display for StoreError {
@@ -41,6 +62,23 @@ impl fmt::Display for StoreError {
             Self::RevisionExhausted => {
                 formatter.write_str("SQLite memory snapshot revision is exhausted")
             }
+            Self::InvalidSymbolValue {
+                namespace,
+                index,
+                detail,
+            } => write!(
+                formatter,
+                "invalid {namespace} symbol at batch index {index}: {detail}",
+            ),
+            Self::SymbolIdExhausted { namespace } => {
+                write!(
+                    formatter,
+                    "{namespace} symbol identifier space is exhausted"
+                )
+            }
+            Self::UnknownSymbolId { namespace, id } => {
+                write!(formatter, "unknown {namespace} symbol identifier {id}")
+            }
         }
     }
 }
@@ -52,7 +90,11 @@ impl Error for StoreError {
             Self::Database(error) => Some(error),
             Self::Entropy(error) => Some(error),
             Self::InvalidStore(error) => Some(error),
-            Self::ConcurrentModification { .. } | Self::RevisionExhausted => None,
+            Self::ConcurrentModification { .. }
+            | Self::RevisionExhausted
+            | Self::InvalidSymbolValue { .. }
+            | Self::SymbolIdExhausted { .. }
+            | Self::UnknownSymbolId { .. } => None,
         }
     }
 }
@@ -123,6 +165,24 @@ pub enum StoreIntegrityError {
         /// Sequence read from the database.
         found: u64,
     },
+    /// Symbol identifiers do not form the exact prefix `0..N`.
+    NonContiguousSymbolId {
+        /// Affected symbol namespace.
+        namespace: &'static str,
+        /// Identifier required at this position.
+        expected: u64,
+        /// Identifier read from the database.
+        found: u64,
+    },
+    /// A persisted symbol value is not canonical.
+    InvalidSymbol {
+        /// Affected symbol namespace.
+        namespace: &'static str,
+        /// Identifier of the malformed symbol.
+        id: u64,
+        /// Violated value invariant.
+        detail: &'static str,
+    },
     /// An episode or one of its statements is not canonical.
     InvalidEpisode {
         /// Sequence of the affected episode.
@@ -166,6 +226,19 @@ impl fmt::Display for StoreIntegrityError {
                 formatter,
                 "expected episode sequence {expected}, found {found}",
             ),
+            Self::NonContiguousSymbolId {
+                namespace,
+                expected,
+                found,
+            } => write!(
+                formatter,
+                "expected {namespace} symbol identifier {expected}, found {found}",
+            ),
+            Self::InvalidSymbol {
+                namespace,
+                id,
+                detail,
+            } => write!(formatter, "invalid {namespace} symbol {id}: {detail}",),
             Self::InvalidEpisode { sequence, detail } => {
                 write!(formatter, "invalid episode {sequence}: {detail}")
             }
