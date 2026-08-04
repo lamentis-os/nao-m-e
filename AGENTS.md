@@ -21,6 +21,8 @@ format and lifecycle are defined in `docs/sqlite-contract.md`.
   allocation, staging, validation, and resolution.
 - `crates/nao-m-e-sqlite/src/store/feedback.rs` owns feedback restoration and
   transactional reconciliation.
+- `crates/nao-m-e-sqlite/src/store/tests.rs` exercises private lifecycle,
+  revision, corruption, and transaction invariants.
 - `crates/nao-m-e-sqlite/tests` exercises the public adapter contract.
 - `crates/nao-m-e-cli` owns the strict CLI argument and text-output grammar,
   command execution, and cross-process CLI tests.
