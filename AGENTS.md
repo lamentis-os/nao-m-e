@@ -15,6 +15,13 @@ format and lifecycle are defined in `docs/sqlite-contract.md`.
 - `src/memory.rs` owns atom storage, bounded feedback traces, and recall.
 - `src/parameters.rs` owns fixed-point constants.
 - `tests/core_contract.rs` exercises the public core contract.
+- `crates/nao-m-e-sqlite/src/format.rs` owns SQLite file identity, session and
+  durability policy, and closed-schema creation and validation.
+- `crates/nao-m-e-sqlite/src/format/codec.rs` owns canonical identifier and
+  episode-payload encoding and decoding.
+- `crates/nao-m-e-sqlite/src/format/tests.rs` and
+  `crates/nao-m-e-sqlite/src/format/codec/tests.rs` exercise the private format
+  and codec invariants.
 - `crates/nao-m-e-sqlite/src/store.rs` owns SQLite store lifecycle, metadata and
   revision validation, and atomic save orchestration.
 - `crates/nao-m-e-sqlite/src/store/symbols.rs` owns text-symbol normalization,

@@ -7,9 +7,8 @@
 //! memory until an explicit [`SqliteStore::save`] atomically commits staged
 //! predicate and term symbols, newly appended episodes, and feedback changes.
 
-mod codec;
 mod error;
-mod schema;
+mod format;
 mod store;
 
 pub use error::{StoreError, StoreIntegrityError};

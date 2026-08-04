@@ -5,9 +5,8 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params_from_iter};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::codec;
 use crate::error::{StoreError, StoreIntegrityError};
-use crate::schema;
+use crate::format;
 
 use super::{SqliteStore, read_metadata, read_u64};
 
@@ -330,7 +329,7 @@ impl SymbolValueError {
 
 fn normalize_symbol(value: &str) -> Result<String, SymbolValueError> {
     let lowercase = value.nfkc().flat_map(unicode_lowercase).nfkc();
-    let mut normalized = String::with_capacity(value.len().min(schema::MAX_SYMBOL_BYTES));
+    let mut normalized = String::with_capacity(value.len().min(format::MAX_SYMBOL_BYTES));
     let mut whitespace_pending = false;
     for character in lowercase {
         if is_unicode_16_whitespace(character) {
@@ -345,7 +344,7 @@ fn normalize_symbol(value: &str) -> Result<String, SymbolValueError> {
             whitespace_pending = false;
         }
         normalized.push(character);
-        if normalized.len() > schema::MAX_SYMBOL_BYTES {
+        if normalized.len() > format::MAX_SYMBOL_BYTES {
             return Err(SymbolValueError::TooLong);
         }
     }
@@ -552,7 +551,7 @@ fn read_symbol_values_for_ids(
         if chunk.is_empty() {
             continue;
         }
-        let encoded: Vec<_> = chunk.iter().copied().map(codec::encode_u64).collect();
+        let encoded: Vec<_> = chunk.iter().copied().map(format::encode_u64).collect();
         let sql = format!(
             "SELECT id, value FROM {} WHERE id IN ({}) ORDER BY id",
             namespace.table(),
@@ -667,7 +666,7 @@ pub(super) fn verify_symbol_tail(
     let actual_tail = tail
         .as_deref()
         .map(|bytes| {
-            codec::decode_u64(bytes).ok_or(StoreIntegrityError::InvalidEncoding {
+            format::decode_u64(bytes).ok_or(StoreIntegrityError::InvalidEncoding {
                 table: namespace.table(),
                 column: "id",
             })
@@ -703,7 +702,7 @@ pub(super) fn insert_pending_symbols(
     );
     let mut insert = transaction.prepare(&sql)?;
     for (id, value) in pending {
-        let id = codec::encode_u64(id);
+        let id = format::encode_u64(id);
         insert.execute((id.as_slice(), value))?;
     }
     Ok(())
