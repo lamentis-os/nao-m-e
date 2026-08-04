@@ -5,8 +5,10 @@
 These instructions apply to the entire repository. The workspace contains a
 deterministic, in-memory Rust 2024 kernel for symbolic episode memory, an
 optional SQLite snapshot adapter, and a user- and agent-facing command-line
-adapter. Core behavior is defined in `docs/core-contract.md`; the persistence
-format and lifecycle are defined in `docs/sqlite-contract.md`.
+adapter. An optional semantic cue sidecar stores rebuildable, caller-embedded
+derived data. Core behavior is defined in `docs/core-contract.md`; authoritative
+persistence is defined in `docs/sqlite-contract.md`; the independent sidecar
+format and lifecycle are defined in `docs/semantic-index-contract.md`.
 
 ## Source layout
 
@@ -34,6 +36,15 @@ format and lifecycle are defined in `docs/sqlite-contract.md`.
 - `crates/nao-m-e-sqlite/src/store/tests.rs` exercises private lifecycle,
   revision, corruption, and transaction invariants.
 - `crates/nao-m-e-sqlite/tests` exercises the public adapter contract.
+- `crates/nao-m-e-semantic-index/src/model.rs` owns embedding profiles,
+  fixed-width vectors, cue text, and index statistics.
+- `crates/nao-m-e-semantic-index/src/error.rs` owns public sidecar operation and
+  integrity errors.
+- `crates/nao-m-e-semantic-index/src/index.rs` owns sidecar lifecycle,
+  synchronization, source projection, and complete validation.
+- `crates/nao-m-e-semantic-index/src/index/format.rs` owns the independent
+  semantic SQLite identity, closed schema, scalar codecs, and connection policy.
+- `crates/nao-m-e-semantic-index/tests` exercises the public sidecar contract.
 - `crates/nao-m-e-cli/src/main.rs` owns the process boundary, root dispatch,
   initialization, feedback, and shared save/output handling.
 - `crates/nao-m-e-cli/src/add.rs` owns Add grammar, text-episode parsing,
@@ -65,6 +76,9 @@ repository-level guardrails when changing the implementation:
 - Keep attribute-key and value text in one append-only SQLite symbol catalog.
   The core and episode payloads remain numeric; every persisted symbol
   reference must resolve to that catalog before a snapshot is exposed.
+- Keep semantic vectors in a rebuildable sidecar bound to one committed memory
+  and embedding profile. The sidecar never becomes authority for text or
+  episodes and must not change core scoring or the main SQLite format.
 - Preserve canonical fixed-width identifier encodings and reject stale writers
   rather than silently merging or overwriting their snapshots.
 
@@ -87,6 +101,9 @@ repository-level guardrails when changing the implementation:
 - `docs/core-contract.md` is the single cross-cutting core specification.
 - `docs/sqlite-contract.md` is the single SQLite format and lifecycle
   specification.
+- `docs/semantic-index-contract.md` is the single semantic sidecar format and
+  lifecycle specification. Its format version is independent of the main
+  SQLite format version.
 - Rustdoc describes symbol-local semantics, errors, and non-obvious behavior.
   Public items remain documented under `#![deny(missing_docs)]`.
 - Ordinary comments explain only non-obvious reasons or invariants, not control

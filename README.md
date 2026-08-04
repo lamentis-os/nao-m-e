@@ -102,8 +102,24 @@ fn main() -> Result<(), Box<dyn Error>> {
 rewriting equal rows on the bounded-delta path. New symbols remain staged until
 the same transaction publishes them with the episodes that reference their
 IDs. `open()` validates and reconstructs the complete snapshot before exposing
-memory state. Cue postings and recall scores are derived in memory and are not
-stored in SQLite.
+memory state. Symbolic-recall cue postings and scores are derived in memory and
+are not stored in the authoritative SQLite database.
+
+## Semantic cue index
+
+`nao-m-e-semantic-index` is an optional, rebuildable SQLite sidecar for future
+semantic candidate generation. It stores one caller-produced fixed-width
+vector for each distinct bound attribute cue `(key SymbolId, value SymbolId)`
+and postings from those cues to episodes. Repeated cues reuse one vector, while
+the normalized key and value text remains only in the authoritative V6 symbol
+catalog.
+
+The sidecar is bound to one memory and one caller-defined embedding profile.
+It can be created from a committed snapshot and synchronized after new episodes
+are saved. It does not alter the main database, core scoring, or CLI, and it does
+not include a model or semantic recall yet. See the
+[semantic cue index contract](docs/semantic-index-contract.md) for the exact
+format, lifecycle, and failure boundary.
 
 ## Command-line interface
 
@@ -226,6 +242,8 @@ must resolve an unknown completion state before retrying.
 
 - The core performs no I/O, networking, random recall, embeddings, or LLM calls.
 - SQLite format V6 has no automatic or heuristic migration from V1-V5.
+- Semantic sidecar format V1 is a separate version namespace; it does not make
+  the authoritative SQLite database V7.
 - Symbol normalization applies NFKC, Unicode lowercase, NFKC again, and Unicode
   whitespace collapse. Only the normalized value is retained.
 - There is no stemming, fuzzy matching, aliasing, synonym inference, or episode
@@ -236,9 +254,10 @@ must resolve an unknown completion state before retrying.
   vector or global activation ranking.
 - Concurrent or stale writers are rejected rather than merged.
 
-See the [core contract](docs/core-contract.md) and the
-[SQLite contract](docs/sqlite-contract.md) for exact semantics. Generate local
-API documentation with:
+See the [core contract](docs/core-contract.md), the
+[SQLite contract](docs/sqlite-contract.md), and the
+[semantic cue index contract](docs/semantic-index-contract.md) for exact
+semantics. Generate local API documentation with:
 
 ```sh
 cargo doc --workspace --no-deps --all-features --locked --open

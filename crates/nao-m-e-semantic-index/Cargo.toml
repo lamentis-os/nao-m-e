@@ -1,0 +1,15 @@
+[package]
+name = "nao-m-e-semantic-index"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Derived semantic cue index for nao-m-e"
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+nao-m-e = { path = "../.." }
+nao-m-e-sqlite = { path = "../nao-m-e-sqlite" }
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+tempfile = "3.27.0"
