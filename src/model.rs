@@ -134,17 +134,13 @@ unsigned_id!(
     TermId,
     "Caller-owned identifier for an entity, value, or other symbolic term."
 );
-unsigned_id!(
-    SourceId,
-    "Caller-owned identifier for the provenance source of an episode."
-);
 
-/// Signed milliseconds on a caller-defined timeline.
+/// Signed milliseconds since the Unix epoch, `1970-01-01T00:00:00Z`.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TimestampMs(i64);
 
 impl TimestampMs {
-    /// Creates a timestamp without imposing clock or ordering semantics.
+    /// Creates a Unix timestamp from signed epoch milliseconds.
     #[must_use]
     pub const fn new(value: i64) -> Self {
         Self(value)
@@ -199,10 +195,8 @@ impl Statement {
 /// Construction data for one episode atom.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EpisodeDraft {
-    /// Time at which the represented event occurred.
-    pub occurred_at: TimestampMs,
-    /// Time at which the event was recorded.
-    pub recorded_at: TimestampMs,
+    /// Unix timestamp associated with the represented episode.
+    pub timestamp: TimestampMs,
     /// Context statements, sorted and deduplicated on insertion.
     pub context: Vec<Statement>,
     /// Observation recorded by the episode.
@@ -211,21 +205,17 @@ pub struct EpisodeDraft {
     pub action: Option<Statement>,
     /// Observed outcome, if any.
     pub outcome: Option<Statement>,
-    /// Caller-defined provenance source.
-    pub source: SourceId,
 }
 
 /// An immutable episode stored in a [`crate::Memory`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EpisodeAtom {
     id: AtomId,
-    occurred_at: TimestampMs,
-    recorded_at: TimestampMs,
+    timestamp: TimestampMs,
     context: Box<[Statement]>,
     observation: Statement,
     action: Option<Statement>,
     outcome: Option<Statement>,
-    source: SourceId,
 }
 
 impl EpisodeAtom {
@@ -235,13 +225,11 @@ impl EpisodeAtom {
 
         Self {
             id,
-            occurred_at: draft.occurred_at,
-            recorded_at: draft.recorded_at,
+            timestamp: draft.timestamp,
             context: draft.context.into_boxed_slice(),
             observation: draft.observation,
             action: draft.action,
             outcome: draft.outcome,
-            source: draft.source,
         }
     }
 
@@ -251,16 +239,10 @@ impl EpisodeAtom {
         self.id
     }
 
-    /// Returns when the represented event occurred.
+    /// Returns the Unix timestamp associated with the represented episode.
     #[must_use]
-    pub const fn occurred_at(&self) -> TimestampMs {
-        self.occurred_at
-    }
-
-    /// Returns when the event was recorded.
-    #[must_use]
-    pub const fn recorded_at(&self) -> TimestampMs {
-        self.recorded_at
+    pub const fn timestamp(&self) -> TimestampMs {
+        self.timestamp
     }
 
     /// Returns the sorted, duplicate-free context.
@@ -285,12 +267,6 @@ impl EpisodeAtom {
     #[must_use]
     pub const fn outcome(&self) -> Option<&Statement> {
         self.outcome.as_ref()
-    }
-
-    /// Returns the provenance source.
-    #[must_use]
-    pub const fn source(&self) -> SourceId {
-        self.source
     }
 }
 

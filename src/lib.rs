@@ -14,7 +14,7 @@ mod parameters;
 
 pub use memory::{FeedbackEdge, Memory, RecallHit};
 pub use model::{Activation, FeedbackTrace, ValueError};
-pub use model::{AtomId, MemoryId, PredicateId, SourceId, TermId, TimestampMs};
+pub use model::{AtomId, MemoryId, PredicateId, TermId, TimestampMs};
 pub use model::{EpisodeAtom, EpisodeDraft, Statement};
 pub use model::{GraphError, MemoryError, MemoryIdError, ModelError};
 pub use parameters::{

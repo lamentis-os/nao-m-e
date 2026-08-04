@@ -22,15 +22,16 @@ state and is rebuilt by replaying the atom sequence.
 ## Symbolic episodes
 
 A statement consists of a caller-owned predicate identifier and one or more
-ordered, caller-owned term identifiers. An episode contains occurrence and
-recording timestamps, context statements, one observation, an optional action,
-an optional outcome, and a caller-owned provenance source identifier.
+ordered, caller-owned term identifiers. An episode contains one timestamp,
+context statements, one observation, an optional action, and an optional
+outcome.
 
 Insertion sorts and deduplicates the context list by predicate identifier and
 then lexicographically by the ordered argument identifiers. It does not reorder
 a statement's arguments or otherwise interpret caller-owned identifiers.
-Timestamps are signed milliseconds on a caller-defined timeline and do not
-drive recall or feedback.
+The timestamp is a signed number of milliseconds since the Unix epoch,
+`1970-01-01T00:00:00Z`. It does not drive recall or feedback, establish
+insertion order, or require the kernel to read a clock.
 
 Recall derives a set of symbolic cues from every statement in an episode. The
 statement roles are `Context`, `Observation`, `Action`, and `Outcome`. For a
@@ -48,7 +49,7 @@ Each distinct cue occurs at most once in an episode's cue set, even if several
 statements produce it. Predicate and term cues can therefore match across
 roles, while role-predicate and role-argument cues preserve their stated role;
 role-argument cues additionally preserve predicate and argument position.
-Timestamps and provenance source identifiers do not produce cues.
+The timestamp does not produce cues.
 
 ## Identity and membership
 

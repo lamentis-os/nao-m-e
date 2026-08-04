@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use nao_m_e::{EpisodeDraft, FeedbackTrace, PredicateId, SourceId, Statement, TermId, TimestampMs};
+use nao_m_e::{EpisodeDraft, FeedbackTrace, PredicateId, Statement, TermId, TimestampMs};
 use rusqlite::{Connection, params};
 use tempfile::{TempDir, tempdir};
 
@@ -16,13 +16,11 @@ fn statement(predicate: u64, arguments: &[u64]) -> Statement {
 
 fn draft(seed: u64) -> EpisodeDraft {
     EpisodeDraft {
-        occurred_at: TimestampMs::new(i64::try_from(seed).expect("small test seed")),
-        recorded_at: TimestampMs::new(-i64::try_from(seed).expect("small test seed")),
+        timestamp: TimestampMs::new(-i64::try_from(seed).expect("small test seed")),
         context: vec![statement(0, &[0])],
         observation: statement(1, &[1, 2]),
         action: Some(statement(2, &[3])),
         outcome: None,
-        source: SourceId::new(40 + seed),
     }
 }
 
@@ -81,13 +79,11 @@ fn failed_episode_dml_rolls_back_pending_symbols_and_revision() {
     store
         .memory_mut()
         .insert_episode(EpisodeDraft {
-            occurred_at: TimestampMs::new(0),
-            recorded_at: TimestampMs::new(0),
+            timestamp: TimestampMs::new(0),
             context: Vec::new(),
             observation: statement(predicate.get(), &[term.get()]),
             action: None,
             outcome: None,
-            source: SourceId::new(0),
         })
         .unwrap();
     store
@@ -142,7 +138,7 @@ fn non_contiguous_symbol_identifiers_are_rejected() {
 
 #[test]
 fn metadata_and_unsupported_formats_fail_closed_with_specific_errors() {
-    for unsupported in [1, 2, 3, format::FORMAT_VERSION + 1] {
+    for unsupported in [1, 2, 3, 4, format::FORMAT_VERSION + 1] {
         let directory = tempdir().unwrap();
         let path = saved_store(&directory, 0);
         let raw = Connection::open(&path).unwrap();
@@ -182,6 +178,7 @@ fn rejected_identity_format_or_journal_mode_never_rewrites_the_file_mode() {
         Some(1),
         Some(2),
         Some(3),
+        Some(4),
         Some(format::FORMAT_VERSION),
         Some(format::FORMAT_VERSION + 1),
     ] {
@@ -210,7 +207,16 @@ fn rejected_identity_format_or_journal_mode_never_rewrites_the_file_mode() {
         drop(raw);
         let before = std::fs::read(&path).unwrap();
 
-        assert!(SqliteStore::open(&path).is_err());
+        let result = SqliteStore::open(&path);
+        match unsupported_format {
+            Some(version) if version != format::FORMAT_VERSION => assert!(matches!(
+                result,
+                Err(StoreError::InvalidStore(
+                    StoreIntegrityError::UnsupportedFormatVersion { found }
+                )) if found == version
+            )),
+            _ => assert!(result.is_err()),
+        }
         assert_eq!(std::fs::read(&path).unwrap(), before);
 
         let raw = Connection::open(&path).unwrap();

@@ -20,22 +20,24 @@ fn episode(draft: EpisodeDraft) -> EpisodeAtom {
 
 fn draft_from_episode(episode: &EpisodeAtom) -> EpisodeDraft {
     EpisodeDraft {
-        occurred_at: episode.occurred_at(),
-        recorded_at: episode.recorded_at(),
+        timestamp: episode.timestamp(),
         context: episode.context().to_vec(),
         observation: episode.observation().clone(),
         action: episode.action().cloned(),
         outcome: episode.outcome().cloned(),
-        source: episode.source(),
     }
 }
 
 fn fixed_prefix(flags: u8) -> Vec<u8> {
     let mut bytes = vec![flags];
     bytes.extend_from_slice(&0_i64.to_be_bytes());
-    bytes.extend_from_slice(&0_i64.to_be_bytes());
-    bytes.extend_from_slice(&0_u64.to_be_bytes());
     bytes
+}
+
+fn encoded_episode(episode: &EpisodeAtom) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(MIN_EPISODE_PAYLOAD_BYTES);
+    encode_episode(episode, &mut encoded);
+    encoded
 }
 
 fn assert_decode_error(bytes: &[u8], expected: &'static str) {
@@ -90,26 +92,26 @@ fn big_endian_encoding_preserves_numeric_order() {
 #[test]
 fn episode_encoding_matches_golden_bytes() {
     let atom = episode(EpisodeDraft {
-        occurred_at: TimestampMs::new(0),
-        recorded_at: TimestampMs::new(-1),
+        timestamp: TimestampMs::new(-1),
         context: Vec::new(),
         observation: statement(1, &[2]),
         action: None,
         outcome: None,
-        source: SourceId::new(u64::MAX),
     });
     let expected = vec![
         0x00, // flags
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // occurred_at
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // recorded_at
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // source
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // timestamp
         0x00, // context count
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // predicate
         0x01, // argument count
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, // term
     ];
 
-    assert_eq!(encode_episode(&atom), expected);
+    assert_eq!(expected.len(), MIN_EPISODE_PAYLOAD_BYTES);
+
+    let mut encoded = vec![0xaa; MIN_EPISODE_PAYLOAD_BYTES + 10];
+    encode_episode(&atom, &mut encoded);
+    assert_eq!(encoded, expected);
     assert_eq!(decode_episode(&expected), Ok(draft_from_episode(&atom)));
 }
 
@@ -118,15 +120,13 @@ fn all_optional_statement_combinations_roundtrip() {
     for action_present in [false, true] {
         for outcome_present in [false, true] {
             let atom = episode(EpisodeDraft {
-                occurred_at: TimestampMs::new(10),
-                recorded_at: TimestampMs::new(20),
+                timestamp: TimestampMs::new(20),
                 context: vec![statement(1, &[2]), statement(3, &[4, 5])],
                 observation: statement(6, &[7]),
                 action: action_present.then(|| statement(8, &[9])),
                 outcome: outcome_present.then(|| statement(10, &[11])),
-                source: SourceId::new(12),
             });
-            let encoded = encode_episode(&atom);
+            let encoded = encoded_episode(&atom);
             let expected_flags = (u8::from(action_present) * ACTION_PRESENT)
                 | (u8::from(outcome_present) * OUTCOME_PRESENT);
 
@@ -143,15 +143,13 @@ fn counts_cross_the_canonical_uleb128_boundary() {
             .map(|index| statement(index as u64, &[index as u64]))
             .collect();
         let context_atom = episode(EpisodeDraft {
-            occurred_at: TimestampMs::new(0),
-            recorded_at: TimestampMs::new(0),
+            timestamp: TimestampMs::new(0),
             context,
             observation: statement(u64::MAX, &[0]),
             action: None,
             outcome: None,
-            source: SourceId::new(0),
         });
-        let encoded = encode_episode(&context_atom);
+        let encoded = encoded_episode(&context_atom);
         assert_eq!(
             &encoded[FIXED_EPISODE_PREFIX_BYTES..FIXED_EPISODE_PREFIX_BYTES + expected.len()],
             expected
@@ -163,15 +161,13 @@ fn counts_cross_the_canonical_uleb128_boundary() {
 
         let arguments: Vec<_> = (0..count).map(|index| index as u64).collect();
         let argument_atom = episode(EpisodeDraft {
-            occurred_at: TimestampMs::new(0),
-            recorded_at: TimestampMs::new(0),
+            timestamp: TimestampMs::new(0),
             context: Vec::new(),
             observation: statement(0, &arguments),
             action: None,
             outcome: None,
-            source: SourceId::new(0),
         });
-        let encoded = encode_episode(&argument_atom);
+        let encoded = encoded_episode(&argument_atom);
         let argument_count_offset = FIXED_EPISODE_PREFIX_BYTES + 1 + U64_BYTES;
         assert_eq!(
             &encoded[argument_count_offset..argument_count_offset + expected.len()],
@@ -185,33 +181,31 @@ fn counts_cross_the_canonical_uleb128_boundary() {
 }
 
 #[test]
-fn signed_timestamps_and_unsigned_identifiers_roundtrip_at_extremes() {
-    let atom = episode(EpisodeDraft {
-        occurred_at: TimestampMs::new(i64::MIN),
-        recorded_at: TimestampMs::new(i64::MAX),
-        context: vec![statement(0, &[u64::MAX])],
-        observation: statement(u64::MAX, &[0, u64::MAX]),
-        action: Some(statement(u64::MAX - 1, &[u64::MAX])),
-        outcome: Some(statement(u64::MAX, &[0])),
-        source: SourceId::new(u64::MAX),
-    });
-    let encoded = encode_episode(&atom);
+fn signed_timestamp_and_unsigned_symbol_identifiers_roundtrip_at_extremes() {
+    for timestamp in [i64::MIN, i64::MAX] {
+        let atom = episode(EpisodeDraft {
+            timestamp: TimestampMs::new(timestamp),
+            context: vec![statement(0, &[u64::MAX])],
+            observation: statement(u64::MAX, &[0, u64::MAX]),
+            action: Some(statement(u64::MAX - 1, &[u64::MAX])),
+            outcome: Some(statement(u64::MAX, &[0])),
+        });
+        let encoded = encoded_episode(&atom);
 
-    assert_eq!(decode_episode(&encoded), Ok(draft_from_episode(&atom)));
+        assert_eq!(decode_episode(&encoded), Ok(draft_from_episode(&atom)));
+    }
 }
 
 #[test]
 fn malformed_episode_encodings_fail_closed() {
     let atom = episode(EpisodeDraft {
-        occurred_at: TimestampMs::new(1),
-        recorded_at: TimestampMs::new(2),
+        timestamp: TimestampMs::new(1),
         context: vec![statement(10, &[11]), statement(20, &[21])],
         observation: statement(30, &[31]),
         action: None,
         outcome: None,
-        source: SourceId::new(3),
     });
-    let valid = encode_episode(&atom);
+    let valid = encoded_episode(&atom);
     for end in 0..valid.len() {
         assert!(
             decode_episode(&valid[..end]).is_err(),
@@ -281,16 +275,14 @@ fn roundtrip_uses_the_atoms_canonical_context() {
     let first = statement(1, &[2]);
     let second = statement(3, &[4]);
     let atom = episode(EpisodeDraft {
-        occurred_at: TimestampMs::new(5),
-        recorded_at: TimestampMs::new(6),
+        timestamp: TimestampMs::new(5),
         context: vec![second.clone(), first.clone(), second],
         observation: statement(7, &[8]),
         action: None,
         outcome: None,
-        source: SourceId::new(9),
     });
     assert_eq!(atom.context(), &[first, statement(3, &[4])]);
 
-    let encoded = encode_episode(&atom);
+    let encoded = encoded_episode(&atom);
     assert_eq!(decode_episode(&encoded), Ok(draft_from_episode(&atom)));
 }

@@ -1,6 +1,6 @@
 use nao_m_e::{
-    Activation, AtomId, EpisodeDraft, FeedbackTrace, Memory, MemoryId, PredicateId, SourceId,
-    Statement, TermId, TimestampMs,
+    Activation, AtomId, EpisodeDraft, FeedbackTrace, Memory, MemoryId, PredicateId, Statement,
+    TermId, TimestampMs,
 };
 
 pub(super) fn memory_id(value: u128) -> MemoryId {
@@ -21,13 +21,11 @@ pub(super) fn statement(predicate: u64, arguments: &[u64]) -> Statement {
 
 pub(super) fn draft(seed: u64) -> EpisodeDraft {
     EpisodeDraft {
-        occurred_at: TimestampMs::new(i64::try_from(seed).expect("small test seed")),
-        recorded_at: TimestampMs::new(i64::try_from(seed + 10).expect("small test seed")),
+        timestamp: TimestampMs::new(i64::try_from(seed).expect("small test seed")),
         context: vec![statement(10 + seed, &[100 + seed])],
         observation: statement(20 + seed, &[200 + seed]),
         action: Some(statement(30 + seed, &[300 + seed])),
         outcome: Some(statement(40 + seed, &[400 + seed])),
-        source: SourceId::new(50 + seed),
     }
 }
 
@@ -39,13 +37,11 @@ pub(super) fn insert(memory: &mut Memory, seed: u64) -> AtomId {
 
 pub(super) fn observation_draft(seed: u64, predicate: u64, arguments: &[u64]) -> EpisodeDraft {
     EpisodeDraft {
-        occurred_at: TimestampMs::new(i64::try_from(seed).expect("small test seed")),
-        recorded_at: TimestampMs::new(i64::try_from(seed + 1).expect("small test seed")),
+        timestamp: TimestampMs::new(i64::try_from(seed).expect("small test seed")),
         context: Vec::new(),
         observation: statement(predicate, arguments),
         action: None,
         outcome: None,
-        source: SourceId::new(seed),
     }
 }
 

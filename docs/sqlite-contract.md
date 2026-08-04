@@ -3,7 +3,7 @@
 This document defines the durable format and observable lifecycle of the
 `nao-m-e-sqlite` adapter. The state being stored and reconstructed remains the
 state defined by the [core contract](core-contract.md). The current persisted
-format version is `4`.
+format version is `5`.
 
 ## Adapter boundary
 
@@ -55,8 +55,7 @@ snapshot state.
 
 An episode inserted directly through `memory_mut()` may use persisted or staged
 predicate and term IDs. `save()` rejects a new episode containing any other
-predicate or term ID. Source IDs remain caller-owned numeric provenance and do
-not use either catalog.
+predicate or term ID.
 
 Explicit feedback appends one sample to each addressed in-memory feedback
 trace. `save()` stores the resulting bounded feedback graph as part of the
@@ -77,7 +76,7 @@ same `MemoryId` must not be modified independently and later merged.
 ## Format identity and connection settings
 
 The format uses SQLite application ID `0x4E414F4D` (`NAOM`, decimal
-`1312902989`) and `format_version = 4`. This adapter accepts only that format
+`1312902989`) and `format_version = 5`. This adapter accepts only that format
 version. Every other format version is rejected with
 `StoreIntegrityError::UnsupportedFormatVersion`, wrapped in
 `StoreError::InvalidStore`. The adapter has no migrator and never rewrites an
@@ -96,7 +95,7 @@ ignore_check_constraints = OFF
 
 For an existing file-backed target, the adapter next reads the SQLite header's
 application ID and then the metadata format version. Only after accepting the
-ID as `NAOM` and format version `4` does it verify the required rollback
+ID as `NAOM` and format version `5` does it verify the required rollback
 journal mode without changing it, then apply and verify the connection-local
 synchronization setting:
 
@@ -105,7 +104,7 @@ journal_mode = DELETE
 synchronous = EXTRA
 ```
 
-An existing V4 file in another journal mode is rejected without being rewritten.
+An existing V5 file in another journal mode is rejected without being rewritten.
 This ordering prevents any attempted open from changing persistent journaling
 mode. A zero busy timeout means the adapter neither waits nor retries on its own;
 SQLite locking failures remain immediately visible to the caller as database
@@ -118,11 +117,12 @@ before its schema and initial snapshot are committed.
 ## Canonical scalar encoding
 
 - `MemoryId` is its canonical 16-byte big-endian representation.
-- Episode sequences, catalog-allocated `PredicateId` and `TermId` values, and
-  caller-owned `SourceId` values are fixed-width 8-byte big-endian unsigned
-  integers.
-- Timestamps in an episode payload are fixed-width 8-byte big-endian
-  two's-complement signed integers containing the unchanged `i64` value.
+- Episode sequences and catalog-allocated `PredicateId` and `TermId` values are
+  fixed-width 8-byte big-endian unsigned integers.
+- An episode timestamp is a fixed-width 8-byte big-endian two's-complement
+  signed integer containing Unix-epoch milliseconds. The full `i64` range is
+  preserved unchanged; SQLite does not interpret time zones or local civil
+  time.
 - Feedback history is an unsigned 16-bit bitset stored as a SQLite integer.
 - Feedback sample count is an unsigned integer in `1..=16`.
 - An `AtomId` is reconstructed from the database `MemoryId` and an episode
@@ -150,7 +150,7 @@ values fail. IDs are stable only within one logical database and its continued
 copies, not across independently created databases.
 
 Both namespaces use the same normalization profile, fixed to Unicode 16.0.0
-for the complete lifetime of format V4:
+for the complete lifetime of format V5:
 
 1. Apply Unicode compatibility decomposition and canonical composition (NFKC).
 2. Apply Unicode lowercase mapping to every resulting scalar.
@@ -183,9 +183,7 @@ layout is the concatenation below; no padding or native-layout bytes occur:
 ```text
 EpisodePayload =
     flags                u8
-    occurred_at_ms       i64be
-    recorded_at_ms       i64be
-    source_id            u64be
+    timestamp_ms         i64be
     context_count        uleb128
     context              Statement * context_count
     observation          Statement
@@ -197,6 +195,9 @@ Statement =
     argument_count       uleb128
     arguments            u64be * argument_count
 ```
+
+The fixed episode prefix is 9 bytes. A minimal episode payload is 27 bytes;
+statement and count encodings are otherwise unchanged.
 
 In `flags`, bit 0 denotes one following action statement and bit 1 denotes one
 following outcome statement. All other bits are reserved and must be zero. An
@@ -232,7 +233,7 @@ PRAGMA application_id = 1312902989;
 
 CREATE TABLE memory_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    format_version INTEGER NOT NULL CHECK (format_version = 4),
+    format_version INTEGER NOT NULL CHECK (format_version = 5),
     memory_id BLOB NOT NULL
         CHECK (
             typeof(memory_id) = 'blob'
@@ -302,7 +303,7 @@ INSERT INTO memory_meta (
     format_version,
     memory_id,
     snapshot_revision
-) VALUES (1, 4, :memory_id, 0);
+) VALUES (1, 5, :memory_id, 0);
 
 COMMIT;
 ```
@@ -384,13 +385,13 @@ classified as `UnsupportedFormatVersion`. The remaining checks are:
 2. The application schema is the canonical closed five-table, two-index schema.
 3. `PRAGMA quick_check` returns exactly one row containing `ok`.
 4. Predicate and term IDs independently form exact prefixes starting at zero;
-   every value is valid UTF-8, canonical under the V4 normalization profile,
+   every value is valid UTF-8, canonical under the V5 normalization profile,
    binary-unique, and within the byte limit. Validation streams catalog rows
    and retains only each namespace's next-ID state.
 5. Episode sequences are exactly `0..N-1` without gaps, and every payload is a
    canonical, exactly consumed whole-episode encoding.
 6. Every predicate and term referenced by an episode lies in its validated
-   catalog prefix. Source IDs require no catalog entry.
+   catalog prefix.
 7. Stored context is already strictly increasing and duplicate-free. Every
    reconstructed episode is accepted by the core without changing its content,
    and the returned `AtomId` has the expected sequence and memory ID.
@@ -499,13 +500,15 @@ non-canonical schema, catalog, or payload, renumber IDs, repair symbol
 references, canonicalize malformed stored values or context, drop invalid rows,
 clamp stored values, discard feedback samples, or expose a partially
 reconstructed memory. Direct SQL modification is not a supported API. V1, V2,
-and V3 contain no source text from which V4 catalogs could be reconstructed, so
-the adapter performs no automatic or heuristic migration.
+and V3 contain no source text from which the symbol catalogs could be
+reconstructed. V4 has symbol catalogs but an incompatible episode payload.
+The adapter performs no automatic or heuristic migration from any older
+format.
 
 ## CLI boundary
 
 The CLI is an argument and text-output contract using only SQLite
-`format_version = 4`. `init` creates an empty database in the format defined
+`format_version = 5`. `init` creates an empty database in the format defined
 here and is silent on success. `add`, `recall`, and `feedback` require an
 existing store and open and reconstruct its complete snapshot before
 executing. Singular `add` stages its predicate and term values and commits them

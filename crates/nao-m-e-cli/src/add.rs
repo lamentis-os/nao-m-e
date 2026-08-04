@@ -2,8 +2,9 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Write as FmtWrite;
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use nao_m_e::{EpisodeDraft, PredicateId, SourceId, Statement, TermId, TimestampMs};
+use nao_m_e::{EpisodeDraft, PredicateId, Statement, TermId, TimestampMs};
 use nao_m_e_sqlite::SqliteStore;
 
 use super::{CliResult, Command, ParsedArgs, is_help_request, open_store, parse_number, save};
@@ -11,10 +12,11 @@ use super::{CliResult, Command, ParsedArgs, is_help_request, open_store, parse_n
 const ADD_HELP: &str = "Append symbolic episodes and save atomically.
 
 Usage:
-  nao-m-e add <DATABASE> [--quiet] --occurred <MS> --recorded <MS> --source <ID> --predicate <TEXT> --term <TEXT>... [EPISODE OPTIONS]
+  nao-m-e add <DATABASE> [--quiet] [--timestamp <UNIX_MS>] --predicate <TEXT> --term <TEXT>... [EPISODE OPTIONS]
   nao-m-e add <DATABASE> --many [--quiet]
 
 Episode options:
+  --timestamp <UNIX_MS>                       Set signed Unix milliseconds; defaults to current time
   --context <TEXT> --context-term <TEXT>...   Add one context; repeatable
   --action <TEXT> --action-term <TEXT>...      Set the optional action
   --outcome <TEXT> --outcome-term <TEXT>...   Set the optional outcome
@@ -22,7 +24,8 @@ Episode options:
 With --many, standard input contains one shell-quoted single-episode flag row
 per episode. Blank lines and shell comments are ignored. The command parses and
 saves all rows once or saves none. Successful add writes the assigned sequence
-per episode unless --quiet is present.
+per episode unless --quiet is present. Missing timestamps share one current-time
+default per invocation.
 ";
 
 struct TextStatement {
@@ -55,23 +58,19 @@ impl EpisodeToken<'_> {
 }
 
 pub(super) struct TextEpisodeDraft {
-    occurred_at: TimestampMs,
-    recorded_at: TimestampMs,
+    timestamp: Option<TimestampMs>,
     context: Vec<TextStatement>,
     observation: TextStatement,
     action: Option<TextStatement>,
     outcome: Option<TextStatement>,
-    source: SourceId,
 }
 
 struct EpisodeShape {
-    occurred_at: TimestampMs,
-    recorded_at: TimestampMs,
+    timestamp: TimestampMs,
     context_term_counts: Vec<usize>,
     observation_term_count: usize,
     action_term_count: Option<usize>,
     outcome_term_count: Option<usize>,
-    source: SourceId,
 }
 
 #[derive(Clone, Copy)]
@@ -179,9 +178,7 @@ fn parse_many_options(options: &[OsString]) -> Result<bool, String> {
 fn parse_episode_flags<'a>(
     args: impl IntoIterator<Item = EpisodeToken<'a>>,
 ) -> CliResult<TextEpisodeDraft> {
-    let mut occurred_at = None;
-    let mut recorded_at = None;
-    let mut source = None;
+    let mut timestamp = None;
     let mut predicate = None;
     let mut terms = Vec::new();
     let mut context = Vec::new();
@@ -233,19 +230,9 @@ fn parse_episode_flags<'a>(
         )?;
 
         match option {
-            "--occurred" => set_once(
-                &mut occurred_at,
-                TimestampMs::new(parse_number(value.as_os_str(), "occurred timestamp")?),
-                option,
-            )?,
-            "--recorded" => set_once(
-                &mut recorded_at,
-                TimestampMs::new(parse_number(value.as_os_str(), "recorded timestamp")?),
-                option,
-            )?,
-            "--source" => set_once(
-                &mut source,
-                SourceId::new(parse_number(value.as_os_str(), "source ID")?),
+            "--timestamp" => set_once(
+                &mut timestamp,
+                TimestampMs::new(parse_number(value.as_os_str(), "Unix timestamp")?),
                 option,
             )?,
             "--predicate" => {
@@ -287,19 +274,14 @@ fn parse_episode_flags<'a>(
 
     close_active_statement(active, &mut terms, &mut context, &mut action, &mut outcome)?;
 
-    let occurred_at = occurred_at.ok_or_else(|| "episode requires `--occurred`".to_owned())?;
-    let recorded_at = recorded_at.ok_or_else(|| "episode requires `--recorded`".to_owned())?;
-    let source = source.ok_or_else(|| "episode requires `--source`".to_owned())?;
     let predicate = predicate.ok_or_else(|| "episode requires `--predicate`".to_owned())?;
 
     Ok(TextEpisodeDraft {
-        occurred_at,
-        recorded_at,
+        timestamp,
         context,
         observation: TextStatement { predicate, terms },
         action,
         outcome,
-        source,
     })
 }
 
@@ -374,9 +356,10 @@ pub(super) fn read_many_drafts() -> CliResult<Vec<TextEpisodeDraft>> {
 
 pub(super) fn execute(
     database: &Path,
-    drafts: Vec<TextEpisodeDraft>,
+    mut drafts: Vec<TextEpisodeDraft>,
     quiet: bool,
 ) -> CliResult<Vec<u8>> {
+    fill_missing_timestamps(&mut drafts)?;
     let mut store = open_store(database)?;
     let drafts = intern_drafts(&mut store, drafts)?;
     let mut output = if quiet {
@@ -395,6 +378,25 @@ pub(super) fn execute(
     }
     save(&mut store, database)?;
     Ok(output.into_bytes())
+}
+
+fn fill_missing_timestamps(drafts: &mut [TextEpisodeDraft]) -> CliResult<()> {
+    if drafts.iter().all(|draft| draft.timestamp.is_some()) {
+        return Ok(());
+    }
+
+    let milliseconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch".to_owned())?
+        .as_millis();
+    let timestamp = TimestampMs::new(
+        i64::try_from(milliseconds)
+            .map_err(|_| "system clock exceeds the supported Unix timestamp range".to_owned())?,
+    );
+    for draft in drafts {
+        draft.timestamp.get_or_insert(timestamp);
+    }
+    Ok(())
 }
 
 fn intern_drafts(
@@ -459,13 +461,13 @@ fn flatten_drafts(drafts: Vec<TextEpisodeDraft>) -> (Vec<String>, Vec<String>, V
             .outcome
             .map(|statement| flatten_statement(statement, &mut predicate_values, &mut term_values));
         shapes.push(EpisodeShape {
-            occurred_at: draft.occurred_at,
-            recorded_at: draft.recorded_at,
+            timestamp: draft
+                .timestamp
+                .expect("missing timestamps are filled before interning"),
             context_term_counts,
             observation_term_count,
             action_term_count,
             outcome_term_count,
-            source: draft.source,
         });
     }
 
@@ -509,13 +511,11 @@ fn resolve_drafts(
                 .map(|term_count| resolve_statement(&mut predicates, &mut terms, term_count))
                 .transpose()?;
             Ok(EpisodeDraft {
-                occurred_at: shape.occurred_at,
-                recorded_at: shape.recorded_at,
+                timestamp: shape.timestamp,
                 context,
                 observation,
                 action,
                 outcome,
-                source: shape.source,
             })
         })
         .collect::<CliResult<Vec<_>>>()?;

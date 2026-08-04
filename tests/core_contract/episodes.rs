@@ -1,4 +1,4 @@
-use nao_m_e::{AtomId, EpisodeDraft, GraphError, Memory, SourceId, TimestampMs};
+use nao_m_e::{AtomId, EpisodeDraft, GraphError, Memory, TimestampMs};
 
 use super::support::{draft, insert, memory_id, new_memory, statement, trace};
 
@@ -38,28 +38,37 @@ fn insertion_canonicalizes_context_but_keeps_occurrences_distinct() {
 }
 
 #[test]
-fn statements_and_episode_metadata_preserve_caller_semantics() {
+fn statements_and_timestamp_extremes_preserve_caller_semantics() {
     let ordered = statement(7, &[30, 20, 10]);
     let mut memory = new_memory(1);
-    let atom = memory
+    let earliest = memory
         .insert_episode(EpisodeDraft {
-            occurred_at: TimestampMs::new(-50),
-            recorded_at: TimestampMs::new(75),
+            timestamp: TimestampMs::new(i64::MIN),
             context: Vec::new(),
             observation: ordered.clone(),
             action: Some(statement(8, &[1])),
             outcome: Some(statement(9, &[2])),
-            source: SourceId::new(99),
         })
         .expect("episode inserts");
-    let stored = memory.episode(atom).expect("episode exists");
+    let latest = memory
+        .insert_episode(EpisodeDraft {
+            timestamp: TimestampMs::new(i64::MAX),
+            context: Vec::new(),
+            observation: ordered.clone(),
+            action: Some(statement(8, &[1])),
+            outcome: Some(statement(9, &[2])),
+        })
+        .expect("episode inserts");
+    let stored = memory.episode(earliest).expect("episode exists");
 
-    assert_eq!(stored.occurred_at(), TimestampMs::new(-50));
-    assert_eq!(stored.recorded_at(), TimestampMs::new(75));
+    assert_eq!(stored.timestamp(), TimestampMs::new(i64::MIN));
     assert_eq!(stored.observation(), &ordered);
     assert_eq!(stored.action(), Some(&statement(8, &[1])));
     assert_eq!(stored.outcome(), Some(&statement(9, &[2])));
-    assert_eq!(stored.source(), SourceId::new(99));
+    assert_eq!(
+        memory.episode(latest).expect("episode exists").timestamp(),
+        TimestampMs::new(i64::MAX)
+    );
 }
 
 #[test]

@@ -1,7 +1,10 @@
 mod codec;
 
 use codec::encode_memory_id;
-pub(crate) use codec::{decode_episode, decode_memory_id, decode_u64, encode_episode, encode_u64};
+pub(crate) use codec::{
+    MIN_EPISODE_PAYLOAD_BYTES, decode_episode, decode_memory_id, decode_u64, encode_episode,
+    encode_u64,
+};
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -10,13 +13,13 @@ use nao_m_e::MemoryId;
 use rusqlite::{Connection, Error, Result, TransactionBehavior, params};
 
 pub(crate) const APPLICATION_ID: i64 = 0x4E41_4F4D;
-pub(crate) const FORMAT_VERSION: i64 = 4;
+pub(crate) const FORMAT_VERSION: i64 = 5;
 pub(crate) const MAX_SYMBOL_BYTES: usize = 4_096;
 
 const SCHEMA: &str = r#"
 CREATE TABLE memory_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    format_version INTEGER NOT NULL CHECK (format_version = 4),
+    format_version INTEGER NOT NULL CHECK (format_version = 5),
     memory_id BLOB NOT NULL
         CHECK (
             typeof(memory_id) = 'blob'

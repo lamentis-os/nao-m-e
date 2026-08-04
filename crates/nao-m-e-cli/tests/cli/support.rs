@@ -54,21 +54,16 @@ pub(super) fn init(database: &Path) {
 }
 
 pub(super) fn add_minimal(database: &Path, seed: i64, quiet: bool) -> Output {
-    let source = u64::try_from(seed).expect("test seed is non-negative");
     let mut command = cli();
     command
         .arg("add")
         .arg(database)
-        .arg("--occurred")
+        .arg("--timestamp")
         .arg(seed.to_string())
-        .arg("--recorded")
-        .arg((seed + 1).to_string())
-        .arg("--source")
-        .arg(source.to_string())
         .arg("--predicate")
-        .arg(format!("predicate-{source}"))
+        .arg(format!("predicate-{seed}"))
         .arg("--term")
-        .arg(format!("term-{source}"));
+        .arg(format!("term-{seed}"));
     if quiet {
         command.arg("--quiet");
     }

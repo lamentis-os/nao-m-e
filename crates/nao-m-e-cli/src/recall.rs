@@ -169,11 +169,8 @@ fn write_recall_hit(
     writeln!(output, "sequence {}", episode.id().sequence())
         .expect("writing to a String cannot fail");
     writeln!(output, "activation_ppm {activation_ppm}").expect("writing to a String cannot fail");
-    writeln!(output, "occurred {}", episode.occurred_at().get())
+    writeln!(output, "timestamp {}", episode.timestamp().get())
         .expect("writing to a String cannot fail");
-    writeln!(output, "recorded {}", episode.recorded_at().get())
-        .expect("writing to a String cannot fail");
-    writeln!(output, "source {}", episode.source().get()).expect("writing to a String cannot fail");
     for statement in episode.context() {
         write_statement(
             output,

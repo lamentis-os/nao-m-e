@@ -9,8 +9,7 @@ use super::support::{add_minimal, assert_silent_success, cli, init, invoke, reca
 
 fn minimal_recall_block(sequence: u64, activation_ppm: u32) -> String {
     format!(
-        "sequence {sequence}\nactivation_ppm {activation_ppm}\noccurred {sequence}\nrecorded {}\nsource {sequence}\npredicate predicate-{sequence}\nterm term-{sequence}",
-        sequence + 1
+        "sequence {sequence}\nactivation_ppm {activation_ppm}\ntimestamp {sequence}\npredicate predicate-{sequence}\nterm term-{sequence}"
     )
 }
 
@@ -20,13 +19,12 @@ fn recall_emits_exact_ranked_blocks_and_honors_limit() {
     let database = directory.path().join("memory.sqlite3");
     init(&database);
     let mut input = String::from(
-        "--occurred 0 --recorded 1 --source 0 --predicate predicate-0 --term term-0\n\
-         --occurred -7 --recorded 8 --source 9 --context context-b --context-term context-b-1 --context-term context-b-2 --context context-a --context-term context-a-1 --context context-a --context-term context-a-1 --predicate observation --term observation-1 --term observation-2 --action action --action-term action-1 --outcome outcome --outcome-term outcome-1 --outcome-term outcome-2\n",
+        "--timestamp 0 --predicate predicate-0 --term term-0\n\
+         --timestamp -7 --context context-b --context-term context-b-1 --context-term context-b-2 --context context-a --context-term context-a-1 --context context-a --context-term context-a-1 --predicate observation --term observation-1 --term observation-2 --action action --action-term action-1 --outcome outcome --outcome-term outcome-1 --outcome-term outcome-2\n",
     );
     for seed in 2..=11 {
         input.push_str(&format!(
-            "--occurred {seed} --recorded {} --source {seed} --predicate predicate-{seed} --term term-{seed}\n",
-            seed + 1
+            "--timestamp {seed} --predicate predicate-{seed} --term term-{seed}\n"
         ));
     }
     let mut many = cli();
@@ -58,7 +56,7 @@ fn recall_emits_exact_ranked_blocks_and_honors_limit() {
     drop(store);
     let before = fs::read(&database).expect("database is readable before recall");
 
-    let rich_block = "sequence 1\nactivation_ppm 400000\noccurred -7\nrecorded 8\nsource 9\ncontext context-b\ncontext-term context-b-1\ncontext-term context-b-2\ncontext context-a\ncontext-term context-a-1\npredicate observation\nterm observation-1\nterm observation-2\naction action\naction-term action-1\noutcome outcome\noutcome-term outcome-1\noutcome-term outcome-2";
+    let rich_block = "sequence 1\nactivation_ppm 400000\ntimestamp -7\ncontext context-b\ncontext-term context-b-1\ncontext-term context-b-2\ncontext context-a\ncontext-term context-a-1\npredicate observation\nterm observation-1\nterm observation-2\naction action\naction-term action-1\noutcome outcome\noutcome-term outcome-1\noutcome-term outcome-2";
     let mut blocks = vec![rich_block.to_owned()];
     blocks.extend(
         [
@@ -93,8 +91,8 @@ fn recall_emits_exact_ranked_blocks_and_honors_limit() {
 
     const UNIQUE_TERM_COUNT: usize = 901;
     let mut wide_input = String::from(
-        "--occurred 12 --recorded 13 --source 12 --predicate batch-symbol --term shared-symbol\n\
-         --occurred 13 --recorded 14 --source 13 --predicate batch-symbol --term shared-symbol --term shared-symbol",
+        "--timestamp 12 --predicate batch-symbol --term shared-symbol\n\
+         --timestamp 13 --predicate batch-symbol --term shared-symbol --term shared-symbol",
     );
     for index in 0..UNIQUE_TERM_COUNT {
         write!(wide_input, " --term unique-term-{index:04}")
@@ -107,7 +105,7 @@ fn recall_emits_exact_ranked_blocks_and_honors_limit() {
 
     let before_wide_recall = fs::read(&database).expect("wide database is readable before recall");
     let mut expected_wide = String::from(
-        "sequence 13\nactivation_ppm 708\noccurred 13\nrecorded 14\nsource 13\npredicate batch-symbol\nterm shared-symbol\nterm shared-symbol\n",
+        "sequence 13\nactivation_ppm 708\ntimestamp 13\npredicate batch-symbol\nterm shared-symbol\nterm shared-symbol\n",
     );
     for index in 0..UNIQUE_TERM_COUNT {
         writeln!(expected_wide, "term unique-term-{index:04}")
@@ -126,21 +124,17 @@ fn cold_recall_rebuilds_cue_candidates_without_feedback() {
     let database = directory.path().join("memory.sqlite3");
     init(&database);
 
-    for (sequence, occurred, source, predicate, terms) in [
-        (0, 1, 100, "category", &["seven", "eight"][..]),
-        (1, 3, 101, "category", &["seven", "nine"][..]),
-        (2, 5, 102, "other", &["thirty"][..]),
+    for (sequence, timestamp, predicate, terms) in [
+        (0, 1, "category", &["seven", "eight"][..]),
+        (1, 3, "category", &["seven", "nine"][..]),
+        (2, 5, "other", &["thirty"][..]),
     ] {
         let mut command = cli();
         command
             .arg("add")
             .arg(&database)
-            .arg("--occurred")
-            .arg(occurred.to_string())
-            .arg("--recorded")
-            .arg((occurred + 1).to_string())
-            .arg("--source")
-            .arg(source.to_string())
+            .arg("--timestamp")
+            .arg(timestamp.to_string())
             .arg("--predicate")
             .arg(predicate);
         for term in terms {
@@ -151,7 +145,7 @@ fn cold_recall_rebuilds_cue_candidates_without_feedback() {
 
     assert_eq!(
         success_text(recall(&database, 0, None)),
-        "sequence 1\nactivation_ppm 177777\noccurred 3\nrecorded 4\nsource 101\npredicate category\nterm seven\nterm nine\n"
+        "sequence 1\nactivation_ppm 177777\ntimestamp 3\npredicate category\nterm seven\nterm nine\n"
     );
     assert_eq!(
         SqliteStore::open(&database)

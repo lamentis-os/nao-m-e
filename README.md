@@ -9,7 +9,7 @@ product.
 
 ## Overview
 
-- Episode atoms are immutable and store a caller-owned provenance source ID.
+- Episode atoms are immutable and carry one signed Unix timestamp in milliseconds.
 - Sparse directed feedback keeps at most 16 binary assessments per relationship.
 - Source-conditioned recall combines symbolic cue overlap with learned direct
   feedback without stored activation or query mutation.
@@ -24,10 +24,7 @@ product.
 ```rust
 use std::error::Error;
 
-use nao_m_e::{
-    EpisodeDraft, Memory, MemoryId, PredicateId, SourceId, Statement, TermId,
-    TimestampMs,
-};
+use nao_m_e::{EpisodeDraft, Memory, MemoryId, PredicateId, Statement, TermId, TimestampMs};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let observation = Statement::new(
@@ -37,13 +34,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let memory_id = MemoryId::new(0x7b4f_6be0_32c2_4be8_96b8_7394_f734_85af)?;
     let mut memory = Memory::new(memory_id);
     let episode = EpisodeDraft {
-        occurred_at: TimestampMs::new(1_000),
-        recorded_at: TimestampMs::new(1_001),
+        timestamp: TimestampMs::new(1_000),
         context: Vec::new(),
         observation,
         action: None,
         outcome: None,
-        source: SourceId::new(7),
     };
     let source = memory.insert_episode(episode.clone())?;
     let target = memory.insert_episode(episode)?;
@@ -69,7 +64,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 use std::error::Error;
 use std::path::Path;
 
-use nao_m_e::{EpisodeDraft, SourceId, Statement, TimestampMs};
+use nao_m_e::{EpisodeDraft, Statement, TimestampMs};
 use nao_m_e_sqlite::SqliteStore;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -78,13 +73,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let predicate = store.intern_predicates(&["build status".to_owned()])?[0];
     let term = store.intern_terms(&["success".to_owned()])?[0];
     let episode = EpisodeDraft {
-        occurred_at: TimestampMs::new(1_000),
-        recorded_at: TimestampMs::new(1_001),
+        timestamp: TimestampMs::new(1_000),
         context: Vec::new(),
         observation: Statement::new(predicate, vec![term])?,
         action: None,
         outcome: None,
-        source: SourceId::new(7),
     };
     let source = store.memory_mut().insert_episode(episode.clone())?;
     let target = store.memory_mut().insert_episode(episode)?;
@@ -122,7 +115,7 @@ The CLI has four commands:
 
 ```text
 nao-m-e init <DATABASE>
-nao-m-e add <DATABASE> --occurred <MS> --recorded <MS> --source <ID>
+nao-m-e add <DATABASE> [--timestamp <UNIX_MS>]
   [--context <TEXT> --context-term <TEXT>...]...
   --predicate <TEXT> --term <TEXT>...
   [--action <TEXT> --action-term <TEXT>...]
@@ -134,13 +127,18 @@ nao-m-e feedback <DATABASE> --from <SEQUENCE> --helpful <SEQUENCES>
 nao-m-e feedback <DATABASE> --from <SEQUENCE> --unhelpful <SEQUENCES>
 ```
 
-`MS` is a signed decimal millisecond value. Source IDs and episode sequences
-are unsigned decimal integers. Predicate and term values are text, with one
-value per argument and shell quoting for spaces. Every statement starts with
-its role option and is followed immediately by one or more matching term
-options. `--context` is repeatable; the required observation and optional
-action and outcome may each occur at most once. A text such as `"20"` is a
-symbol value, not the internal numeric ID 20.
+`UNIX_MS` is a signed decimal number of milliseconds since
+`1970-01-01T00:00:00Z`. Omitting `--timestamp` uses the current system time; all
+missing timestamps in one invocation receive the same value. This absolute
+UTC-based representation is independent of local time zones and daylight-saving
+transitions. System time is not guaranteed to be monotonic, so the local episode
+sequence—not the timestamp—is the canonical insertion order. Episode sequences
+remain unsigned decimal integers. Predicate and term values are text, with one
+value per argument and shell quoting for spaces. Every statement starts with its
+role option and is followed immediately by one or more matching term options.
+`--context` is repeatable; the required observation and optional action and
+outcome may each occur at most once. A text such as `"20"` is a symbol value,
+not the internal numeric ID 20.
 
 Create an empty store, then append episodes. `init` never replaces an existing
 path and writes nothing to standard output on success. `add` requires an
@@ -151,9 +149,7 @@ newline. `--quiet` suppresses that sequence without changing the saved state.
 nao-m-e init incident-memory.sqlite3
 
 nao-m-e add incident-memory.sqlite3 \
-  --occurred 1785596400000 \
-  --recorded 1785596405000 \
-  --source 7 \
+  --timestamp 1785596400000 \
   --context repository \
   --context-term nao-m-e \
   --predicate "build status" \
@@ -162,9 +158,7 @@ nao-m-e add incident-memory.sqlite3 \
 # stdout: 0
 
 nao-m-e add incident-memory.sqlite3 \
-  --occurred 1785596460000 \
-  --recorded 1785596465000 \
-  --source 7 \
+  --timestamp 1785596460000 \
   --predicate "incident status" \
   --term nao-m-e \
   --outcome "process result" \
@@ -180,12 +174,13 @@ unquoted `#` starts a comment. Blank and comment-only lines do not create
 episodes. The complete input is parsed and validated before one save commits
 all new symbols and episodes atomically. On success, one assigned sequence per
 input episode is written in input order; invocation-level `--quiet` suppresses
-all of those lines.
+all of those lines. Every row without `--timestamp` receives the invocation's
+shared current-time value; explicit row timestamps remain unchanged.
 
 ```sh
 printf '%s\n' \
-  '--occurred 1785596520000 --recorded 1785596525000 --source 7 --predicate "build status" --term queued' \
-  '--occurred 1785596580000 --recorded 1785596585000 --source 7 --predicate "build status" --term running --action command --action-term "cargo test"' \
+  '--timestamp 1785596520000 --predicate "build status" --term queued' \
+  '--predicate "build status" --term running --action command --action-term "cargo test"' \
   | nao-m-e add incident-memory.sqlite3 --many
 # stdout:
 # 2
@@ -198,13 +193,12 @@ uses exactly one save.
 
 Recall is a read-only, source-conditioned query. The default limit is ten. Each
 hit is emitted as a deterministic block of `key value` lines in this exact
-order: `sequence`, `activation_ppm`, `occurred`, `recorded`, `source`, zero or
-more `context` groups, `predicate`, repeated `term` lines, then action and
-outcome groups when present. Each context, action, or outcome predicate is
-followed by its matching repeated term lines. Contexts retain their canonical
-core order, and absent optional statements have no line. Blocks follow recall
-rank and are separated by one blank line; a query with no hits writes zero
-bytes.
+order: `sequence`, `activation_ppm`, `timestamp`, zero or more `context`
+groups, `predicate`, repeated `term` lines, then action and outcome groups when
+present. Each context, action, or outcome predicate is followed by its matching
+repeated term lines. Contexts retain their canonical core order, and absent
+optional statements have no line. Blocks follow recall rank and are separated
+by one blank line; a query with no hits writes zero bytes.
 
 ```sh
 nao-m-e recall incident-memory.sqlite3 --from 0 --limit 5
@@ -213,9 +207,7 @@ nao-m-e recall incident-memory.sqlite3 --from 0 --limit 5
 ```text
 sequence 1
 activation_ppm 11428
-occurred 1785596460000
-recorded 1785596465000
-source 7
+timestamp 1785596460000
 predicate incident status
 term nao-m-e
 outcome process result
@@ -282,17 +274,16 @@ store, input, and output failures use exit code `1`. Help and version output
 remain plain text.
 
 CLI syntax and text output are independent from the SQLite format. This
-implementation accepts only SQLite `format_version = 4`; every other format is
+implementation accepts only SQLite `format_version = 5`; every other format is
 rejected without automatic or heuristic migration. Predicate and term text is
 normalized with NFKC, Unicode lowercase, and collapsed Unicode whitespace, then
 stored once per role-specific catalog. Only that normalized lowercase value is
-retained. Sources and times remain caller-owned numeric values. The CLI does not
-deduplicate episodes, infer aliases, or provide embeddings. `add`, `recall`,
-and `feedback` each load the complete snapshot. The current adapter opens it
-read-write, so recall still requires write access even though it never saves.
-Simultaneous writers are rejected rather than merged. Recall remains one-hop
-and source-conditioned; there is no persistent activation vector or global
-activation ranking.
+retained. The CLI does not deduplicate episodes, infer aliases, or provide
+embeddings. `add`, `recall`, and `feedback` each load the complete snapshot.
+The current adapter opens it read-write, so recall still requires write access
+even though it never saves. Simultaneous writers are rejected rather than
+merged. Recall remains one-hop and source-conditioned; there is no persistent
+activation vector or global activation ranking.
 
 ## Boundaries
 
