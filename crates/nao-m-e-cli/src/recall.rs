@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use nao_m_e::{AtomId, EpisodeAtom, PredicateId, Statement, TermId};
 use nao_m_e_sqlite::SqliteStore;
 
-use super::{CliResult, Command, ParsedArgs, is_help_request, parse_number};
+use super::{CliResult, Command, ParsedArgs, is_help_request, open_store, parse_number};
 
 const DEFAULT_RECALL_LIMIT: usize = 10;
 
@@ -57,8 +57,7 @@ pub(super) fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
 }
 
 pub(super) fn execute(database: &Path, source_sequence: u64, limit: usize) -> CliResult<Vec<u8>> {
-    let store = SqliteStore::open(database)
-        .map_err(|error| format!("could not open `{}`: {error}", database.display()))?;
+    let store = open_store(database)?;
     let source = AtomId::from_parts(store.memory_id(), source_sequence);
     let hits = store
         .memory()
@@ -85,8 +84,13 @@ fn format_recall(store: &SqliteStore, hits: &[nao_m_e::RecallHit]) -> CliResult<
     let term_values = store
         .term_values(&term_ids)
         .map_err(|error| error.to_string())?;
-    let predicate_values = resolved_predicates(predicate_ids, predicate_values)?;
-    let term_values = resolved_terms(term_ids, term_values)?;
+    let predicate_values = resolve_symbols(
+        predicate_ids,
+        predicate_values,
+        "predicate",
+        PredicateId::get,
+    )?;
+    let term_values = resolve_symbols(term_ids, term_values, "term", TermId::get)?;
     let mut output = String::new();
     for (index, hit) in hits.iter().enumerate() {
         if index != 0 {
@@ -107,44 +111,35 @@ fn format_recall(store: &SqliteStore, hits: &[nao_m_e::RecallHit]) -> CliResult<
     Ok(output.into_bytes())
 }
 
-fn resolved_predicates(
-    ids: Vec<PredicateId>,
+struct ResolvedSymbols<I> {
+    ids: Vec<I>,
     values: Vec<Option<String>>,
-) -> CliResult<BTreeMap<PredicateId, String>> {
-    if ids.len() != values.len() {
-        return Err("predicate lookup returned an incomplete result".to_owned());
-    }
-    ids.into_iter()
-        .zip(values)
-        .map(|(id, value)| {
-            value.map(|value| (id, value)).ok_or_else(|| {
-                format!(
-                    "stored episode references unresolved predicate symbol {}",
-                    id.get()
-                )
-            })
-        })
-        .collect()
 }
 
-fn resolved_terms(
-    ids: Vec<TermId>,
-    values: Vec<Option<String>>,
-) -> CliResult<BTreeMap<TermId, String>> {
-    if ids.len() != values.len() {
-        return Err("term lookup returned an incomplete result".to_owned());
+impl<I: Ord> ResolvedSymbols<I> {
+    fn get(&self, id: &I) -> Option<&str> {
+        let index = self.ids.binary_search(id).ok()?;
+        self.values[index].as_deref()
     }
-    ids.into_iter()
-        .zip(values)
-        .map(|(id, value)| {
-            value.map(|value| (id, value)).ok_or_else(|| {
-                format!(
-                    "stored episode references unresolved term symbol {}",
-                    id.get()
-                )
-            })
-        })
-        .collect()
+}
+
+fn resolve_symbols<I: Copy + Ord>(
+    ids: Vec<I>,
+    values: Vec<Option<String>>,
+    namespace: &str,
+    raw_id: impl Fn(I) -> u64,
+) -> CliResult<ResolvedSymbols<I>> {
+    if ids.len() != values.len() {
+        return Err(format!("{namespace} lookup returned an incomplete result"));
+    }
+    debug_assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    if let Some(index) = values.iter().position(Option::is_none) {
+        return Err(format!(
+            "stored episode references unresolved {namespace} symbol {}",
+            raw_id(ids[index])
+        ));
+    }
+    Ok(ResolvedSymbols { ids, values })
 }
 
 fn collect_episode_symbols(
@@ -168,8 +163,8 @@ fn write_recall_hit(
     output: &mut String,
     episode: &EpisodeAtom,
     activation_ppm: u32,
-    predicates: &BTreeMap<PredicateId, String>,
-    terms: &BTreeMap<TermId, String>,
+    predicates: &ResolvedSymbols<PredicateId>,
+    terms: &ResolvedSymbols<TermId>,
 ) {
     writeln!(output, "sequence {}", episode.id().sequence())
         .expect("writing to a String cannot fail");
@@ -217,8 +212,8 @@ fn write_statement(
     predicate_label: &str,
     term_label: &str,
     statement: &Statement,
-    predicates: &BTreeMap<PredicateId, String>,
-    terms: &BTreeMap<TermId, String>,
+    predicates: &ResolvedSymbols<PredicateId>,
+    terms: &ResolvedSymbols<TermId>,
 ) {
     let predicate = predicates
         .get(&statement.predicate())

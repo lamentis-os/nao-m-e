@@ -218,6 +218,11 @@ fn invalid_symbol_batch_is_atomic_and_resolve_chunks_large_requests() {
     let path = database_path(&directory);
     let mut store = SqliteStore::create(&path).unwrap();
 
+    assert!(store.intern_predicates(&[]).unwrap().is_empty());
+    assert!(store.intern_terms(&[]).unwrap().is_empty());
+    assert!(store.predicate_values(&[]).unwrap().is_empty());
+    assert!(store.term_values(&[]).unwrap().is_empty());
+
     for (values, expected_detail) in [
         (
             vec!["valid".to_owned(), " \t\n ".to_owned()],
@@ -255,21 +260,30 @@ fn invalid_symbol_batch_is_atomic_and_resolve_chunks_large_requests() {
         })
     ));
 
-    let values: Vec<_> = (0..1_005).map(|index| format!("symbol-{index}")).collect();
+    let values: Vec<_> = (0..1_801).map(|index| format!("symbol-{index}")).collect();
     let ids = store.intern_predicates(&values).unwrap();
     assert_eq!(ids.first(), Some(&PredicateId::new(0)));
-    assert_eq!(ids.last(), Some(&PredicateId::new(1_004)));
+    assert_eq!(ids.last(), Some(&PredicateId::new(1_800)));
     store.save().unwrap();
     drop(store);
 
-    let reopened = SqliteStore::open(&path).unwrap();
-    let mut requested = ids;
+    let mut reopened = SqliteStore::open(&path).unwrap();
+    assert_eq!(
+        reopened.intern_predicates(&values[..1_800]).unwrap(),
+        ids[..1_800]
+    );
+    assert_eq!(reopened.intern_predicates(&values).unwrap(), ids);
+
+    let mut requested = ids.clone();
+    requested.push(ids[0]);
     requested.push(PredicateId::new(9_999));
     let resolved = reopened.predicate_values(&requested).unwrap();
-    assert_eq!(resolved.len(), 1_006);
-    assert_eq!(resolved[0], Some("symbol-0".to_owned()));
-    assert_eq!(resolved[1_004], Some("symbol-1004".to_owned()));
-    assert_eq!(resolved[1_005], None);
+    assert_eq!(resolved.len(), 1_803);
+    for index in [0, 899, 900, 1_799, 1_800] {
+        assert_eq!(resolved[index], Some(format!("symbol-{index}")));
+    }
+    assert_eq!(resolved[1_801], Some("symbol-0".to_owned()));
+    assert_eq!(resolved[1_802], None);
 }
 
 #[test]

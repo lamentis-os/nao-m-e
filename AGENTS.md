@@ -12,9 +12,12 @@ format and lifecycle are defined in `docs/sqlite-contract.md`.
 
 - `src/model.rs` owns public identifiers, episode values, fixed-point values,
   and errors.
-- `src/memory.rs` owns atom storage, bounded feedback traces, and recall.
+- `src/memory.rs` owns atom storage and bounded feedback traces.
+- `src/memory/recall.rs` owns cue indexing, source-conditioned scoring, and
+  deterministic recall ranking.
 - `src/parameters.rs` owns fixed-point constants.
-- `tests/core_contract.rs` exercises the public core contract.
+- `tests/core_contract.rs` and `tests/core_contract` form one public core
+  contract target.
 - `crates/nao-m-e-sqlite/src/format.rs` owns SQLite file identity, session and
   durability policy, and closed-schema creation and validation.
 - `crates/nao-m-e-sqlite/src/format/codec.rs` owns canonical identifier and

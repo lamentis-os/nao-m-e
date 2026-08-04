@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use nao_m_e::{EpisodeDraft, PredicateId, SourceId, Statement, TermId, TimestampMs};
 use nao_m_e_sqlite::SqliteStore;
 
-use super::{CliResult, Command, ParsedArgs, is_help_request, parse_number, save};
+use super::{CliResult, Command, ParsedArgs, is_help_request, open_store, parse_number, save};
 
 const ADD_HELP: &str = "Append symbolic episodes and save atomically.
 
@@ -357,8 +357,7 @@ pub(super) fn execute(
     drafts: Vec<TextEpisodeDraft>,
     quiet: bool,
 ) -> CliResult<Vec<u8>> {
-    let mut store = SqliteStore::open(database)
-        .map_err(|error| format!("could not open `{}`: {error}", database.display()))?;
+    let mut store = open_store(database)?;
     let drafts = intern_drafts(&mut store, drafts)?;
     let mut output = if quiet {
         String::new()
