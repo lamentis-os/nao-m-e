@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use nao_m_e::{EpisodeAtom, EpisodeDraft, Memory, PredicateId, Statement, TermId};
+use nao_m_e::{EpisodeDraft, Memory, SymbolId};
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params_from_iter};
 use unicode_normalization::UnicodeNormalization;
@@ -11,6 +11,7 @@ use crate::format;
 use super::{SqliteStore, read_metadata, read_u64};
 
 const MAX_SYMBOL_QUERY_BINDINGS: usize = 900;
+const RECENT_NON_CANONICAL_SYMBOLS: usize = 256;
 
 const _: () = {
     assert!(unicode_case_mapping::UNICODE_VERSION.0 == 16);
@@ -22,45 +23,21 @@ const _: () = {
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum SymbolNamespace {
-    Predicate,
-    Term,
-}
-
-impl SymbolNamespace {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Predicate => "predicate",
-            Self::Term => "term",
-        }
-    }
-
-    const fn table(self) -> &'static str {
-        match self {
-            Self::Predicate => "predicates",
-            Self::Term => "terms",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NextSymbolId {
     Next(u64),
     Exhausted,
 }
 
 impl NextSymbolId {
-    fn allocate(self, count: usize) -> Option<(Vec<u64>, Self)> {
-        let mut next = self;
-        let mut ids = Vec::with_capacity(count);
-        for _ in 0..count {
-            let Self::Next(id) = next else {
-                return None;
-            };
-            ids.push(id);
-            next = id.checked_add(1).map_or(Self::Exhausted, Self::Next);
-        }
-        Some((ids, next))
+    fn allocate_range(self, count: usize) -> Option<(u64, Self)> {
+        debug_assert!(count != 0);
+        let Self::Next(first) = self else {
+            return None;
+        };
+        let offset = u64::try_from(count.checked_sub(1)?).ok()?;
+        let last = first.checked_add(offset)?;
+        let next = last.checked_add(1).map_or(Self::Exhausted, Self::Next);
+        Some((first, next))
     }
 
     const fn tail(self) -> Option<u64> {
@@ -124,81 +101,45 @@ impl SymbolState {
 }
 
 impl SqliteStore {
-    /// Normalizes and interns predicate values in input order.
+    /// Normalizes and interns symbol values in input order.
     ///
     /// Duplicate normalized values return the same identifier. New assignments
     /// remain staged in this store until [`Self::save`] commits them atomically
     /// with pending episode and feedback changes. An invalid value or exhausted
     /// identifier space leaves the complete staged symbol state unchanged.
-    pub fn intern_predicates(&mut self, values: &[String]) -> Result<Vec<PredicateId>, StoreError> {
-        self.intern_symbols(SymbolNamespace::Predicate, values)
-            .map(|ids| ids.into_iter().map(PredicateId::new).collect())
-    }
-
-    /// Normalizes and interns term values in input order.
-    ///
-    /// Duplicate normalized values return the same identifier. New assignments
-    /// remain staged in this store until [`Self::save`] commits them atomically
-    /// with pending episode and feedback changes. An invalid value or exhausted
-    /// identifier space leaves the complete staged symbol state unchanged.
-    pub fn intern_terms(&mut self, values: &[String]) -> Result<Vec<TermId>, StoreError> {
-        self.intern_symbols(SymbolNamespace::Term, values)
-            .map(|ids| ids.into_iter().map(TermId::new).collect())
-    }
-
-    /// Resolves predicate identifiers in input order.
-    ///
-    /// Values staged by [`Self::intern_predicates`] are visible before a save.
-    /// Only the requested values are loaded from SQLite. Unknown identifiers
-    /// produce `None` at their input position.
-    pub fn predicate_values(&self, ids: &[PredicateId]) -> Result<Vec<Option<String>>, StoreError> {
-        let ids: Vec<_> = ids.iter().map(|id| id.get()).collect();
-        self.symbol_values(SymbolNamespace::Predicate, &ids)
-    }
-
-    /// Resolves term identifiers in input order.
-    ///
-    /// Values staged by [`Self::intern_terms`] are visible before a save. Only
-    /// the requested values are loaded from SQLite. Unknown identifiers
-    /// produce `None` at their input position.
-    pub fn term_values(&self, ids: &[TermId]) -> Result<Vec<Option<String>>, StoreError> {
-        let ids: Vec<_> = ids.iter().map(|id| id.get()).collect();
-        self.symbol_values(SymbolNamespace::Term, &ids)
-    }
-
-    fn intern_symbols(
-        &mut self,
-        namespace: SymbolNamespace,
-        values: &[String],
-    ) -> Result<Vec<u64>, StoreError> {
+    pub fn intern_symbols(&mut self, values: &[String]) -> Result<Vec<SymbolId>, StoreError> {
         let NormalizedBatch {
             mut unique_values,
-            mut positions,
-        } = normalize_batch(namespace, values)?;
+            positions,
+        } = normalize_batch(values)?;
         if unique_values.is_empty() {
             return Ok(Vec::new());
         }
 
-        let state = self.symbol_state(namespace);
-        let mut assignments = vec![None; unique_values.len()];
+        let state = &self.symbols;
+        let mut assignments = vec![0_u64; unique_values.len()];
         let mut unresolved_indexes = Vec::new();
         for (index, value) in unique_values.iter().enumerate() {
             if let Some(&id) = state.pending.get(value) {
-                assignments[index] = Some(id);
+                assignments[index] = id;
             } else {
                 unresolved_indexes.push(index);
             }
         }
 
-        let unresolved: Vec<_> = unresolved_indexes
-            .iter()
-            .map(|&index| unique_values[index].as_str())
-            .collect();
-        let persisted = read_symbol_ids_for_values(&self.connection, namespace, &unresolved)?;
-        let mut new_indexes = Vec::new();
-        for index in unresolved_indexes {
-            let value = unique_values[index].as_str();
-            if let Some(&id) = persisted.get(value) {
+        let mut persisted = vec![false; unique_values.len()];
+        read_symbol_ids_for_values(
+            &self.connection,
+            &unique_values,
+            &unresolved_indexes,
+            &mut assignments,
+            &mut persisted,
+        )?;
+        let mut new_count = 0;
+        for position in 0..unresolved_indexes.len() {
+            let index = unresolved_indexes[position];
+            if persisted[index] {
+                let id = assignments[index];
                 if !state.contains_persisted(id) {
                     let (_, actual_revision) = read_metadata(&self.connection)?;
                     if actual_revision != self.expected_revision {
@@ -208,62 +149,76 @@ impl SqliteStore {
                         });
                     }
                     return Err(StoreIntegrityError::InvalidSymbol {
-                        namespace: namespace.name(),
                         id,
                         detail: "symbol row changed outside this store session",
                     }
                     .into());
                 }
-                assignments[index] = Some(id);
             } else {
-                new_indexes.push(index);
+                unresolved_indexes[new_count] = index;
+                new_count += 1;
             }
         }
+        unresolved_indexes.truncate(new_count);
 
-        let (new_ids, next_id) =
+        let (first_new_id, next_id) = if unresolved_indexes.is_empty() {
+            (0, state.next_id)
+        } else {
             state
                 .next_id
-                .allocate(new_indexes.len())
-                .ok_or(StoreError::SymbolIdExhausted {
-                    namespace: namespace.name(),
-                })?;
-        for (&index, &id) in new_indexes.iter().zip(&new_ids) {
-            assignments[index] = Some(id);
+                .allocate_range(unresolved_indexes.len())
+                .ok_or(StoreError::SymbolIdExhausted)?
+        };
+        for (offset, &index) in unresolved_indexes.iter().enumerate() {
+            assignments[index] = first_new_id
+                .checked_add(u64::try_from(offset).expect("a slice index fits in u64"))
+                .expect("the validated symbol range contains every offset");
         }
 
-        for position in &mut positions {
-            let index = usize::try_from(*position)
-                .expect("a normalized batch position was produced from a usize");
-            *position = assignments[index].expect("every normalized symbol was assigned");
-        }
+        let resolved = positions
+            .into_iter()
+            .map(|position| SymbolId::new(assignments[position]))
+            .collect();
 
-        let state = self.symbol_state_mut(namespace);
-        for (index, id) in new_indexes.into_iter().zip(new_ids) {
+        let state = &mut self.symbols;
+        for index in unresolved_indexes {
+            let id = assignments[index];
             let value = std::mem::take(&mut unique_values[index]);
             let previous = state.pending.insert(value, id);
             debug_assert!(previous.is_none());
         }
         state.next_id = next_id;
-        Ok(positions)
+        Ok(resolved)
     }
 
-    fn symbol_values(
-        &self,
-        namespace: SymbolNamespace,
-        ids: &[u64],
-    ) -> Result<Vec<Option<String>>, StoreError> {
+    /// Resolves symbol identifiers in input order.
+    ///
+    /// Values staged by [`Self::intern_symbols`] are visible before a save.
+    /// Only the requested values are loaded from SQLite. Unknown identifiers
+    /// produce `None` at their input position.
+    pub fn symbol_values(&self, ids: &[SymbolId]) -> Result<Vec<Option<String>>, StoreError> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let state = self.symbol_state(namespace);
-        let pending_by_id: BTreeMap<_, _> = state
-            .pending
+        let state = &self.symbols;
+        let requested_pending: BTreeSet<_> = ids
             .iter()
-            .map(|(value, &id)| (id, value.as_str()))
+            .map(|id| id.get())
+            .filter(|&id| !state.contains_persisted(id) && state.contains_current(id))
             .collect();
+        let mut pending_by_id = BTreeMap::new();
+        for (value, &id) in &state.pending {
+            if requested_pending.contains(&id) {
+                pending_by_id.insert(id, value.as_str());
+                if pending_by_id.len() == requested_pending.len() {
+                    break;
+                }
+            }
+        }
         let mut persisted_ids = Vec::new();
         let mut last_persisted_positions = BTreeMap::new();
-        for (position, &id) in ids.iter().enumerate() {
+        for (position, id) in ids.iter().enumerate() {
+            let id = id.get();
             if pending_by_id.contains_key(&id) {
                 continue;
             }
@@ -274,46 +229,31 @@ impl SqliteStore {
                 persisted_ids.push(id);
             }
         }
-        let mut persisted =
-            read_symbol_values_for_ids(&self.connection, namespace, &persisted_ids)?;
+        let mut persisted = read_symbol_values_for_ids(&self.connection, &persisted_ids)?;
         ids.iter()
             .enumerate()
             .map(|(position, id)| {
-                if let Some(value) = pending_by_id.get(id) {
+                let id = id.get();
+                if let Some(value) = pending_by_id.get(&id) {
                     return Ok(Some((*value).to_owned()));
                 }
-                if !state.contains_persisted(*id) {
+                if !state.contains_persisted(id) {
                     return Ok(None);
                 }
-                let value = if last_persisted_positions.get(id) == Some(&position) {
-                    persisted.remove(id)
+                let value = if last_persisted_positions.get(&id) == Some(&position) {
+                    persisted.remove(&id)
                 } else {
-                    persisted.get(id).cloned()
+                    persisted.get(&id).cloned()
                 };
                 value.map(Some).ok_or_else(|| {
                     StoreIntegrityError::InvalidSymbol {
-                        namespace: namespace.name(),
-                        id: *id,
+                        id,
                         detail: "symbol row is absent",
                     }
                     .into()
                 })
             })
             .collect()
-    }
-
-    const fn symbol_state(&self, namespace: SymbolNamespace) -> &SymbolState {
-        match namespace {
-            SymbolNamespace::Predicate => &self.predicates,
-            SymbolNamespace::Term => &self.terms,
-        }
-    }
-
-    const fn symbol_state_mut(&mut self, namespace: SymbolNamespace) -> &mut SymbolState {
-        match namespace {
-            SymbolNamespace::Predicate => &mut self.predicates,
-            SymbolNamespace::Term => &mut self.terms,
-        }
     }
 }
 
@@ -400,35 +340,47 @@ const fn is_unicode_control(character: char) -> bool {
 #[derive(Debug, Eq, PartialEq)]
 struct NormalizedBatch {
     unique_values: Vec<String>,
-    positions: Vec<u64>,
+    positions: Vec<usize>,
 }
 
-fn normalize_batch(
-    namespace: SymbolNamespace,
-    values: &[String],
-) -> Result<NormalizedBatch, StoreError> {
-    let mut raw_positions = BTreeMap::<&str, usize>::new();
+fn normalize_batch(values: &[String]) -> Result<NormalizedBatch, StoreError> {
     let mut canonical_positions = BTreeMap::<String, usize>::new();
+    let mut recent_non_canonical = BTreeMap::<&str, usize>::new();
+    let mut recent_order = VecDeque::<&str>::new();
     let mut positions = Vec::with_capacity(values.len());
 
     for (index, value) in values.iter().enumerate() {
-        if let Some(&position) = raw_positions.get(value.as_str()) {
-            positions.push(u64::try_from(position).expect("a slice index fits in a u64"));
+        if let Some(&position) = canonical_positions.get(value.as_str()) {
+            positions.push(position);
+            continue;
+        }
+        if let Some(&position) = recent_non_canonical.get(value.as_str()) {
+            positions.push(position);
             continue;
         }
 
         let normalized =
             normalize_symbol(value).map_err(|error| StoreError::InvalidSymbolValue {
-                namespace: namespace.name(),
                 index,
                 detail: error.detail(),
             })?;
+        let is_non_canonical = normalized != value.as_str();
         let next_position = canonical_positions.len();
         let position = *canonical_positions
             .entry(normalized)
             .or_insert(next_position);
-        raw_positions.insert(value.as_str(), position);
-        positions.push(u64::try_from(position).expect("a slice index fits in a u64"));
+        positions.push(position);
+
+        if is_non_canonical {
+            if recent_non_canonical.len() == RECENT_NON_CANONICAL_SYMBOLS {
+                let oldest = recent_order
+                    .pop_front()
+                    .expect("a full recent-symbol cache has an oldest entry");
+                recent_non_canonical.remove(oldest);
+            }
+            recent_non_canonical.insert(value.as_str(), position);
+            recent_order.push_back(value.as_str());
+        }
     }
 
     let mut unique_values: Vec<Option<String>> = std::iter::repeat_with(|| None)
@@ -437,7 +389,6 @@ fn normalize_batch(
     for (value, position) in canonical_positions {
         unique_values[position] = Some(value);
     }
-
     Ok(NormalizedBatch {
         unique_values: unique_values
             .into_iter()
@@ -447,12 +398,8 @@ fn normalize_batch(
     })
 }
 
-pub(super) fn validate_symbol_catalog(
-    connection: &Connection,
-    namespace: SymbolNamespace,
-) -> Result<SymbolState, StoreError> {
-    let sql = format!("SELECT id, value FROM {} ORDER BY id", namespace.table());
-    let mut statement = connection.prepare(&sql)?;
+pub(super) fn validate_symbol_catalog(connection: &Connection) -> Result<SymbolState, StoreError> {
+    let mut statement = connection.prepare("SELECT id, value FROM symbols ORDER BY id")?;
     let mut rows = statement.query([])?;
     let mut next = NextSymbolId::Next(0);
     let mut tail = None;
@@ -463,10 +410,9 @@ pub(super) fn validate_symbol_catalog(
             }
             .into());
         };
-        let (id, _) = read_symbol_row(row, namespace)?;
+        let (id, _) = read_symbol_row(row)?;
         if id != expected {
             return Err(StoreIntegrityError::NonContiguousSymbolId {
-                namespace: namespace.name(),
                 expected,
                 found: id,
             }
@@ -482,28 +428,26 @@ pub(super) fn validate_symbol_catalog(
     Ok(state)
 }
 
-fn read_symbol_row(row: &Row<'_>, namespace: SymbolNamespace) -> Result<(u64, String), StoreError> {
-    let id = read_u64(row, 0, namespace.table(), "id")?;
+fn read_symbol_row(row: &Row<'_>) -> Result<(u64, String), StoreError> {
+    let id = read_u64(row, 0, "symbols", "id")?;
     let ValueRef::Text(bytes) = row.get_ref(1)? else {
         return Err(StoreIntegrityError::InvalidEncoding {
-            table: namespace.table(),
+            table: "symbols",
             column: "value",
         }
         .into());
     };
     let value = std::str::from_utf8(bytes).map_err(|_| StoreIntegrityError::InvalidEncoding {
-        table: namespace.table(),
+        table: "symbols",
         column: "value",
     })?;
     let canonical =
         normalize_symbol(value).map_err(|error| StoreIntegrityError::InvalidSymbol {
-            namespace: namespace.name(),
             id,
             detail: error.detail(),
         })?;
     if canonical != value {
         return Err(StoreIntegrityError::InvalidSymbol {
-            namespace: namespace.name(),
             id,
             detail: "value is not normalized",
         }
@@ -525,59 +469,72 @@ fn placeholders(count: usize) -> String {
 
 fn read_symbol_ids_for_values(
     connection: &Connection,
-    namespace: SymbolNamespace,
-    values: &[&str],
-) -> Result<BTreeMap<String, u64>, StoreError> {
-    let mut found = BTreeMap::new();
-    let full_end = values.len() / MAX_SYMBOL_QUERY_BINDINGS * MAX_SYMBOL_QUERY_BINDINGS;
-    let (full_chunks, remainder) = values.split_at(full_end);
+    values: &[String],
+    indexes: &[usize],
+    assignments: &mut [u64],
+    found: &mut [bool],
+) -> Result<(), StoreError> {
+    let full_end = indexes.len() / MAX_SYMBOL_QUERY_BINDINGS * MAX_SYMBOL_QUERY_BINDINGS;
+    let (full_chunks, remainder) = indexes.split_at(full_end);
 
     if !full_chunks.is_empty() {
         let sql = format!(
-            "SELECT id, value FROM {} WHERE value IN ({}) ORDER BY id",
-            namespace.table(),
+            "SELECT id, value FROM symbols WHERE value IN ({}) ORDER BY id",
             placeholders(MAX_SYMBOL_QUERY_BINDINGS)
         );
         let mut statement = connection.prepare(&sql)?;
         for chunk in full_chunks.chunks_exact(MAX_SYMBOL_QUERY_BINDINGS) {
-            read_symbol_id_rows(&mut statement, namespace, chunk, &mut found)?;
+            read_symbol_id_rows(&mut statement, values, chunk, assignments, found)?;
         }
     }
 
     if !remainder.is_empty() {
         let sql = format!(
-            "SELECT id, value FROM {} WHERE value IN ({}) ORDER BY id",
-            namespace.table(),
+            "SELECT id, value FROM symbols WHERE value IN ({}) ORDER BY id",
             placeholders(remainder.len())
         );
         let mut statement = connection.prepare(&sql)?;
-        read_symbol_id_rows(&mut statement, namespace, remainder, &mut found)?;
+        read_symbol_id_rows(&mut statement, values, remainder, assignments, found)?;
     }
-    Ok(found)
+    Ok(())
 }
 
 fn read_symbol_id_rows(
     statement: &mut rusqlite::Statement<'_>,
-    namespace: SymbolNamespace,
-    values: &[&str],
-    found: &mut BTreeMap<String, u64>,
+    values: &[String],
+    indexes: &[usize],
+    assignments: &mut [u64],
+    found: &mut [bool],
 ) -> Result<(), StoreError> {
-    let mut rows = statement.query(params_from_iter(values.iter().copied()))?;
+    let requested: BTreeMap<_, _> = indexes
+        .iter()
+        .map(|&index| (values[index].as_str(), index))
+        .collect();
+    let mut rows = statement.query(params_from_iter(
+        indexes.iter().map(|&index| values[index].as_str()),
+    ))?;
     while let Some(row) = rows.next()? {
-        let (id, value) = read_symbol_row(row, namespace)?;
-        if found.insert(value, id).is_some() {
+        let (id, value) = read_symbol_row(row)?;
+        let Some(&index) = requested.get(value.as_str()) else {
+            return Err(StoreIntegrityError::InvalidMetadata {
+                detail: "symbol query returned an unrequested value",
+            }
+            .into());
+        };
+        if found[index] {
             return Err(StoreIntegrityError::InvalidMetadata {
                 detail: "symbol value appears more than once",
             }
             .into());
         }
+        assignments[index] = id;
+        found[index] = true;
     }
     Ok(())
 }
 
 fn read_symbol_values_for_ids(
     connection: &Connection,
-    namespace: SymbolNamespace,
     ids: &[u64],
 ) -> Result<BTreeMap<u64, String>, StoreError> {
     let mut found = BTreeMap::new();
@@ -586,31 +543,28 @@ fn read_symbol_values_for_ids(
 
     if !full_chunks.is_empty() {
         let sql = format!(
-            "SELECT id, value FROM {} WHERE id IN ({}) ORDER BY id",
-            namespace.table(),
+            "SELECT id, value FROM symbols WHERE id IN ({}) ORDER BY id",
             placeholders(MAX_SYMBOL_QUERY_BINDINGS)
         );
         let mut statement = connection.prepare(&sql)?;
         for chunk in full_chunks.chunks_exact(MAX_SYMBOL_QUERY_BINDINGS) {
-            read_symbol_value_rows(&mut statement, namespace, chunk, &mut found)?;
+            read_symbol_value_rows(&mut statement, chunk, &mut found)?;
         }
     }
 
     if !remainder.is_empty() {
         let sql = format!(
-            "SELECT id, value FROM {} WHERE id IN ({}) ORDER BY id",
-            namespace.table(),
+            "SELECT id, value FROM symbols WHERE id IN ({}) ORDER BY id",
             placeholders(remainder.len())
         );
         let mut statement = connection.prepare(&sql)?;
-        read_symbol_value_rows(&mut statement, namespace, remainder, &mut found)?;
+        read_symbol_value_rows(&mut statement, remainder, &mut found)?;
     }
     Ok(found)
 }
 
 fn read_symbol_value_rows(
     statement: &mut rusqlite::Statement<'_>,
-    namespace: SymbolNamespace,
     ids: &[u64],
     found: &mut BTreeMap<u64, String>,
 ) -> Result<(), StoreError> {
@@ -619,7 +573,7 @@ fn read_symbol_value_rows(
         encoded.iter().map(|value| value.as_slice()),
     ))?;
     while let Some(row) = rows.next()? {
-        let (id, value) = read_symbol_row(row, namespace)?;
+        let (id, value) = read_symbol_row(row)?;
         if found.insert(id, value).is_some() {
             return Err(StoreIntegrityError::InvalidMetadata {
                 detail: "symbol identifier appears more than once",
@@ -630,45 +584,27 @@ fn read_symbol_value_rows(
     Ok(())
 }
 
-fn draft_statements(draft: &EpisodeDraft) -> impl Iterator<Item = &Statement> {
-    draft
-        .context
-        .iter()
-        .chain(std::iter::once(&draft.observation))
-        .chain(draft.action.iter())
-        .chain(draft.outcome.iter())
-}
-
-fn atom_statements(atom: &EpisodeAtom) -> impl Iterator<Item = &Statement> {
-    atom.context()
-        .iter()
-        .chain(std::iter::once(atom.observation()))
-        .chain(atom.action())
-        .chain(atom.outcome())
-}
-
 pub(super) fn validate_persisted_episode_symbols(
     sequence: u64,
     draft: &EpisodeDraft,
-    predicates: &SymbolState,
-    terms: &SymbolState,
+    symbols: &SymbolState,
 ) -> Result<(), StoreError> {
-    for statement in draft_statements(draft) {
-        if !predicates.contains_persisted(statement.predicate().get()) {
+    for attribute in draft.attributes() {
+        if !symbols.contains_persisted(attribute.key().get()) {
             return Err(StoreIntegrityError::InvalidEpisode {
                 sequence,
-                detail: "predicate identifier is absent from the symbol catalog",
+                detail: "attribute key identifier is absent from the symbol catalog",
             }
             .into());
         }
-        if statement
-            .arguments()
+        if attribute
+            .values()
             .iter()
-            .any(|term| !terms.contains_persisted(term.get()))
+            .any(|value| !symbols.contains_persisted(value.get()))
         {
             return Err(StoreIntegrityError::InvalidEpisode {
                 sequence,
-                detail: "term identifier is absent from the symbol catalog",
+                detail: "attribute value identifier is absent from the symbol catalog",
             }
             .into());
         }
@@ -679,28 +615,21 @@ pub(super) fn validate_persisted_episode_symbols(
 pub(super) fn validate_new_episode_symbols(
     memory: &Memory,
     start: usize,
-    predicates: &SymbolState,
-    terms: &SymbolState,
+    symbols: &SymbolState,
 ) -> Result<(), StoreError> {
     for atom in memory.episodes().skip(start) {
-        for statement in atom_statements(atom) {
-            let predicate = statement.predicate().get();
-            if !predicates.contains_current(predicate) {
-                return Err(StoreError::UnknownSymbolId {
-                    namespace: SymbolNamespace::Predicate.name(),
-                    id: predicate,
-                });
+        for attribute in atom.attributes() {
+            let key = attribute.key().get();
+            if !symbols.contains_current(key) {
+                return Err(StoreError::UnknownSymbolId { id: key });
             }
-            if let Some(term) = statement
-                .arguments()
+            if let Some(value) = attribute
+                .values()
                 .iter()
-                .map(|term| term.get())
-                .find(|&term| !terms.contains_current(term))
+                .map(|value| value.get())
+                .find(|&value| !symbols.contains_current(value))
             {
-                return Err(StoreError::UnknownSymbolId {
-                    namespace: SymbolNamespace::Term.name(),
-                    id: term,
-                });
+                return Err(StoreError::UnknownSymbolId { id: value });
             }
         }
     }
@@ -709,21 +638,20 @@ pub(super) fn validate_new_episode_symbols(
 
 pub(super) fn verify_symbol_tail(
     transaction: &Transaction<'_>,
-    namespace: SymbolNamespace,
     state: &SymbolState,
 ) -> Result<(), StoreError> {
-    let sql = format!(
-        "SELECT id FROM {} ORDER BY id DESC LIMIT 1",
-        namespace.table()
-    );
     let tail: Option<Vec<u8>> = transaction
-        .query_row(&sql, [], |row| row.get(0))
+        .query_row(
+            "SELECT id FROM symbols ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
         .optional()?;
     let actual_tail = tail
         .as_deref()
         .map(|bytes| {
             format::decode_u64(bytes).ok_or(StoreIntegrityError::InvalidEncoding {
-                table: namespace.table(),
+                table: "symbols",
                 column: "id",
             })
         })
@@ -740,26 +668,38 @@ pub(super) fn verify_symbol_tail(
 
 pub(super) fn insert_pending_symbols(
     transaction: &Transaction<'_>,
-    namespace: SymbolNamespace,
     state: &SymbolState,
 ) -> Result<(), StoreError> {
     if state.pending.is_empty() {
         return Ok(());
     }
-    let mut pending: Vec<_> = state
-        .pending
-        .iter()
-        .map(|(value, &id)| (id, value))
-        .collect();
-    pending.sort_unstable_by_key(|(id, _)| *id);
-    let sql = format!(
-        "INSERT INTO {} (id, value) VALUES (?1, ?2)",
-        namespace.table()
-    );
-    let mut insert = transaction.prepare(&sql)?;
-    for (id, value) in pending {
+    let first_id = state.persisted_tail.map_or(0, |tail| {
+        tail.checked_add(1)
+            .expect("a non-empty pending range follows a non-maximum persisted tail")
+    });
+    let mut pending = vec![None; state.pending.len()];
+    for (value, &id) in &state.pending {
+        let offset = usize::try_from(
+            id.checked_sub(first_id)
+                .expect("a pending symbol follows the persisted tail"),
+        )
+        .expect("a pending symbol offset fits in memory");
+        let slot = pending
+            .get_mut(offset)
+            .expect("pending symbol identifiers form one contiguous range");
+        debug_assert!(slot.is_none());
+        *slot = Some(value);
+    }
+    let mut insert = transaction.prepare("INSERT INTO symbols (id, value) VALUES (?1, ?2)")?;
+    for (offset, value) in pending.into_iter().enumerate() {
+        let id = first_id
+            .checked_add(u64::try_from(offset).expect("a pending offset fits in u64"))
+            .expect("the pending identifier range is valid");
         let id = format::encode_u64(id);
-        insert.execute((id.as_slice(), value))?;
+        insert.execute((
+            id.as_slice(),
+            value.expect("every pending identifier is assigned once"),
+        ))?;
     }
     Ok(())
 }
@@ -771,19 +711,15 @@ mod tests {
     #[test]
     fn cursor_preserves_the_complete_u64_range_atomically() {
         assert_eq!(
-            NextSymbolId::Next(u64::MAX).allocate(0),
-            Some((Vec::new(), NextSymbolId::Next(u64::MAX)))
+            NextSymbolId::Next(7).allocate_range(3),
+            Some((7, NextSymbolId::Next(10)))
         );
         assert_eq!(
-            NextSymbolId::Next(u64::MAX).allocate(1),
-            Some((vec![u64::MAX], NextSymbolId::Exhausted))
+            NextSymbolId::Next(u64::MAX).allocate_range(1),
+            Some((u64::MAX, NextSymbolId::Exhausted))
         );
-        assert_eq!(NextSymbolId::Next(u64::MAX).allocate(2), None);
-        assert_eq!(
-            NextSymbolId::Exhausted.allocate(0),
-            Some((Vec::new(), NextSymbolId::Exhausted))
-        );
-        assert_eq!(NextSymbolId::Exhausted.allocate(1), None);
+        assert_eq!(NextSymbolId::Next(u64::MAX).allocate_range(2), None);
+        assert_eq!(NextSymbolId::Exhausted.allocate_range(1), None);
     }
 
     #[test]
@@ -801,7 +737,7 @@ mod tests {
         ];
 
         assert_eq!(
-            normalize_batch(SymbolNamespace::Term, &values).unwrap(),
+            normalize_batch(&values).unwrap(),
             NormalizedBatch {
                 unique_values: vec!["zeta".to_owned(), "alpha".to_owned(), "beta".to_owned()],
                 positions: vec![0, 0, 0, 1, 1, 0, 2, 0],

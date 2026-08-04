@@ -1,7 +1,7 @@
 use nao_m_e::{AtomId, GraphError, MAX_FEEDBACK_TARGETS};
 
 use super::support::{
-    activation, feedback_snapshot, insert, insert_observation, memory_id, new_memory, trace,
+    activation, feedback_snapshot, insert, insert_attribute, memory_id, new_memory, trace,
 };
 
 #[test]
@@ -212,8 +212,8 @@ fn helpful_feedback_follows_the_exact_saturating_learning_curve() {
 #[test]
 fn saturated_learning_requires_eight_opposing_samples_to_become_neutral() {
     let mut memory = new_memory(1);
-    let source = insert_observation(&mut memory, 1, 10, &[100]);
-    let target = insert_observation(&mut memory, 2, 10, &[100]);
+    let source = insert_attribute(&mut memory, 1, 10, &[100]);
+    let target = insert_attribute(&mut memory, 2, 10, &[100]);
     for _ in 0..16 {
         memory
             .apply_feedback(source, &[target], true)
@@ -244,9 +244,9 @@ fn saturated_learning_requires_eight_opposing_samples_to_become_neutral() {
 #[test]
 fn unhelpful_feedback_suppresses_structural_recall_with_exact_signed_scores() {
     let mut memory = new_memory(1);
-    let source = insert_observation(&mut memory, 1, 10, &[100, 200]);
-    let target = insert_observation(&mut memory, 2, 10, &[100, 999]);
-    let expected = [Some(105_902), Some(50_000), Some(5_277), None];
+    let source = insert_attribute(&mut memory, 1, 10, &[100, 200]);
+    let target = insert_attribute(&mut memory, 2, 10, &[100, 999]);
+    let expected = [Some(99_553), Some(43_651), None, None];
 
     for (index, expected_score) in expected.into_iter().enumerate() {
         memory

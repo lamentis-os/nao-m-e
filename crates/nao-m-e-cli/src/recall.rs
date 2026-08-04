@@ -3,7 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 
-use nao_m_e::{AtomId, EpisodeAtom, PredicateId, Statement, TermId};
+use nao_m_e::{AtomId, EpisodeAtom, SymbolId};
 use nao_m_e_sqlite::SqliteStore;
 
 use super::{CliResult, Command, ParsedArgs, is_help_request, open_store, parse_number};
@@ -67,30 +67,19 @@ pub(super) fn execute(database: &Path, source_sequence: u64, limit: usize) -> Cl
 }
 
 fn format_recall(store: &SqliteStore, hits: &[nao_m_e::RecallHit]) -> CliResult<Vec<u8>> {
-    let mut predicate_ids = BTreeSet::new();
-    let mut term_ids = BTreeSet::new();
+    let mut symbol_ids = BTreeSet::new();
     for hit in hits {
         let episode = store
             .memory()
             .episode(hit.atom_id)
             .expect("recall hits always reference stored episodes");
-        collect_episode_symbols(episode, &mut predicate_ids, &mut term_ids);
+        collect_episode_symbols(episode, &mut symbol_ids);
     }
-    let predicate_ids: Vec<_> = predicate_ids.into_iter().collect();
-    let term_ids: Vec<_> = term_ids.into_iter().collect();
-    let predicate_values = store
-        .predicate_values(&predicate_ids)
+    let symbol_ids: Vec<_> = symbol_ids.into_iter().collect();
+    let symbol_values = store
+        .symbol_values(&symbol_ids)
         .map_err(|error| error.to_string())?;
-    let term_values = store
-        .term_values(&term_ids)
-        .map_err(|error| error.to_string())?;
-    let predicate_values = resolve_symbols(
-        predicate_ids,
-        predicate_values,
-        "predicate",
-        PredicateId::get,
-    )?;
-    let term_values = resolve_symbols(term_ids, term_values, "term", TermId::get)?;
+    let symbols = resolve_symbols(symbol_ids, symbol_values)?;
     let mut output = String::new();
     for (index, hit) in hits.iter().enumerate() {
         if index != 0 {
@@ -100,62 +89,41 @@ fn format_recall(store: &SqliteStore, hits: &[nao_m_e::RecallHit]) -> CliResult<
             .memory()
             .episode(hit.atom_id)
             .expect("recall hits always reference stored episodes");
-        write_recall_hit(
-            &mut output,
-            episode,
-            hit.activation.as_ppm(),
-            &predicate_values,
-            &term_values,
-        );
+        write_recall_hit(&mut output, episode, hit.activation.as_ppm(), &symbols);
     }
     Ok(output.into_bytes())
 }
 
-struct ResolvedSymbols<I> {
-    ids: Vec<I>,
+struct ResolvedSymbols {
+    ids: Vec<SymbolId>,
     values: Vec<Option<String>>,
 }
 
-impl<I: Ord> ResolvedSymbols<I> {
-    fn get(&self, id: &I) -> Option<&str> {
+impl ResolvedSymbols {
+    fn get(&self, id: &SymbolId) -> Option<&str> {
         let index = self.ids.binary_search(id).ok()?;
         self.values[index].as_deref()
     }
 }
 
-fn resolve_symbols<I: Copy + Ord>(
-    ids: Vec<I>,
-    values: Vec<Option<String>>,
-    namespace: &str,
-    raw_id: impl Fn(I) -> u64,
-) -> CliResult<ResolvedSymbols<I>> {
+fn resolve_symbols(ids: Vec<SymbolId>, values: Vec<Option<String>>) -> CliResult<ResolvedSymbols> {
     if ids.len() != values.len() {
-        return Err(format!("{namespace} lookup returned an incomplete result"));
+        return Err("symbol lookup returned an incomplete result".to_owned());
     }
     debug_assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
     if let Some(index) = values.iter().position(Option::is_none) {
         return Err(format!(
-            "stored episode references unresolved {namespace} symbol {}",
-            raw_id(ids[index])
+            "stored episode references unresolved symbol {}",
+            ids[index].get()
         ));
     }
     Ok(ResolvedSymbols { ids, values })
 }
 
-fn collect_episode_symbols(
-    episode: &EpisodeAtom,
-    predicates: &mut BTreeSet<PredicateId>,
-    terms: &mut BTreeSet<TermId>,
-) {
-    for statement in episode
-        .context()
-        .iter()
-        .chain(std::iter::once(episode.observation()))
-        .chain(episode.action())
-        .chain(episode.outcome())
-    {
-        predicates.insert(statement.predicate());
-        terms.extend(statement.arguments());
+fn collect_episode_symbols(episode: &EpisodeAtom, symbols: &mut BTreeSet<SymbolId>) {
+    for attribute in episode.attributes() {
+        symbols.insert(attribute.key());
+        symbols.extend(attribute.values());
     }
 }
 
@@ -163,63 +131,23 @@ fn write_recall_hit(
     output: &mut String,
     episode: &EpisodeAtom,
     activation_ppm: u32,
-    predicates: &ResolvedSymbols<PredicateId>,
-    terms: &ResolvedSymbols<TermId>,
+    symbols: &ResolvedSymbols,
 ) {
     writeln!(output, "sequence {}", episode.id().sequence())
         .expect("writing to a String cannot fail");
     writeln!(output, "activation_ppm {activation_ppm}").expect("writing to a String cannot fail");
     writeln!(output, "timestamp {}", episode.timestamp().get())
         .expect("writing to a String cannot fail");
-    for statement in episode.context() {
-        write_statement(
-            output,
-            "context",
-            "context-term",
-            statement,
-            predicates,
-            terms,
-        );
-    }
-    write_statement(
-        output,
-        "predicate",
-        "term",
-        episode.observation(),
-        predicates,
-        terms,
-    );
-    if let Some(action) = episode.action() {
-        write_statement(output, "action", "action-term", action, predicates, terms);
-    }
-    if let Some(outcome) = episode.outcome() {
-        write_statement(
-            output,
-            "outcome",
-            "outcome-term",
-            outcome,
-            predicates,
-            terms,
-        );
-    }
-}
-
-fn write_statement(
-    output: &mut String,
-    predicate_label: &str,
-    term_label: &str,
-    statement: &Statement,
-    predicates: &ResolvedSymbols<PredicateId>,
-    terms: &ResolvedSymbols<TermId>,
-) {
-    let predicate = predicates
-        .get(&statement.predicate())
-        .expect("every recalled predicate was resolved");
-    writeln!(output, "{predicate_label} {predicate}").expect("writing to a String cannot fail");
-    for term_id in statement.arguments() {
-        let term = terms
-            .get(term_id)
-            .expect("every recalled term was resolved");
-        writeln!(output, "{term_label} {term}").expect("writing to a String cannot fail");
+    for attribute in episode.attributes() {
+        let key = symbols
+            .get(&attribute.key())
+            .expect("every recalled attribute key was resolved");
+        writeln!(output, "attribute {key}").expect("writing to a String cannot fail");
+        for value_id in attribute.values() {
+            let value = symbols
+                .get(value_id)
+                .expect("every recalled attribute value was resolved");
+            writeln!(output, "value {value}").expect("writing to a String cannot fail");
+        }
     }
 }

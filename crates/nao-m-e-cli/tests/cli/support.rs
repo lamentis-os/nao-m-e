@@ -60,10 +60,10 @@ pub(super) fn add_minimal(database: &Path, seed: i64, quiet: bool) -> Output {
         .arg(database)
         .arg("--timestamp")
         .arg(seed.to_string())
-        .arg("--predicate")
-        .arg(format!("predicate-{seed}"))
-        .arg("--term")
-        .arg(format!("term-{seed}"));
+        .arg("--attribute")
+        .arg(format!("attribute-{seed}"))
+        .arg("--value")
+        .arg(format!("value-{seed}"));
     if quiet {
         command.arg("--quiet");
     }

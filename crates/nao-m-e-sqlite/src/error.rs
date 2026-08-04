@@ -24,22 +24,15 @@ pub enum StoreError {
     RevisionExhausted,
     /// A caller-supplied symbol value cannot be normalized into the contract.
     InvalidSymbolValue {
-        /// Symbol namespace containing the rejected batch entry.
-        namespace: &'static str,
         /// Zero-based position of the rejected value in the batch.
         index: usize,
         /// Violated value invariant.
         detail: &'static str,
     },
-    /// A symbol namespace has assigned every unsigned 64-bit identifier.
-    SymbolIdExhausted {
-        /// Exhausted symbol namespace.
-        namespace: &'static str,
-    },
-    /// A caller referred to an identifier absent from a symbol namespace.
+    /// The symbol catalog has assigned every unsigned 64-bit identifier.
+    SymbolIdExhausted,
+    /// A caller referred to an identifier absent from the symbol catalog.
     UnknownSymbolId {
-        /// Symbol namespace that did not contain the identifier.
-        namespace: &'static str,
         /// Missing unsigned identifier.
         id: u64,
     },
@@ -62,22 +55,12 @@ impl fmt::Display for StoreError {
             Self::RevisionExhausted => {
                 formatter.write_str("SQLite memory snapshot revision is exhausted")
             }
-            Self::InvalidSymbolValue {
-                namespace,
-                index,
-                detail,
-            } => write!(
-                formatter,
-                "invalid {namespace} symbol at batch index {index}: {detail}",
-            ),
-            Self::SymbolIdExhausted { namespace } => {
-                write!(
-                    formatter,
-                    "{namespace} symbol identifier space is exhausted"
-                )
+            Self::InvalidSymbolValue { index, detail } => {
+                write!(formatter, "invalid symbol at batch index {index}: {detail}")
             }
-            Self::UnknownSymbolId { namespace, id } => {
-                write!(formatter, "unknown {namespace} symbol identifier {id}")
+            Self::SymbolIdExhausted => formatter.write_str("symbol identifier space is exhausted"),
+            Self::UnknownSymbolId { id } => {
+                write!(formatter, "unknown symbol identifier {id}")
             }
         }
     }
@@ -93,7 +76,7 @@ impl Error for StoreError {
             Self::ConcurrentModification { .. }
             | Self::RevisionExhausted
             | Self::InvalidSymbolValue { .. }
-            | Self::SymbolIdExhausted { .. }
+            | Self::SymbolIdExhausted
             | Self::UnknownSymbolId { .. } => None,
         }
     }
@@ -167,8 +150,6 @@ pub enum StoreIntegrityError {
     },
     /// Symbol identifiers do not form the exact prefix `0..N`.
     NonContiguousSymbolId {
-        /// Affected symbol namespace.
-        namespace: &'static str,
         /// Identifier required at this position.
         expected: u64,
         /// Identifier read from the database.
@@ -176,14 +157,12 @@ pub enum StoreIntegrityError {
     },
     /// A persisted symbol value is not canonical.
     InvalidSymbol {
-        /// Affected symbol namespace.
-        namespace: &'static str,
         /// Identifier of the malformed symbol.
         id: u64,
         /// Violated value invariant.
         detail: &'static str,
     },
-    /// An episode or one of its statements is not canonical.
+    /// An episode or one of its attributes is not canonical.
     InvalidEpisode {
         /// Sequence of the affected episode.
         sequence: u64,
@@ -226,19 +205,13 @@ impl fmt::Display for StoreIntegrityError {
                 formatter,
                 "expected episode sequence {expected}, found {found}",
             ),
-            Self::NonContiguousSymbolId {
-                namespace,
-                expected,
-                found,
-            } => write!(
+            Self::NonContiguousSymbolId { expected, found } => write!(
                 formatter,
-                "expected {namespace} symbol identifier {expected}, found {found}",
+                "expected symbol identifier {expected}, found {found}",
             ),
-            Self::InvalidSymbol {
-                namespace,
-                id,
-                detail,
-            } => write!(formatter, "invalid {namespace} symbol {id}: {detail}",),
+            Self::InvalidSymbol { id, detail } => {
+                write!(formatter, "invalid symbol {id}: {detail}")
+            }
             Self::InvalidEpisode { sequence, detail } => {
                 write!(formatter, "invalid episode {sequence}: {detail}")
             }

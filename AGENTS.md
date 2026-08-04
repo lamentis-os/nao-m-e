@@ -62,9 +62,9 @@ repository-level guardrails when changing the implementation:
   truth or confidence.
 - Keep persistence outside the core crate. Decode and validate a complete
   snapshot before exposing reconstructed state, and commit a save atomically.
-- Keep predicate and term text in separate append-only SQLite symbol catalogs.
-  The core and episode payloads remain numeric; every persisted predicate or
-  term reference must resolve to its catalog before a snapshot is exposed.
+- Keep attribute-key and value text in one append-only SQLite symbol catalog.
+  The core and episode payloads remain numeric; every persisted symbol
+  reference must resolve to that catalog before a snapshot is exposed.
 - Preserve canonical fixed-width identifier encodings and reject stale writers
   rather than silently merging or overwriting their snapshots.
 

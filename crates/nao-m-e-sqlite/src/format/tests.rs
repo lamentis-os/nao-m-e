@@ -65,13 +65,7 @@ fn schema_creation_commits_current_format_identity_and_closed_shape() {
         .unwrap();
     assert_eq!(
         tables,
-        [
-            "episodes",
-            "feedback_edges",
-            "memory_meta",
-            "predicates",
-            "terms"
-        ]
+        ["episodes", "feedback_edges", "memory_meta", "symbols"]
     );
     let indexes: Vec<String> = connection
         .prepare(
@@ -84,7 +78,7 @@ fn schema_creation_commits_current_format_identity_and_closed_shape() {
         .unwrap()
         .collect::<Result<_>>()
         .unwrap();
-    assert_eq!(indexes, ["predicates_value_unique", "terms_value_unique"]);
+    assert_eq!(indexes, ["symbols_value_unique"]);
 }
 
 #[test]
@@ -169,7 +163,7 @@ fn constraints_enforce_canonical_keys_and_edges() {
     assert!(
         connection
             .execute(
-                "INSERT INTO predicates (id, value) VALUES (?1, 'bad-id')",
+                "INSERT INTO symbols (id, value) VALUES (?1, 'bad-id')",
                 [[0_u8; 7].as_slice()],
             )
             .is_err()
@@ -178,7 +172,7 @@ fn constraints_enforce_canonical_keys_and_edges() {
         assert!(
             connection
                 .execute(
-                    "INSERT INTO predicates (id, value) VALUES (?1, ?2)",
+                    "INSERT INTO symbols (id, value) VALUES (?1, ?2)",
                     params![zero.as_slice(), value],
                 )
                 .is_err()
@@ -186,14 +180,14 @@ fn constraints_enforce_canonical_keys_and_edges() {
     }
     connection
         .execute(
-            "INSERT INTO predicates (id, value) VALUES (?1, 'value')",
+            "INSERT INTO symbols (id, value) VALUES (?1, 'value')",
             [zero.as_slice()],
         )
         .unwrap();
     assert!(
         connection
             .execute(
-                "INSERT INTO predicates (id, value) VALUES (?1, 'value')",
+                "INSERT INTO symbols (id, value) VALUES (?1, 'value')",
                 [one.as_slice()],
             )
             .is_err()
@@ -203,7 +197,7 @@ fn constraints_enforce_canonical_keys_and_edges() {
         connection
             .execute(
                 "INSERT INTO episodes (sequence, payload) VALUES (?1, ?2)",
-                params![[0_u8; 7].as_slice(), [1_u8].as_slice()],
+                params![[0_u8; 7].as_slice(), [1_u8; 26].as_slice()],
             )
             .is_err()
     );
@@ -211,20 +205,20 @@ fn constraints_enforce_canonical_keys_and_edges() {
         connection
             .execute(
                 "INSERT INTO episodes (sequence, payload) VALUES (?1, ?2)",
-                params![zero.as_slice(), [].as_slice()],
+                params![zero.as_slice(), [0_u8; 25].as_slice()],
             )
             .is_err()
     );
     connection
         .execute(
             "INSERT INTO episodes (sequence, payload) VALUES (?1, ?2)",
-            params![zero.as_slice(), [1_u8].as_slice()],
+            params![zero.as_slice(), [1_u8; 26].as_slice()],
         )
         .unwrap();
     connection
         .execute(
             "INSERT INTO episodes (sequence, payload) VALUES (?1, ?2)",
-            params![one.as_slice(), [1_u8].as_slice()],
+            params![one.as_slice(), [1_u8; 26].as_slice()],
         )
         .unwrap();
     assert!(

@@ -59,6 +59,13 @@ fn help_version_and_top_level_syntax_have_stable_exit_categories() {
     assert!(recall_help.contains("Direct learned feedback"));
     assert!(recall_help.contains("suppress structural matches"));
 
+    let mut add_help = cli();
+    add_help.args(["add", "--help"]);
+    let add_help = success_text(invoke(add_help, None));
+    assert!(add_help.contains("--attribute <TEXT> --value <TEXT>..."));
+    assert!(!add_help.contains("--predicate"));
+    assert!(!add_help.contains("--context"));
+
     let mut version = cli();
     version.arg("--version");
     assert_eq!(
@@ -101,11 +108,11 @@ fn commands_reject_unsupported_format_before_execution_without_changing_it() {
     let store = SqliteStore::open(&database).expect("created SQLite store opens");
     let memory_id = store.memory_id().to_be_bytes();
     drop(store);
-    rewrite_format_version(&database, memory_id, 5, 6);
+    rewrite_format_version(&database, memory_id, 6, 7);
     let before = fs::read(&database).expect("unsupported-format store is readable");
 
     let stderr = failure(recall(&database, 0, None), 1);
-    assert!(stderr.contains("unsupported SQLite memory format version 6"));
+    assert!(stderr.contains("unsupported SQLite memory format version 7"));
     assert_eq!(fs::read(&database).unwrap(), before);
 }
 
@@ -135,51 +142,35 @@ fn malformed_direct_arguments_are_syntax_errors_but_store_errors_are_runtime_err
         failure(invoke(command, None), 2);
     }
 
-    let mut malformed_statement = cli();
-    malformed_statement
+    let mut malformed_attribute = cli();
+    malformed_attribute
         .arg("add")
         .arg(&database)
-        .args(["--predicate", "4", "--terms", "1,"]);
-    failure(invoke(malformed_statement, None), 2);
+        .args(["--attribute", "4", "--values", "1,"]);
+    failure(invoke(malformed_attribute, None), 2);
 
     for episode_options in [
+        vec!["--value", "orphan"],
+        vec!["--attribute", "empty", "--timestamp", "1"],
         vec![
-            "--predicate",
-            "observation",
-            "--context",
-            "context",
-            "--term",
-            "late observation term",
-            "--context-term",
-            "context term",
+            "--attribute",
+            "complete",
+            "--value",
+            "first",
+            "--timestamp",
+            "1",
+            "--value",
+            "late",
         ],
         vec![
-            "--predicate",
-            "observation",
-            "--term",
-            "observation term",
-            "--context",
-            "context",
-            "--context-term",
-            "context term",
-            "--term",
-            "late observation term",
-        ],
-        vec![
-            "--predicate",
-            "observation",
-            "--term",
-            "observation term",
-            "--action",
-            "action",
-            "--action-term",
-            "action term",
-            "--outcome",
-            "outcome",
-            "--outcome-term",
-            "outcome term",
-            "--action-term",
-            "late action term",
+            "--timestamp",
+            "1",
+            "--timestamp",
+            "2",
+            "--attribute",
+            "complete",
+            "--value",
+            "value",
         ],
     ] {
         let mut command = cli();

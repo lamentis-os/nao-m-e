@@ -78,7 +78,7 @@ impl Memory {
         self.memory_id
     }
 
-    /// Canonicalizes the draft context and appends the immutable episode.
+    /// Appends one canonical immutable episode.
     pub fn insert_episode(&mut self, draft: EpisodeDraft) -> Result<AtomId, MemoryError> {
         let sequence = u64::try_from(self.atoms.len()).map_err(|_| MemoryError::IdExhausted)?;
         let id = AtomId::from_parts(self.memory_id, sequence);
