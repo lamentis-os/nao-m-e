@@ -107,6 +107,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nao-m-e-semantic-index"
+version = "0.0.1"
+dependencies = [
+ "nao-m-e",
+ "nao-m-e-sqlite",
+ "rusqlite",
+ "tempfile",
+]
+
+[[package]]
 name = "nao-m-e-sqlite"
 version = "0.0.1"
 dependencies = [
