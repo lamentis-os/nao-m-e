@@ -12,6 +12,7 @@ publish.workspace = true
 name = "nao-m-e"
 path = "src/main.rs"
 doc = false
+test = false
 
 [dependencies]
 nao-m-e = { path = "../.." }
