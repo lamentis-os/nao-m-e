@@ -12,8 +12,8 @@ pub enum SemanticError {
         /// Number of supplied cues.
         found: usize,
     },
-    /// Hugging Face cache lookup or download failed.
-    ArtifactDownload {
+    /// A required pinned artifact is absent from or inaccessible in the local cache.
+    ArtifactUnavailable {
         /// Repository path of the required artifact.
         file: &'static str,
         /// Underlying Hub failure.
@@ -26,13 +26,13 @@ pub enum SemanticError {
         /// Underlying filesystem failure.
         source: std::io::Error,
     },
-    /// An artifact remained different from its pinned SHA-256 after one forced retry.
+    /// A provisioned artifact differs from its pinned SHA-256.
     ArtifactHashMismatch {
         /// Repository path of the invalid artifact.
         file: &'static str,
         /// Required digest.
         expected: [u8; 32],
-        /// Digest read after the retry.
+        /// Digest read from the provisioned artifact.
         found: [u8; 32],
     },
     /// The pinned tokenizer could not be loaded or configured.
@@ -63,10 +63,10 @@ impl fmt::Display for SemanticError {
                     "semantic batch contains {found} cues; maximum is {maximum}"
                 )
             }
-            Self::ArtifactDownload { file, source } => {
+            Self::ArtifactUnavailable { file, source } => {
                 write!(
                     formatter,
-                    "failed to obtain semantic artifact {file}: {source}"
+                    "required semantic artifact {file} is not provisioned or accessible in the local cache: {source}"
                 )
             }
             Self::ArtifactRead { file, source } => {
@@ -101,7 +101,7 @@ impl fmt::Display for SemanticError {
 impl Error for SemanticError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::ArtifactDownload { source, .. } => Some(source),
+            Self::ArtifactUnavailable { source, .. } => Some(source),
             Self::ArtifactRead { source, .. } => Some(source),
             Self::Runtime(error) => Some(error),
             Self::BatchTooLarge { .. }

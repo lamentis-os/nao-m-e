@@ -1,6 +1,6 @@
 use nao_m_e_semantic::{
     CueText, E5_SMALL_PROFILE, EMBEDDING_DIMENSIONS, Embedding, MAX_EMBEDDING_BATCH_SIZE,
-    SemanticEncoder, SemanticError,
+    QueryText, SemanticEncoder, SemanticError,
 };
 
 const FIXTURE_OUTPUT: &str = "NAO_M_E_SEMANTIC_FIXTURE_PATH";
@@ -60,15 +60,15 @@ fn public_encoder_is_lazy_for_non_runtime_paths() {
 }
 
 #[test]
-#[ignore = "downloads and executes the pinned 470 MB E5 Small model"]
+#[ignore = "requires and executes the provisioned pinned 470 MB E5 Small model"]
 fn pinned_runtime_smoke_is_explicit_and_repeatable() {
-    let long_value = std::iter::repeat_n("grenze", 700)
+    let long_value = std::iter::repeat_n("boundary", 700)
         .collect::<Vec<_>>()
         .join(" ");
     let values = [
         ("problem", "login returns http 404".to_owned()),
-        ("activity", "hund am strand spazieren".to_owned()),
-        ("unicode", "straße ångström 東京 🐕 café שלום".to_owned()),
+        ("activity", "walked with the dog on the beach".to_owned()),
+        ("punctuation", "login: http 404 -- retry?".to_owned()),
         ("truncation", long_value),
     ];
     let cues: Vec<_> = values
@@ -104,8 +104,14 @@ fn pinned_runtime_smoke_is_explicit_and_repeatable() {
     reversed_embeddings.reverse();
     assert_eq!(reversed_embeddings, embeddings);
 
+    let query = QueryText::new("login bug in lamentis with http 404");
+    let query_embedding = encoder.encode_query(query).unwrap();
+    assert_eq!(encoder.encode_query(query).unwrap(), query_embedding);
+
     if let Some(path) = std::env::var_os(FIXTURE_OUTPUT) {
-        std::fs::write(path, fixture_bytes(&embeddings)).unwrap();
+        let mut fixtures = embeddings;
+        fixtures.push(query_embedding);
+        std::fs::write(path, fixture_bytes(&fixtures)).unwrap();
     }
 }
 

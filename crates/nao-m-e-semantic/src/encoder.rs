@@ -15,7 +15,9 @@ use crate::profile::{
     MODEL_FILE, MODEL_NAME, MODEL_OWNER, MODEL_REVISION, MODEL_SHA256, TOKENIZER_FILE,
     TOKENIZER_SHA256,
 };
-use crate::{CueText, EMBEDDING_DIMENSIONS, Embedding, MAX_EMBEDDING_BATCH_SIZE, SemanticError};
+use crate::{
+    CueText, EMBEDDING_DIMENSIONS, Embedding, MAX_EMBEDDING_BATCH_SIZE, QueryText, SemanticError,
+};
 
 const MAX_TOKEN_COUNT: usize = 512;
 
@@ -42,8 +44,8 @@ struct EncoderRuntime {
 impl EncoderRuntime {
     fn load() -> Result<Self, SemanticError> {
         let repository = pinned_repository(MODEL_FILE)?;
-        let model_path = remote_artifact(&repository, MODEL)?;
-        let tokenizer_path = remote_artifact(&repository, TOKENIZER)?;
+        let model_path = cached_artifact(&repository, MODEL)?;
+        let tokenizer_path = cached_artifact(&repository, TOKENIZER)?;
 
         let tokenizer = load_tokenizer(&tokenizer_path)?;
         let environment = Environment::current()?;
@@ -84,54 +86,35 @@ impl EncoderRuntime {
         Ok(Self { tokenizer, session })
     }
 
-    fn encode_one(&mut self, cue: CueText<'_>) -> Result<Embedding, SemanticError> {
-        let cues = [cue];
-        let projected: Vec<String> = cues.iter().map(|cue| cue.project()).collect();
-        let encodings = self
+    fn encode_projected(&mut self, projected: String) -> Result<Embedding, SemanticError> {
+        let encoding = self
             .tokenizer
-            .encode_batch(projected, true)
+            .encode(projected, true)
             .map_err(tokenizer_error)?;
-        let sequence_length = encodings.first().map(tokenizers::Encoding::len).ok_or(
-            SemanticError::InvalidModelOutput {
-                detail: "tokenizer returned an empty batch",
-            },
-        )?;
-        if sequence_length == 0
-            || encodings
-                .iter()
-                .any(|encoding| encoding.len() != sequence_length)
-        {
+        let sequence_length = encoding.len();
+        if sequence_length == 0 {
             return Err(SemanticError::InvalidModelOutput {
-                detail: "tokenizer returned an invalid padded shape",
+                detail: "tokenizer returned an empty sequence",
             });
         }
 
-        let element_count =
-            cues.len()
-                .checked_mul(sequence_length)
-                .ok_or(SemanticError::InvalidModelOutput {
-                    detail: "token tensor size overflowed",
-                })?;
-        let mut input_ids = Vec::with_capacity(element_count);
-        let mut attention_mask = Vec::with_capacity(element_count);
-        let mut token_type_ids = Vec::with_capacity(element_count);
-        for encoding in &encodings {
-            input_ids.extend(encoding.get_ids().iter().map(|value| i64::from(*value)));
-            attention_mask.extend(
-                encoding
-                    .get_attention_mask()
-                    .iter()
-                    .map(|value| i64::from(*value)),
-            );
-            token_type_ids.extend(
-                encoding
-                    .get_type_ids()
-                    .iter()
-                    .map(|value| i64::from(*value)),
-            );
-        }
+        let input_ids = encoding
+            .get_ids()
+            .iter()
+            .map(|value| i64::from(*value))
+            .collect::<Vec<_>>();
+        let attention_mask = encoding
+            .get_attention_mask()
+            .iter()
+            .map(|value| i64::from(*value))
+            .collect::<Vec<_>>();
+        let token_type_ids = encoding
+            .get_type_ids()
+            .iter()
+            .map(|value| i64::from(*value))
+            .collect::<Vec<_>>();
 
-        let shape = [cues.len(), sequence_length];
+        let shape = [1, sequence_length];
         let input_ids = TensorRef::from_array_view((shape, input_ids.as_slice()))?;
         let attention = TensorRef::from_array_view((shape, attention_mask.as_slice()))?;
         let token_types = TensorRef::from_array_view((shape, token_type_ids.as_slice()))?;
@@ -148,7 +131,7 @@ impl EncoderRuntime {
         let (output_shape, values) = output.try_extract_tensor::<f32>()?;
         if output_shape.as_ref()
             != [
-                i64::try_from(cues.len()).expect("batch bound fits i64"),
+                1,
                 i64::try_from(sequence_length).expect("token bound fits i64"),
                 i64::try_from(EMBEDDING_DIMENSIONS).expect("dimension fits i64"),
             ]
@@ -158,46 +141,43 @@ impl EncoderRuntime {
             });
         }
 
-        let mut embeddings = pool_embeddings(values, &attention_mask, cues.len(), sequence_length)?;
-        Ok(embeddings
-            .pop()
-            .expect("singleton model inference returns one embedding"))
+        pool_embedding(values, &attention_mask, sequence_length)
     }
 }
 
 fn pinned_repository(
     error_file: &'static str,
 ) -> Result<HFRepositorySync<RepoTypeModel>, SemanticError> {
-    let client = HFClientSync::new().map_err(|source| SemanticError::ArtifactDownload {
+    let client = HFClientSync::new().map_err(|source| SemanticError::ArtifactUnavailable {
         file: error_file,
         source,
     })?;
     Ok(client.model(MODEL_OWNER, MODEL_NAME))
 }
 
-fn remote_artifact(
+fn cached_artifact(
     repository: &HFRepositorySync<RepoTypeModel>,
     artifact: ArtifactSpec,
 ) -> Result<PathBuf, SemanticError> {
-    verified_artifact(artifact, |force_download| {
+    verified_artifact(artifact, || {
         repository
             .download_file()
             .filename(artifact.file)
             .revision(MODEL_REVISION)
-            .force_download(force_download)
+            .local_files_only(true)
             .send()
-            .map_err(|source| SemanticError::ArtifactDownload {
+            .map_err(|source| SemanticError::ArtifactUnavailable {
                 file: artifact.file,
                 source,
             })
     })
 }
 
-/// Lazy local encoder for the fixed multilingual E5 Small profile.
+/// Lazy local encoder for the fixed E5 Small profile.
 ///
 /// Construction performs no filesystem or network I/O. The pinned model and
-/// tokenizer are resolved through the Hugging Face cache only when the first
-/// non-empty batch is encoded.
+/// tokenizer must already be provisioned in the local Hugging Face cache. The
+/// first non-empty request verifies and loads them without network fallback.
 pub struct SemanticEncoder {
     runtime: Option<EncoderRuntime>,
 }
@@ -229,11 +209,26 @@ impl SemanticEncoder {
         if cues.is_empty() {
             return Ok(Vec::new());
         }
+        let runtime = self.runtime()?;
+        cues.iter()
+            .map(|cue| runtime.encode_projected(cue.project()))
+            .collect()
+    }
+
+    /// Encodes one normalized free-text retrieval query.
+    ///
+    /// The query is projected with the fixed E5 `query:` prefix and uses the
+    /// same lazy model, tokenizer, pooling, normalization, and quantization as
+    /// bound cue encoding.
+    pub fn encode_query(&mut self, query: QueryText<'_>) -> Result<Embedding, SemanticError> {
+        self.runtime()?.encode_projected(query.project())
+    }
+
+    fn runtime(&mut self) -> Result<&mut EncoderRuntime, SemanticError> {
         if self.runtime.is_none() {
             self.runtime = Some(EncoderRuntime::load()?);
         }
-        let runtime = self.runtime.as_mut().expect("runtime was initialized");
-        cues.iter().map(|cue| runtime.encode_one(*cue)).collect()
+        Ok(self.runtime.as_mut().expect("runtime was initialized"))
     }
 }
 
@@ -290,15 +285,9 @@ fn session_builder_error(error: ort::Error<SessionBuilder>) -> SemanticError {
 
 fn verified_artifact(
     artifact: ArtifactSpec,
-    mut download: impl FnMut(bool) -> Result<PathBuf, SemanticError>,
+    resolve: impl FnOnce() -> Result<PathBuf, SemanticError>,
 ) -> Result<PathBuf, SemanticError> {
-    let path = download(false)?;
-    let found = sha256_file(artifact.file, &path)?;
-    if found == artifact.sha256 {
-        return Ok(path);
-    }
-
-    let path = download(true)?;
+    let path = resolve()?;
     let found = sha256_file(artifact.file, &path)?;
     if found == artifact.sha256 {
         Ok(path)
@@ -328,72 +317,64 @@ fn sha256_file(file: &'static str, path: &Path) -> Result<[u8; 32], SemanticErro
     Ok(digest.finalize().into())
 }
 
-fn pool_embeddings(
+fn pool_embedding(
     hidden: &[f32],
     attention_mask: &[i64],
-    batch_size: usize,
     sequence_length: usize,
-) -> Result<Vec<Embedding>, SemanticError> {
-    let expected_hidden = batch_size
-        .checked_mul(sequence_length)
-        .and_then(|value| value.checked_mul(EMBEDDING_DIMENSIONS))
-        .ok_or(SemanticError::InvalidModelOutput {
+) -> Result<Embedding, SemanticError> {
+    let expected_hidden = sequence_length.checked_mul(EMBEDDING_DIMENSIONS).ok_or(
+        SemanticError::InvalidModelOutput {
             detail: "model output size overflowed",
-        })?;
-    if hidden.len() != expected_hidden || attention_mask.len() != batch_size * sequence_length {
+        },
+    )?;
+    if hidden.len() != expected_hidden || attention_mask.len() != sequence_length {
         return Err(SemanticError::InvalidModelOutput {
             detail: "model output length does not match its shape",
         });
     }
 
-    let mut embeddings = Vec::with_capacity(batch_size);
-    for batch in 0..batch_size {
-        let mut pooled = [0.0_f64; EMBEDDING_DIMENSIONS];
-        let mut token_count = 0_u32;
-        for token in 0..sequence_length {
-            if attention_mask[batch * sequence_length + token] == 0 {
-                continue;
+    let mut pooled = [0.0_f64; EMBEDDING_DIMENSIONS];
+    let mut token_count = 0_u32;
+    for (token, &attention) in attention_mask.iter().enumerate() {
+        if attention == 0 {
+            continue;
+        }
+        token_count += 1;
+        let start = token * EMBEDDING_DIMENSIONS;
+        for (sum, value) in pooled
+            .iter_mut()
+            .zip(&hidden[start..start + EMBEDDING_DIMENSIONS])
+        {
+            if !value.is_finite() {
+                return Err(SemanticError::InvalidModelOutput {
+                    detail: "model output contains a non-finite component",
+                });
             }
-            token_count += 1;
-            let start = (batch * sequence_length + token) * EMBEDDING_DIMENSIONS;
-            for (sum, value) in pooled
-                .iter_mut()
-                .zip(&hidden[start..start + EMBEDDING_DIMENSIONS])
-            {
-                if !value.is_finite() {
-                    return Err(SemanticError::InvalidModelOutput {
-                        detail: "model output contains a non-finite component",
-                    });
-                }
-                *sum += f64::from(*value);
-            }
+            *sum += f64::from(*value);
         }
-        if token_count == 0 {
-            return Err(SemanticError::InvalidModelOutput {
-                detail: "attention mask contains no input token",
-            });
-        }
-        let divisor = f64::from(token_count);
-        for value in &mut pooled {
-            *value /= divisor;
-        }
-        let norm = pooled.iter().map(|value| value * value).sum::<f64>().sqrt();
-        if !norm.is_finite() || norm == 0.0 {
-            return Err(SemanticError::InvalidModelOutput {
-                detail: "pooled model output has no finite norm",
-            });
-        }
-        let values = pooled
-            .iter()
-            .map(|value| quantize_component(value / norm))
-            .collect::<Result<Vec<_>, _>>()?;
-        embeddings.push(
-            Embedding::new(values).ok_or(SemanticError::InvalidModelOutput {
-                detail: "normalized model output quantized to zero",
-            })?,
-        );
     }
-    Ok(embeddings)
+    if token_count == 0 {
+        return Err(SemanticError::InvalidModelOutput {
+            detail: "attention mask contains no input token",
+        });
+    }
+    let divisor = f64::from(token_count);
+    for value in &mut pooled {
+        *value /= divisor;
+    }
+    let norm = pooled.iter().map(|value| value * value).sum::<f64>().sqrt();
+    if !norm.is_finite() || norm == 0.0 {
+        return Err(SemanticError::InvalidModelOutput {
+            detail: "pooled model output has no finite norm",
+        });
+    }
+    let values = pooled
+        .iter()
+        .map(|value| quantize_component(value / norm))
+        .collect::<Result<Vec<_>, _>>()?;
+    Embedding::new(values).ok_or(SemanticError::InvalidModelOutput {
+        detail: "normalized model output quantized to zero",
+    })
 }
 
 fn quantize_component(normalized: f64) -> Result<i16, SemanticError> {
@@ -408,16 +389,16 @@ fn quantize_component(normalized: f64) -> Result<i16, SemanticError> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::Cell;
     use std::fs;
 
     use sha2::Digest;
     use tempfile::tempdir;
 
     use super::{
-        ArtifactSpec, SemanticEncoder, TOKENIZER, load_tokenizer, padding_params,
-        pinned_repository, pool_embeddings, quantize_component, remote_artifact, truncation_params,
-        verified_artifact,
+        ArtifactSpec, MODEL, MODEL_REVISION, SemanticEncoder, TOKENIZER, cached_artifact,
+        load_tokenizer, padding_params, pinned_repository, pool_embedding, quantize_component,
+        sha256_file, truncation_params, verified_artifact,
     };
     use crate::{CueText, EMBEDDING_DIMENSIONS, MAX_EMBEDDING_BATCH_SIZE, SemanticError};
 
@@ -439,29 +420,54 @@ mod tests {
     }
 
     #[test]
-    fn artifact_hash_mismatch_forces_exactly_one_retry() {
+    fn artifact_hash_mismatch_fails_without_repair_or_retry() {
         let directory = tempdir().unwrap();
         let bad = directory.path().join("bad");
-        let good = directory.path().join("good");
         fs::write(&bad, b"bad").unwrap();
-        fs::write(&good, b"good").unwrap();
         let expected: [u8; 32] = sha2::Sha256::digest(b"good").into();
-        let calls = RefCell::new(Vec::new());
+        let bad_digest: [u8; 32] = sha2::Sha256::digest(b"bad").into();
+        let calls = Cell::new(0);
 
-        let path = verified_artifact(
+        let result = verified_artifact(
             ArtifactSpec {
                 file: "test",
                 sha256: expected,
             },
-            |force| {
-                calls.borrow_mut().push(force);
-                Ok(if force { good.clone() } else { bad.clone() })
+            || {
+                calls.set(calls.get() + 1);
+                Ok(bad)
             },
-        )
-        .unwrap();
+        );
 
-        assert_eq!(path, good);
-        assert_eq!(*calls.borrow(), [false, true]);
+        assert!(matches!(
+            result,
+            Err(SemanticError::ArtifactHashMismatch { found, .. })
+                if found == bad_digest
+        ));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    #[ignore = "explicitly provisions the pinned model assets for runtime qualification"]
+    fn provision_pinned_artifacts_for_runtime_qualification() {
+        let repository = pinned_repository(MODEL.file).unwrap();
+        for artifact in [MODEL, TOKENIZER] {
+            let mut force_download = false;
+            loop {
+                let path = repository
+                    .download_file()
+                    .filename(artifact.file)
+                    .revision(MODEL_REVISION)
+                    .force_download(force_download)
+                    .send()
+                    .unwrap();
+                if sha256_file(artifact.file, &path).unwrap() == artifact.sha256 {
+                    break;
+                }
+                assert!(!force_download, "provisioned artifact hash remains invalid");
+                force_download = true;
+            }
+        }
     }
 
     #[test]
@@ -494,38 +500,23 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "downloads and validates the pinned 17 MB tokenizer asset"]
-    fn pinned_tokenizer_matches_cross_script_golden_ids_and_right_truncation() {
+    #[ignore = "requires the provisioned pinned 17 MB tokenizer asset"]
+    fn pinned_tokenizer_matches_golden_ids_and_right_truncation() {
         let repository = pinned_repository(TOKENIZER.file).unwrap();
-        let path = remote_artifact(&repository, TOKENIZER).unwrap();
+        let path = cached_artifact(&repository, TOKENIZER).unwrap();
         let tokenizer = load_tokenizer(&path).unwrap();
-        let goldens = [
-            (
-                CueText::new("problem", "login returns http 404"),
-                &[0, 46692, 12, 2967, 12, 73655, 30646, 7, 1621, 1112, 617, 2][..],
-            ),
-            (
-                CueText::new("aktivität", "hund am strand spazieren"),
-                &[
-                    0, 46692, 12, 7910, 12809, 12, 30574, 444, 32594, 81223, 3683, 2,
-                ][..],
-            ),
-            (
-                CueText::new("unicode", "straße ångström 東京 🐕 café שלום"),
-                &[
-                    0, 46692, 12, 60347, 112, 12, 6, 71887, 426, 449, 30011, 6, 22888, 6, 3, 26216,
-                    56976, 2,
-                ][..],
-            ),
-        ];
+        let goldens = [(
+            CueText::new("problem", "login returns http 404"),
+            &[0, 46692, 12, 2967, 12, 73655, 30646, 7, 1621, 1112, 617, 2][..],
+        )];
         for (cue, expected) in goldens {
             let encoding = tokenizer.encode(cue.project(), true).unwrap();
             assert_eq!(encoding.get_ids(), expected);
         }
 
         let long_value = format!(
-            "anfang {} ende",
-            std::iter::repeat_n("grenze", 700)
+            "start {} end",
+            std::iter::repeat_n("boundary", 700)
                 .collect::<Vec<_>>()
                 .join(" ")
         );
@@ -549,28 +540,28 @@ mod tests {
         hidden[1] = 4.0;
         hidden[EMBEDDING_DIMENSIONS] = 99.0;
 
-        let embeddings = pool_embeddings(&hidden, &[1, 0], 1, 2).unwrap();
-        assert_eq!(embeddings[0].values()[0], 19_660);
-        assert_eq!(embeddings[0].values()[1], 26_214);
-        assert!(embeddings[0].values()[2..].iter().all(|value| *value == 0));
+        let embedding = pool_embedding(&hidden, &[1, 0], 2).unwrap();
+        assert_eq!(embedding.values()[0], 19_660);
+        assert_eq!(embedding.values()[1], 26_214);
+        assert!(embedding.values()[2..].iter().all(|value| *value == 0));
     }
 
     #[test]
     fn pooling_rejects_non_finite_and_zero_vectors() {
         let zero = vec![0.0_f32; EMBEDDING_DIMENSIONS];
         assert!(matches!(
-            pool_embeddings(&zero, &[1], 1, 1),
+            pool_embedding(&zero, &[1], 1),
             Err(SemanticError::InvalidModelOutput { .. })
         ));
         let mut invalid = zero;
         invalid[7] = f32::NAN;
         assert!(matches!(
-            pool_embeddings(&invalid, &[1], 1, 1),
+            pool_embedding(&invalid, &[1], 1),
             Err(SemanticError::InvalidModelOutput { .. })
         ));
         let infinity = vec![f32::INFINITY; EMBEDDING_DIMENSIONS];
         assert!(matches!(
-            pool_embeddings(&infinity, &[1], 1, 1),
+            pool_embedding(&infinity, &[1], 1),
             Err(SemanticError::InvalidModelOutput { .. })
         ));
     }

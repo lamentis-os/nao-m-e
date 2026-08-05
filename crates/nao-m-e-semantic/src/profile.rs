@@ -62,7 +62,7 @@ const PROFILE_FINGERPRINT: [u8; 32] = [
     0xa6, 0xeb, 0x7a, 0x43, 0xc3, 0x23, 0x53, 0x59, 0x08, 0x9c, 0xee, 0xd7, 0xdf, 0x1f, 0x5b, 0x25,
 ];
 
-/// Stable identity of the fixed multilingual E5 Small encoding contract.
+/// Stable identity of the fixed E5 Small encoding contract.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct EmbeddingProfile {
     fingerprint: [u8; 32],
@@ -88,7 +88,7 @@ impl EmbeddingProfile {
     }
 }
 
-/// Fixed multilingual E5 Small FP32 profile used by this crate.
+/// Fixed E5 Small FP32 profile used by this crate.
 pub const E5_SMALL_PROFILE: EmbeddingProfile = EmbeddingProfile {
     fingerprint: PROFILE_FINGERPRINT,
 };

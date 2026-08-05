@@ -1,5 +1,29 @@
 use crate::{E5_SMALL_PROFILE, EMBEDDING_DIMENSIONS, EmbeddingProfile};
 
+/// Borrowed normalized free-text query for semantic retrieval.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct QueryText<'a> {
+    value: &'a str,
+}
+
+impl<'a> QueryText<'a> {
+    /// Creates one borrowed normalized query.
+    #[must_use]
+    pub const fn new(value: &'a str) -> Self {
+        Self { value }
+    }
+
+    /// Returns the normalized query text.
+    #[must_use]
+    pub const fn value(self) -> &'a str {
+        self.value
+    }
+
+    pub(crate) fn project(self) -> String {
+        format!("query: {}", self.value)
+    }
+}
+
 /// Borrowed normalized text for one bound attribute-key/value cue.
 ///
 /// The semantic projection keeps the key and value together so identical
@@ -73,7 +97,7 @@ impl Embedding {
 
 #[cfg(test)]
 mod tests {
-    use super::{CueText, Embedding};
+    use super::{CueText, Embedding, QueryText};
     use crate::{E5_SMALL_PROFILE, EMBEDDING_DIMENSIONS};
 
     #[test]
@@ -82,6 +106,13 @@ mod tests {
         assert_eq!(cue.key(), "problem");
         assert_eq!(cue.value(), "http 404");
         assert_eq!(cue.project(), "passage: problem: http 404");
+    }
+
+    #[test]
+    fn query_projection_uses_the_retrieval_prefix() {
+        let query = QueryText::new("login bug in lamentis");
+        assert_eq!(query.value(), "login bug in lamentis");
+        assert_eq!(query.project(), "query: login bug in lamentis");
     }
 
     #[test]
