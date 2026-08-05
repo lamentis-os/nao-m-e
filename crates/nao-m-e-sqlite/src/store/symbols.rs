@@ -77,7 +77,7 @@ impl SymbolState {
         }
     }
 
-    fn contains_persisted(&self, id: u64) -> bool {
+    pub(super) fn contains_persisted(&self, id: u64) -> bool {
         self.persisted_tail.is_some_and(|tail| id <= tail)
     }
 
@@ -141,7 +141,7 @@ impl SqliteStore {
             if persisted[index] {
                 let id = assignments[index];
                 if !state.contains_persisted(id) {
-                    let (_, actual_revision) = read_metadata(&self.connection)?;
+                    let (_, actual_revision, _) = read_metadata(&self.connection)?;
                     if actual_revision != self.expected_revision {
                         return Err(StoreError::ConcurrentModification {
                             expected_revision: self.expected_revision,

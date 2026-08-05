@@ -31,6 +31,16 @@ pub enum StoreError {
     },
     /// The symbol catalog has assigned every unsigned 64-bit identifier.
     SymbolIdExhausted,
+    /// The semantic cue catalog reached V7's unsigned 64-bit count capacity.
+    ///
+    /// Because metadata stores the next prefix length, the largest assignable
+    /// cue identifier is `u64::MAX - 1`.
+    SemanticCueIdExhausted,
+    /// The configured semantic encoder could not produce canonical vectors.
+    SemanticEncoding {
+        /// Encoder or vector validation diagnostic.
+        detail: String,
+    },
     /// A caller referred to an identifier absent from the symbol catalog.
     UnknownSymbolId {
         /// Missing unsigned identifier.
@@ -59,6 +69,12 @@ impl fmt::Display for StoreError {
                 write!(formatter, "invalid symbol at batch index {index}: {detail}")
             }
             Self::SymbolIdExhausted => formatter.write_str("symbol identifier space is exhausted"),
+            Self::SemanticCueIdExhausted => {
+                formatter.write_str("semantic cue identifier space is exhausted")
+            }
+            Self::SemanticEncoding { detail } => {
+                write!(formatter, "semantic cue encoding failed: {detail}")
+            }
             Self::UnknownSymbolId { id } => {
                 write!(formatter, "unknown symbol identifier {id}")
             }
@@ -77,6 +93,8 @@ impl Error for StoreError {
             | Self::RevisionExhausted
             | Self::InvalidSymbolValue { .. }
             | Self::SymbolIdExhausted
+            | Self::SemanticCueIdExhausted
+            | Self::SemanticEncoding { .. }
             | Self::UnknownSymbolId { .. } => None,
         }
     }
@@ -127,6 +145,16 @@ pub enum StoreIntegrityError {
         /// Diagnostic returned by SQLite.
         detail: String,
     },
+    /// SQLite's complete integrity check did not report `ok`.
+    IntegrityCheckFailed {
+        /// Diagnostic returned by SQLite.
+        detail: String,
+    },
+    /// SQLite reported one or more foreign-key violations.
+    ForeignKeyCheckFailed {
+        /// Compact diagnostics returned by SQLite.
+        detail: String,
+    },
     /// A column did not contain its canonical fixed-width encoding.
     InvalidEncoding {
         /// Table containing the invalid value.
@@ -154,6 +182,27 @@ pub enum StoreIntegrityError {
         expected: u64,
         /// Identifier read from the database.
         found: u64,
+    },
+    /// Semantic cue identifiers do not form the exact prefix `0..N`.
+    NonContiguousSemanticCueId {
+        /// Identifier required at this position.
+        expected: u64,
+        /// Identifier read from the database.
+        found: u64,
+    },
+    /// A semantic cue, vector, or its symbol binding is invalid.
+    InvalidSemanticCue {
+        /// Identifier of the affected cue when it could be decoded.
+        cue_id: u64,
+        /// Violated semantic invariant.
+        detail: &'static str,
+    },
+    /// Persisted episode-to-cue postings differ from episode attributes.
+    InvalidSemanticPostings {
+        /// Sequence of the affected episode.
+        sequence: u64,
+        /// Violated posting invariant.
+        detail: &'static str,
     },
     /// A persisted symbol value is not canonical.
     InvalidSymbol {
@@ -196,6 +245,12 @@ impl fmt::Display for StoreIntegrityError {
             Self::QuickCheckFailed { detail } => {
                 write!(formatter, "SQLite quick check failed: {detail}")
             }
+            Self::IntegrityCheckFailed { detail } => {
+                write!(formatter, "SQLite integrity check failed: {detail}")
+            }
+            Self::ForeignKeyCheckFailed { detail } => {
+                write!(formatter, "SQLite foreign-key check failed: {detail}")
+            }
             Self::InvalidEncoding { table, column } => {
                 write!(formatter, "invalid encoding in {table}.{column}")
             }
@@ -209,6 +264,19 @@ impl fmt::Display for StoreIntegrityError {
                 formatter,
                 "expected symbol identifier {expected}, found {found}",
             ),
+            Self::NonContiguousSemanticCueId { expected, found } => write!(
+                formatter,
+                "expected semantic cue identifier {expected}, found {found}",
+            ),
+            Self::InvalidSemanticCue { cue_id, detail } => {
+                write!(formatter, "invalid semantic cue {cue_id}: {detail}")
+            }
+            Self::InvalidSemanticPostings { sequence, detail } => {
+                write!(
+                    formatter,
+                    "invalid semantic postings for episode {sequence}: {detail}"
+                )
+            }
             Self::InvalidSymbol { id, detail } => {
                 write!(formatter, "invalid symbol {id}: {detail}")
             }

@@ -19,6 +19,11 @@ episode content creates distinct atoms. Implementations may maintain a private
 cue index derived completely from `A`; that index is not additional logical
 state and is rebuilt by replaying the atom sequence.
 
+Normalized symbol text, persisted semantic cue vectors, and their episode
+postings remain adapter-owned projections outside `M`. The core neither creates
+nor reads them. They do not change the scoring or ordering defined by this
+contract.
+
 ## Symbolic episodes
 
 An episode consists of one timestamp and a non-empty set of symbolic

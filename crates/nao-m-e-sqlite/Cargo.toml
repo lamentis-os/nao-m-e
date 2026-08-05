@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 getrandom = "0.4.3"
 nao-m-e = { path = "../.." }
+nao-m-e-semantic = { path = "../nao-m-e-semantic" }
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 tempfile = "3.27.0"
 unicode-case-mapping = "=1.0.0"

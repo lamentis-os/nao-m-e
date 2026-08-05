@@ -5,7 +5,9 @@ use nao_m_e::AtomId;
 use nao_m_e_sqlite::SqliteStore;
 use tempfile::TempDir;
 
-use super::support::{add_minimal, assert_silent_success, cli, init, invoke, recall, success_text};
+use super::support::{
+    add_minimal, assert_silent_success, cli, init, invoke, recall, seed_cues, success_text,
+};
 
 fn minimal_recall_block(sequence: u64, activation_ppm: u32) -> String {
     format!(
@@ -18,6 +20,23 @@ fn recall_emits_exact_ranked_blocks_and_honors_limit() {
     let directory = TempDir::new().expect("temporary directory");
     let database = directory.path().join("memory.sqlite3");
     init(&database);
+    let mut initial_cues = vec![("attribute-0".to_owned(), "value-0".to_owned())];
+    initial_cues.extend(
+        [
+            ("context-b", "context-b-1"),
+            ("context-b", "context-b-2"),
+            ("context-a", "context-a-1"),
+            ("observation", "observation-1"),
+            ("observation", "observation-2"),
+            ("action", "action-1"),
+            ("outcome", "outcome-1"),
+            ("outcome", "outcome-2"),
+        ]
+        .map(|(key, value)| (key.to_owned(), value.to_owned())),
+    );
+    initial_cues
+        .extend((2..=11).map(|seed| (format!("attribute-{seed}"), format!("value-{seed}"))));
+    seed_cues(&database, initial_cues);
     let mut input = String::from(
         "--timestamp 0 --attribute attribute-0 --value value-0\n\
          --timestamp -7 --attribute context-b --value context-b-1 --value context-b-2 --attribute context-a --value context-a-1 --attribute context-a --value context-a-1 --attribute observation --value observation-1 --value observation-2 --attribute action --value action-1 --attribute outcome --value outcome-1 --value outcome-2\n",
@@ -90,6 +109,14 @@ fn recall_emits_exact_ranked_blocks_and_honors_limit() {
     );
 
     const UNIQUE_VALUE_COUNT: usize = 901;
+    let mut wide_cues = vec![("batch-symbol".to_owned(), "shared-symbol".to_owned())];
+    wide_cues.extend((0..UNIQUE_VALUE_COUNT).map(|index| {
+        (
+            "batch-symbol".to_owned(),
+            format!("unique-value-{index:04}"),
+        )
+    }));
+    seed_cues(&database, wide_cues);
     let mut wide_input = String::from(
         "--timestamp 12 --attribute batch-symbol --value shared-symbol\n\
          --timestamp 13 --attribute batch-symbol --value shared-symbol --value shared-symbol",
@@ -123,6 +150,15 @@ fn cold_recall_rebuilds_cue_candidates_without_feedback() {
     let directory = TempDir::new().expect("temporary directory");
     let database = directory.path().join("memory.sqlite3");
     init(&database);
+    seed_cues(
+        &database,
+        [
+            ("category", "seven"),
+            ("category", "eight"),
+            ("category", "nine"),
+            ("other", "thirty"),
+        ],
+    );
 
     for (sequence, timestamp, attribute, values) in [
         (0, 1, "category", &["seven", "eight"][..]),

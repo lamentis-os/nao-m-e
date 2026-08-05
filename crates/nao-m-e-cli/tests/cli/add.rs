@@ -6,7 +6,8 @@ use nao_m_e_sqlite::SqliteStore;
 use tempfile::TempDir;
 
 use super::support::{
-    add_minimal, assert_silent_success, cli, failure, init, invoke, success_text,
+    add_minimal, assert_silent_success, check, cli, failure, init, invoke, seed_cues,
+    snapshot_revision, success_text,
 };
 
 fn assert_attribute(store: &SqliteStore, actual: &Attribute, key: &str, values: &[&str]) {
@@ -43,6 +44,20 @@ fn direct_add_outputs_only_the_assigned_sequence_and_quiet_is_silent() {
     let directory = TempDir::new().expect("temporary directory");
     let database = directory.path().join("memory.sqlite3");
     init(&database);
+    seed_cues(
+        &database,
+        [
+            (" Environment ", " CI : Linux "),
+            ("Project", " Nao M E "),
+            ("  OBSERVE: Build  ", " Linux, ARM64 "),
+            ("  OBSERVE: Build  ", "Release Candidate"),
+            (" Execute ", " Cargo Test "),
+            (" Result ", " Pass "),
+            (" Result ", "No Warnings"),
+            ("--quiet", "--many"),
+        ],
+    );
+    let revision_before_rich = snapshot_revision(&database);
 
     let mut rich = cli();
     rich.arg("add")
@@ -78,6 +93,7 @@ fn direct_add_outputs_only_the_assigned_sequence_and_quiet_is_silent() {
         .arg("--value")
         .arg("No Warnings");
     assert_eq!(success_text(invoke(rich, None)), "0\n");
+    assert_eq!(snapshot_revision(&database), revision_before_rich + 1);
     assert_silent_success(add_minimal(&database, 8, true));
     let mut option_like_text = cli();
     option_like_text
@@ -125,6 +141,8 @@ fn direct_add_outputs_only_the_assigned_sequence_and_quiet_is_silent() {
     assert_eq!(atoms[1].id().sequence(), 1);
     assert_minimal_episode(&store, atoms[1], 8);
     assert_attribute(&store, &atoms[2].attributes()[0], "--quiet", &["--many"]);
+    drop(store);
+    assert_silent_success(check(&database));
 }
 
 #[test]
@@ -134,6 +152,7 @@ fn direct_add_round_trips_integer_boundaries() {
     init(&database);
 
     for (sequence, timestamp) in [i64::MIN, i64::MAX].into_iter().enumerate() {
+        seed_cues(&database, [("Boundary", timestamp.to_string())]);
         let mut command = cli();
         command
             .arg("add")
@@ -158,6 +177,7 @@ fn add_defaults_to_current_unix_milliseconds() {
     let directory = TempDir::new().expect("temporary directory");
     let database = directory.path().join("memory.sqlite3");
     init(&database);
+    seed_cues(&database, [("Now", "Default")]);
 
     let before = unix_milliseconds_now();
     let mut command = cli();
@@ -194,6 +214,21 @@ fn many_add_shares_one_default_timestamp_preserves_explicit_values_and_is_atomic
     let directory = TempDir::new().expect("temporary directory");
     let database = directory.path().join("memory.sqlite3");
     init(&database);
+    seed_cues(
+        &database,
+        [
+            ("Attribute-1", "Value-1"),
+            ("Attribute 2", "Value 2"),
+            ("Attribute 2", "Value, 3"),
+            ("Context: Value", "Context Value"),
+            ("Action", "Action Value"),
+            ("Outcome", "Outcome Value"),
+            ("--quiet", "--many"),
+            ("--quiet", "escaped value"),
+            ("--quiet", "quoted \"value\""),
+            ("Attribute-3", "Value-3"),
+        ],
+    );
 
     let input = "# ignored comment\n\n--attribute 'Attribute-1' --value 'Value-1' # trailing comment\r\n  \n--timestamp -3 --attribute \"Attribute 2\" --value 'Value 2' --value 'Value, 3' --attribute 'Context: Value' --value 'Context Value' --attribute Action --value 'Action Value' --attribute Outcome --value 'Outcome Value'\n--attribute '--quiet' --value '--many' --value escaped\\ value --value \"quoted \\\"value\\\"\"\n";
     let before_default = unix_milliseconds_now();
