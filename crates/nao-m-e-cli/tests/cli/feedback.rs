@@ -5,10 +5,12 @@ use nao_m_e_sqlite::SqliteStore;
 use tempfile::TempDir;
 
 use super::support::{
-    add_minimal, assert_silent_success, cli, failure, feedback, init, invoke, recall, success_text,
+    add_minimal, assert_silent_success, cli, failure, feedback, init, invoke, recall, seed_cues,
+    success_text,
 };
 
 fn add_episode(database: &Path, timestamp: i64, attribute: &str, values: &[&str]) {
+    seed_cues(database, values.iter().map(|value| (attribute, *value)));
     let mut command = cli();
     command
         .arg("add")

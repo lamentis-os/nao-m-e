@@ -4,9 +4,9 @@
 
 NAO-M-E is a deterministic Rust kernel for symbolic episode memory. The core
 operates entirely in memory; an optional SQLite adapter provides explicit,
-transactional snapshots, and a small CLI exposes the normal add, recall, and
-feedback workflow. It is a research mechanism rather than an LLM memory
-product.
+transactional snapshots with integrated semantic cue vectors, and a small CLI
+exposes the normal add, recall, and feedback workflow. It is a research
+mechanism rather than an LLM memory product.
 
 ## Model
 
@@ -16,6 +16,8 @@ product.
   only IDs and has no runtime dependencies.
 - SQLite owns one normalized, append-only text catalog and stores compact IDs in
   episode payloads.
+- SQLite stores one fixed-width multilingual-E5 vector for each distinct bound
+  attribute cue `(key, value)` and reuses it across episodes.
 - Source-conditioned recall combines ordinary Jaccard overlap over symbolic
   cues with sparse directed feedback histories.
 - Each feedback relationship retains at most 16 helpful or unhelpful samples.
@@ -101,25 +103,37 @@ fn main() -> Result<(), Box<dyn Error>> {
 `save()` appends only new episodes and reconciles feedback changes without
 rewriting equal rows on the bounded-delta path. New symbols remain staged until
 the same transaction publishes them with the episodes that reference their
-IDs. `open()` validates and reconstructs the complete snapshot before exposing
-memory state. Symbolic-recall cue postings and scores are derived in memory and
-are not stored in the authoritative SQLite database.
+IDs. `open()` validates and reconstructs the complete core snapshot before
+exposing memory state, using bounded operational semantic checks;
+`check()` performs the exhaustive vector and posting audit. The symbolic-recall
+posting cache and scores are still derived in memory and are not persisted.
+Integrated semantic postings are separate V7 projection data and current core
+recall does not read them.
 
-## Semantic cue index
+## Integrated semantic cues
 
-`nao-m-e-semantic-index` is an optional, rebuildable SQLite sidecar for future
-semantic candidate generation. It stores one caller-produced fixed-width
-vector for each distinct bound attribute cue `(key SymbolId, value SymbolId)`
-and postings from those cues to episodes. Repeated cues reuse one vector, while
-the normalized key and value text remains only in the authoritative V6 symbol
-catalog.
+SQLite format V7 stores semantic vectors and their episode postings in the same
+database as symbols, episodes, and feedback. Each distinct normalized bound cue
+`(attribute key, value)` is embedded once and reused by every episode containing
+that pair. The fixed profile is
+[`intfloat/multilingual-e5-small`](https://huggingface.co/intfloat/multilingual-e5-small)
+with 384 signed 16-bit coordinates; model revision, tokenizer, projection,
+pooling, normalization, and quantization are part of the format contract.
+There is no locale setting, language detection, translation, or localized
+execution path. Text from every script passes through the same fixed profile.
 
-The sidecar is bound to one memory and one caller-defined embedding profile.
-It can be created from a committed snapshot and synchronized after new episodes
-are saved. It does not alter the main database, core scoring, or CLI, and it does
-not include a model or semantic recall yet. See the
-[semantic cue index contract](docs/semantic-index-contract.md) for the exact
-format, lifecycle, and failure boundary.
+The embedding runtime is lazy. The first `add` that introduces a new cue
+downloads and verifies the pinned model assets when they are not already in the
+local cache. That operation therefore needs network access and can be much
+slower than later additions. A missing network, corrupt download, model error,
+or invalid vector aborts the complete save. Reused cues, `init`, `check`,
+`recall --from`, and `feedback` do not load the model.
+
+The vectors are an integrated, validated projection of authoritative normalized
+text. They do not change symbolic core scoring, and this version deliberately
+does not provide `recall <TEXT>` or any other semantic-text query. See the
+[semantic cue contract](docs/semantic-contract.md) for the exact model and
+failure boundary.
 
 ## Command-line interface
 
@@ -133,6 +147,7 @@ The complete command surface is:
 
 ```text
 nao-m-e init <DATABASE>
+nao-m-e check <DATABASE>
 nao-m-e add <DATABASE> [--quiet] [--timestamp <UNIX_MS>]
   --attribute <TEXT> --value <TEXT>...
   [--attribute <TEXT> --value <TEXT>...]...
@@ -176,9 +191,10 @@ nao-m-e add incident-memory.sqlite3 \
 # stdout: 1
 ```
 
-Successful `init` and feedback are silent. `add` prints the assigned local
-sequence followed by a newline; `--quiet` suppresses it without changing the
-saved state.
+Successful `init`, `check`, and feedback are silent. `check` performs the full
+read-only database validation without loading the embedding model. `add` prints
+the assigned local sequence followed by a newline; `--quiet` suppresses it
+without changing the saved state.
 
 `add --many` reads one shell-quoted episode flag row per non-empty standard-input
 line. It performs quoting and escaping but no variable, command, or glob
@@ -241,9 +257,9 @@ must resolve an unknown completion state before retrying.
 ## Boundaries
 
 - The core performs no I/O, networking, random recall, embeddings, or LLM calls.
-- SQLite format V6 has no automatic or heuristic migration from V1-V5.
-- Semantic sidecar format V1 is a separate version namespace; it does not make
-  the authoritative SQLite database V7.
+- SQLite format V7 has no automatic or heuristic migration from V1-V6.
+- Semantic cue vectors are integrated into V7. There is no secondary database,
+  synchronization step, caller-defined embedding profile, or repair path.
 - Symbol normalization applies NFKC, Unicode lowercase, NFKC again, and Unicode
   whitespace collapse. Only the normalized value is retained.
 - There is no stemming, fuzzy matching, aliasing, synonym inference, or episode
@@ -252,11 +268,16 @@ must resolve an unknown completion state before retrying.
   read-write even for logically read-only recall.
 - Recall is one-hop and source-conditioned. There is no persistent activation
   vector or global activation ranking.
+- There is no text-query or semantic-vector contribution to recall in this
+  version; the integrated vectors establish the durable cue foundation only.
+- Same-platform encoding is byte-repeatable. Independently generated vectors
+  across supported platforms may differ by at most one `i16` bin per component
+  at cosine similarity `>= 0.999999`; universal byte equality is not promised.
 - Concurrent or stale writers are rejected rather than merged.
 
 See the [core contract](docs/core-contract.md), the
 [SQLite contract](docs/sqlite-contract.md), and the
-[semantic cue index contract](docs/semantic-index-contract.md) for exact
+[semantic cue contract](docs/semantic-contract.md) for exact
 semantics. Generate local API documentation with:
 
 ```sh

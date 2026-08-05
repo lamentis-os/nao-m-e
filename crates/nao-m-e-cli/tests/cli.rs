@@ -13,7 +13,10 @@ mod recall;
 #[path = "cli/support.rs"]
 mod support;
 
-use support::{add_minimal, cli, failure, feedback, init, invoke, recall, success_text};
+use support::{
+    add_minimal, assert_silent_success, check, cli, failure, feedback, init, invoke, recall,
+    success_text,
+};
 
 fn rewrite_format_version(database: &Path, memory_id: [u8; 16], from: u8, to: u8) {
     let mut bytes = fs::read(database).expect("database is readable");
@@ -40,6 +43,7 @@ fn help_version_and_top_level_syntax_have_stable_exit_categories() {
     for arguments in [
         &["--help"][..],
         &["init", "--help"][..],
+        &["check", "--help"][..],
         &["add", "--help"][..],
         &["recall", "--help"][..],
         &["feedback", "--help"][..],
@@ -82,6 +86,35 @@ fn help_version_and_top_level_syntax_have_stable_exit_categories() {
 }
 
 #[test]
+fn check_is_silent_read_only_and_does_not_require_model_assets() {
+    let directory = TempDir::new().expect("temporary directory");
+    let database = directory.path().join("memory.sqlite3");
+    init(&database);
+    let before = fs::read(&database).expect("database is readable");
+
+    let mut command = cli();
+    command
+        .arg("check")
+        .arg(&database)
+        .env("HF_HUB_OFFLINE", "1")
+        .env("HF_HOME", directory.path().join("absent-model-cache"));
+    assert_silent_success(invoke(command, None));
+    assert_eq!(fs::read(&database).unwrap(), before);
+
+    let missing = directory.path().join("missing.sqlite3");
+    let stderr = failure(check(&missing), 1);
+    assert!(stderr.contains("could not check"));
+    assert!(!missing.exists());
+
+    let malformed = directory.path().join("malformed.sqlite3");
+    fs::write(&malformed, b"not a SQLite memory").expect("malformed fixture is written");
+    let malformed_before = fs::read(&malformed).unwrap();
+    let stderr = failure(check(&malformed), 1);
+    assert!(stderr.contains("could not check"));
+    assert_eq!(fs::read(&malformed).unwrap(), malformed_before);
+}
+
+#[test]
 fn init_is_silent_creates_current_format_and_never_clobbers() {
     let directory = TempDir::new().expect("temporary directory");
     let database = directory.path().join("memory.sqlite3");
@@ -108,11 +141,15 @@ fn commands_reject_unsupported_format_before_execution_without_changing_it() {
     let store = SqliteStore::open(&database).expect("created SQLite store opens");
     let memory_id = store.memory_id().to_be_bytes();
     drop(store);
-    rewrite_format_version(&database, memory_id, 6, 7);
+    rewrite_format_version(&database, memory_id, 7, 6);
     let before = fs::read(&database).expect("unsupported-format store is readable");
 
+    let stderr = failure(check(&database), 1);
+    assert!(stderr.contains("unsupported SQLite memory format version 6"));
+    assert_eq!(fs::read(&database).unwrap(), before);
+
     let stderr = failure(recall(&database, 0, None), 1);
-    assert!(stderr.contains("unsupported SQLite memory format version 7"));
+    assert!(stderr.contains("unsupported SQLite memory format version 6"));
     assert_eq!(fs::read(&database).unwrap(), before);
 }
 
@@ -123,6 +160,8 @@ fn malformed_direct_arguments_are_syntax_errors_but_store_errors_are_runtime_err
     init(&database);
 
     let invalid_commands = [
+        vec!["check"],
+        vec!["check", database.to_str().unwrap(), "unexpected"],
         vec!["add", database.to_str().unwrap()],
         vec!["recall", database.to_str().unwrap(), "--limit", "1"],
         vec![
