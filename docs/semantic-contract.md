@@ -59,7 +59,7 @@ Cross-script fixtures only verify that this single path remains stable; they do
 not select localized behavior.
 
 The profile fingerprint stored in `memory_meta` is SHA-256
-`295a32ca1455fd8d81bfd42f4b950b2c0e037b6ab4717656db25d8300c1a6d4e`.
+`1297d8d28c7dbe9c624a13a0afa6bf8aa6eb7a43c3235359089ceed7df1f5b25`.
 It binds these artifacts and the complete preprocessing, pooling,
 normalization, and quantization pipeline. It is a file-format constant, not
 caller configuration. Opening a database with a different fingerprint fails

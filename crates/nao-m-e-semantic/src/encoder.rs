@@ -51,7 +51,6 @@ impl EncoderRuntime {
         for device in environment.devices() {
             if device.ep()? == "CPUExecutionProvider"
                 && device.hardware_device().ty() == DeviceType::CPU
-                && device.hardware_device().id() == 0
                 && cpu_device.replace(device).is_some()
             {
                 return Err(SemanticError::RuntimeConfiguration {

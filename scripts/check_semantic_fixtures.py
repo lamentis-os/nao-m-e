@@ -17,7 +17,7 @@ import sys
 
 MAGIC = b"nao-m-e-e5-fixture-v1\0"
 PROFILE_FINGERPRINT = bytes.fromhex(
-    "295a32ca1455fd8d81bfd42f4b950b2c0e037b6ab4717656db25d8300c1a6d4e"
+    "1297d8d28c7dbe9c624a13a0afa6bf8aa6eb7a43c3235359089ceed7df1f5b25"
 )
 DIMENSIONS = 384
 HEADER_SIZE = len(MAGIC) + 32 + struct.calcsize("<IH")
