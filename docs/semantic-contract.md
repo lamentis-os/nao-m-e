@@ -41,8 +41,8 @@ V7 has exactly one built-in embedding profile:
 - special tokens enabled; maximum input length 512 tokens, with longest-first
   right truncation and zero stride, batch-longest right padding with no
   multiple, `<pad>` token ID `1`, and padding type ID `0`;
-- ONNX Runtime 1.28 through `ort` 2.0.0-rc.13, exclusively bound to device `0`
-  of `CPUExecutionProvider`, level-three graph optimization, sequential
+- ONNX Runtime 1.28 through `ort` 2.0.0-rc.13, exclusively bound to the unique
+  CPU device of `CPUExecutionProvider`, level-three graph optimization, sequential
   execution, one intra-op and one inter-op thread, deterministic compute
   enabled, memory patterns and the CPU arena disabled, environment execution
   providers ignored, and one cue per model invocation;
