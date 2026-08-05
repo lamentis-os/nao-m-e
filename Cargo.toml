@@ -17,7 +17,7 @@ path = "src/lib.rs"
 [workspace]
 members = [
     "crates/nao-m-e-cli",
-    "crates/nao-m-e-semantic-index",
+    "crates/nao-m-e-semantic",
     "crates/nao-m-e-sqlite",
 ]
 resolver = "3"
