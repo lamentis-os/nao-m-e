@@ -1,0 +1,18 @@
+[package]
+name = "nao-m-e-semantic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Deterministic local semantic encoding for nao-m-e"
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+hf-hub = { version = "=1.0.0", default-features = false, features = ["blocking", "rustls-tls"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["api-27", "copy-dylibs", "download-binaries", "std", "tls-rustls"] }
+sha2 = "=0.11.0"
+tokenizers = { version = "=0.23.1", default-features = false, features = ["fancy-regex"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

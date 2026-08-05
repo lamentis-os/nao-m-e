@@ -4,9 +4,9 @@
 
 NAO-M-E is a deterministic Rust kernel for symbolic episode memory. The core
 operates entirely in memory; an optional SQLite adapter provides explicit,
-transactional snapshots, and a small CLI exposes the normal add, recall, and
-feedback workflow. It is a research mechanism rather than an LLM memory
-product.
+transactional snapshots with one mandatory semantic vector per episode, and a
+small CLI exposes add, free-text recall, and feedback. It is a research
+mechanism rather than an LLM memory product.
 
 ## Model
 
@@ -14,10 +14,12 @@ product.
   more set-valued symbolic attributes.
 - Attribute keys and values share one numeric `SymbolId` type. The core stores
   only IDs and has no runtime dependencies.
-- SQLite owns one normalized, append-only text catalog and stores compact IDs in
-  episode payloads.
-- Source-conditioned recall combines ordinary Jaccard overlap over symbolic
-  cues with sparse directed feedback histories.
+- SQLite owns one normalized, append-only text catalog and exactly one
+  fixed-width semantic vector for every committed episode.
+- CLI recall ranks committed episode vectors against one free-text query.
+  Feedback does not affect this semantic ranking.
+- Programmatic `Memory::recall_from` combines ordinary Jaccard overlap over
+  symbolic cues with sparse directed feedback histories.
 - Each feedback relationship retains at most 16 helpful or unhelpful samples.
 - Caller-supplied memory IDs namespace the local atom sequences allocated by a
   memory.
@@ -58,11 +60,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 ```
 
-## SQLite snapshots
+## SQLite V8 snapshots
 
 `nao-m-e-sqlite` owns one logical memory per database. Symbols are normalized
-and staged through the adapter, then published with episodes and feedback by
-one explicit `save()`:
+and staged through the adapter. `save()` encodes every new episode before
+opening a write transaction, then atomically publishes staged symbols, episodes,
+their same-sequence vectors, and feedback changes:
 
 ```rust
 use std::error::Error;
@@ -82,28 +85,43 @@ fn main() -> Result<(), Box<dyn Error>> {
         TimestampMs::new(1_000),
         vec![Attribute::new(symbols[0], vec![symbols[1]])?],
     )?;
-    let source = store.memory_mut().insert_episode(episode.clone())?;
-    let target = store.memory_mut().insert_episode(episode)?;
+    store.memory_mut().insert_episode(episode)?;
     store.save()?;
 
-    let memory_id = store.memory_id();
     drop(store);
-
-    let reopened = SqliteStore::open(path)?;
-    assert_eq!(reopened.memory_id(), memory_id);
-    let hits = reopened.memory().recall_from(source, 1)?;
-    assert_eq!(hits[0].atom_id, target);
-    assert_eq!(hits[0].activation.as_ppm(), 400_000);
+    assert_eq!(SqliteStore::open(path)?.memory().episodes().len(), 1);
     Ok(())
 }
 ```
 
-`save()` appends only new episodes and reconciles feedback changes without
-rewriting equal rows on the bounded-delta path. New symbols remain staged until
-the same transaction publishes them with the episodes that reference their
-IDs. `open()` validates and reconstructs the complete snapshot before exposing
-memory state. Cue postings and recall scores are derived in memory and are not
-stored in SQLite.
+A failed preparation or transaction leaves the previous database snapshot
+authoritative. `open()` validates and reconstructs the complete core snapshot;
+`check()` performs a physically read-only exhaustive vector audit. The core's
+symbolic cue postings are derived in memory and are not persisted.
+
+## Semantic episode recall
+
+SQLite V8 builds each episode vector from all normalized bound
+`(attribute key, value)` pairs. Equal episode text still receives one vector per
+episode sequence. The fixed profile is
+[`intfloat/multilingual-e5-small`](https://huggingface.co/intfloat/multilingual-e5-small)
+with 384 signed 16-bit coordinates; its model revision, tokenizer, projection,
+pooling, normalization, quantization, and fingerprint are format constants.
+
+The pinned model and tokenizer are installation prerequisites. Runtime commands
+use the local Hugging Face cache only and never download or repair assets. The
+first episode encoding or positive-limit query against a non-empty store in a
+process verifies the exact cached assets and loads the model lazily; `init` and
+`check` do not load it. Missing, invalid, or unusable assets fail clearly without
+a partial save or symbolic fallback.
+
+The model path is language-agnostic. It performs no language detection, routing,
+translation, locale selection, or language-specific scoring. Semantic recall is
+an exact scan of committed vectors with positive integer cosine scores, ordered
+by score and then atom ID. Pending episodes and feedback do not contribute.
+
+See the [semantic episode contract](docs/semantic-contract.md) for the exact
+projection, runtime, scoring, and failure boundaries.
 
 ## Command-line interface
 
@@ -113,136 +131,90 @@ Install the workspace binary from a checkout:
 cargo install --locked --path crates/nao-m-e-cli
 ```
 
+Provision the pinned model and tokenizer in the local Hugging Face cache before
+adding an episode or running a positive-limit query against a non-empty store.
+This repository does not define an installer.
+
 The complete command surface is:
 
 ```text
 nao-m-e init <DATABASE>
+nao-m-e check <DATABASE>
 nao-m-e add <DATABASE> [--quiet] [--timestamp <UNIX_MS>]
   --attribute <TEXT> --value <TEXT>...
   [--attribute <TEXT> --value <TEXT>...]...
 nao-m-e add <DATABASE> --many [--quiet]
-nao-m-e recall <DATABASE> --from <SEQUENCE> [--limit <N>]
+nao-m-e recall <DATABASE> --query <TEXT> [--limit <N>]
 nao-m-e feedback <DATABASE> --from <SEQUENCE> --helpful <SEQUENCE,...>
 nao-m-e feedback <DATABASE> --from <SEQUENCE> --unhelpful <SEQUENCE,...>
 ```
 
-`UNIX_MS` is a signed decimal count of milliseconds since
-`1970-01-01T00:00:00Z`. Omitting it records the current system time. All missing
-timestamps within one command receive the same value. Unix time is independent
-of local time zones and daylight-saving transitions, but system time is not
-guaranteed to be monotonic; the episode sequence is the canonical insertion
-order.
-
-Each `--attribute` requires at least one immediately following `--value`.
-Attributes and values are text; quote shell values containing spaces. Text that
-looks numeric or option-like remains text when supplied as the required
-argument, for example `--attribute --quiet --value --many`.
-
-Create a store and add two episodes:
+A minimal workflow is:
 
 ```sh
 nao-m-e init incident-memory.sqlite3
 
 nao-m-e add incident-memory.sqlite3 \
   --timestamp 1785596400000 \
-  --attribute repository \
-  --value nao-m-e \
-  --attribute "build status" \
-  --value failed
+  --attribute repository --value nao-m-e \
+  --attribute "build status" --value failed
 # stdout: 0
 
 nao-m-e add incident-memory.sqlite3 \
   --timestamp 1785596460000 \
-  --attribute repository \
-  --value nao-m-e \
-  --attribute "incident status" \
-  --value open
+  --attribute repository --value nao-m-e \
+  --attribute "incident status" --value open
 # stdout: 1
+
+nao-m-e recall incident-memory.sqlite3 \
+  --query "open nao-m-e incident" --limit 5
+
+nao-m-e feedback incident-memory.sqlite3 --from 0 --helpful 1
+nao-m-e check incident-memory.sqlite3
 ```
 
-Successful `init` and feedback are silent. `add` prints the assigned local
-sequence followed by a newline; `--quiet` suppresses it without changing the
-saved state.
+Every singular or batch add calls `save()` exactly once, so all normalized
+symbols, episodes, and mandatory vectors commit together or none do. `add
+--many` reads one shell-quoted episode flag row per non-empty standard-input
+line and parses the complete input before opening the store. `--timestamp` is a
+signed decimal Unix-millisecond value; omitting it uses the current system time.
 
-`add --many` reads one shell-quoted episode flag row per non-empty standard-input
-line. It performs quoting and escaping but no variable, command, or glob
-expansion; an unquoted `#` begins a comment. The complete input is parsed before
-the store is opened, then all symbols and episodes are committed by exactly one
-save or none are committed:
-
-```sh
-printf '%s\n' \
-  '--timestamp 1785596520000 --attribute "build status" --value queued' \
-  '--attribute "build status" --value running --attribute command --value "cargo test"' \
-  | nao-m-e add incident-memory.sqlite3 --many
-# stdout:
-# 2
-# 3
-```
-
-Recall is read-only and defaults to ten hits. Every hit uses this deterministic
-line grammar, with one blank line between hit blocks:
-
-```sh
-nao-m-e recall incident-memory.sqlite3 --from 0 --limit 5
-```
+Recall is logically read-only and defaults to ten hits. Hits are ordered by
+semantic score descending and then atom ID ascending. Each uses this line
+grammar, with one blank line between blocks:
 
 ```text
-sequence 1
-activation_ppm 133333
-timestamp 1785596460000
-attribute repository
-value nao-m-e
-attribute incident status
-value open
+sequence <SEQUENCE>
+activation_ppm <POSITIVE_PPM>
+timestamp <UNIX_MS>
+attribute <NORMALIZED_KEY>
+value <NORMALIZED_VALUE>
 ```
 
-The two episodes share the three cues produced by `repository = {nao-m-e}`.
-Each also has three distinct cues, so ordinary Jaccard projection is
-`floor(3 * 400000 / 9) = 133333` ppm. Attribute order is canonical numeric-ID
-order, not input or lexical order. A recall with no hits writes zero bytes and
-does not save or mutate the database.
-
-One helpful assessment adds the first learned contribution of `71,875 ppm`:
-
-```sh
-nao-m-e feedback incident-memory.sqlite3 --from 0 --helpful 1
-nao-m-e recall incident-memory.sqlite3 --from 0 --limit 5
-```
-
-The hit content is unchanged and its score becomes `205208`. Repeated helpful
-or unhelpful feedback updates the bounded 16-sample history. Positive learned
-feedback can introduce a target with no shared cues; negative feedback can
-suppress a structural match. Feedback changes retrieval accessibility, not
-truth or confidence, and never runs recall implicitly.
-
-Errors detected before a command commits leave standard output empty. Exit code
-`2` denotes invalid CLI syntax; model, store, input, and output failures use exit
-code `1`. Add sequences are emitted after the save commits, so a later output
-failure cannot roll back the append. Add and feedback are not idempotent; callers
-must resolve an unknown completion state before retrying.
+A recall with no hits writes zero bytes. Feedback updates the bounded history
+used by programmatic `Memory::recall_from`; CLI semantic recall ignores it.
+Successful `init`, `check`, and feedback are silent. Exit code `2` denotes
+invalid CLI syntax; model, store, input, and output failures use exit code `1`.
 
 ## Boundaries
 
 - The core performs no I/O, networking, random recall, embeddings, or LLM calls.
-- SQLite format V6 has no automatic or heuristic migration from V1-V5.
+- SQLite format V8 rejects V1-V7 without automatic or heuristic migration.
+- Episode vectors are mandatory V8 rows. There is no secondary semantic index
+  or database, synchronization step, caller-defined profile, runtime download,
+  or repair path.
 - Symbol normalization applies NFKC, Unicode lowercase, NFKC again, and Unicode
   whitespace collapse. Only the normalized value is retained.
-- There is no stemming, fuzzy matching, aliasing, synonym inference, or episode
-  deduplication.
-- Every CLI process reconstructs the complete snapshot. The adapter opens
-  read-write even for logically read-only recall.
-- Recall is one-hop and source-conditioned. There is no persistent activation
-  vector or global activation ranking.
+- There is no stemming, fuzzy matching, aliasing, synonym inference, episode
+  deduplication, symbolic-semantic score fusion, or approximate vector index.
+- CLI recall accepts free text only. Programmatic core recall remains one-hop
+  and source-conditioned, with explicit feedback and no persistent activation
+  vector.
 - Concurrent or stale writers are rejected rather than merged.
 
-See the [core contract](docs/core-contract.md) and the
-[SQLite contract](docs/sqlite-contract.md) for exact semantics. Generate local
-API documentation with:
-
-```sh
-cargo doc --workspace --no-deps --all-features --locked --open
-```
+See the [core contract](docs/core-contract.md), the
+[SQLite contract](docs/sqlite-contract.md), and the
+[semantic episode contract](docs/semantic-contract.md) for exact semantics.
 
 ## Development
 
@@ -252,7 +224,12 @@ Run the primary local test suite with:
 cargo test --workspace --all-targets --all-features --locked --no-fail-fast
 ```
 
-Repository rules and the complete gate list are in `AGENTS.md`.
+Repository rules and the complete gate list are in `AGENTS.md`. Generate local
+API documentation with:
+
+```sh
+cargo doc --workspace --no-deps --all-features --locked --open
+```
 
 ## License
 

@@ -2,6 +2,8 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
+use rusqlite::Connection;
+
 pub(super) fn cli() -> Command {
     Command::new(env!("CARGO_BIN_EXE_nao-m-e"))
 }
@@ -53,30 +55,30 @@ pub(super) fn init(database: &Path) {
     assert_silent_success(invoke(command, None));
 }
 
-pub(super) fn add_minimal(database: &Path, seed: i64, quiet: bool) -> Output {
+pub(super) fn check(database: &Path) -> Output {
     let mut command = cli();
-    command
-        .arg("add")
-        .arg(database)
-        .arg("--timestamp")
-        .arg(seed.to_string())
-        .arg("--attribute")
-        .arg(format!("attribute-{seed}"))
-        .arg("--value")
-        .arg(format!("value-{seed}"));
-    if quiet {
-        command.arg("--quiet");
-    }
+    command.arg("check").arg(database);
     invoke(command, None)
 }
 
-pub(super) fn recall(database: &Path, source: u64, limit: Option<usize>) -> Output {
+pub(super) fn snapshot_revision(database: &Path) -> i64 {
+    Connection::open(database)
+        .expect("fixture database opens for revision lookup")
+        .query_row(
+            "SELECT snapshot_revision FROM memory_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("snapshot revision exists")
+}
+
+pub(super) fn semantic_recall(database: &Path, query: &str, limit: Option<usize>) -> Output {
     let mut command = cli();
     command
         .arg("recall")
         .arg(database)
-        .arg("--from")
-        .arg(source.to_string());
+        .arg("--query")
+        .arg(query);
     if let Some(limit) = limit {
         command.arg("--limit").arg(limit.to_string());
     }

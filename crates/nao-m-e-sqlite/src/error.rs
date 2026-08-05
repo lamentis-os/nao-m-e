@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-/// Failure while creating, opening, or saving a SQLite memory store.
+/// Failure while operating on a SQLite memory store.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum StoreError {
@@ -29,8 +29,23 @@ pub enum StoreError {
         /// Violated value invariant.
         detail: &'static str,
     },
+    /// A caller-supplied semantic query cannot be normalized.
+    InvalidSemanticQuery {
+        /// Violated query invariant.
+        detail: &'static str,
+    },
     /// The symbol catalog has assigned every unsigned 64-bit identifier.
     SymbolIdExhausted,
+    /// The configured semantic encoder could not produce a canonical episode vector.
+    SemanticEncoding {
+        /// Encoder or vector validation diagnostic.
+        detail: String,
+    },
+    /// The configured semantic encoder could not encode a retrieval query.
+    SemanticQueryEncoding {
+        /// Encoder diagnostic.
+        detail: String,
+    },
     /// A caller referred to an identifier absent from the symbol catalog.
     UnknownSymbolId {
         /// Missing unsigned identifier.
@@ -58,7 +73,16 @@ impl fmt::Display for StoreError {
             Self::InvalidSymbolValue { index, detail } => {
                 write!(formatter, "invalid symbol at batch index {index}: {detail}")
             }
+            Self::InvalidSemanticQuery { detail } => {
+                write!(formatter, "invalid semantic query: {detail}")
+            }
             Self::SymbolIdExhausted => formatter.write_str("symbol identifier space is exhausted"),
+            Self::SemanticEncoding { detail } => {
+                write!(formatter, "semantic episode encoding failed: {detail}")
+            }
+            Self::SemanticQueryEncoding { detail } => {
+                write!(formatter, "semantic query encoding failed: {detail}")
+            }
             Self::UnknownSymbolId { id } => {
                 write!(formatter, "unknown symbol identifier {id}")
             }
@@ -76,7 +100,10 @@ impl Error for StoreError {
             Self::ConcurrentModification { .. }
             | Self::RevisionExhausted
             | Self::InvalidSymbolValue { .. }
+            | Self::InvalidSemanticQuery { .. }
             | Self::SymbolIdExhausted
+            | Self::SemanticEncoding { .. }
+            | Self::SemanticQueryEncoding { .. }
             | Self::UnknownSymbolId { .. } => None,
         }
     }
@@ -106,7 +133,7 @@ impl From<StoreIntegrityError> for StoreError {
     }
 }
 
-/// Persisted-data violation detected while opening or saving a store.
+/// Persisted-data violation detected while operating on a store.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum StoreIntegrityError {
@@ -125,6 +152,16 @@ pub enum StoreIntegrityError {
     /// SQLite's structural quick check did not report `ok`.
     QuickCheckFailed {
         /// Diagnostic returned by SQLite.
+        detail: String,
+    },
+    /// SQLite's complete integrity check did not report `ok`.
+    IntegrityCheckFailed {
+        /// Diagnostic returned by SQLite.
+        detail: String,
+    },
+    /// SQLite reported one or more foreign-key violations.
+    ForeignKeyCheckFailed {
+        /// Compact diagnostics returned by SQLite.
         detail: String,
     },
     /// A column did not contain its canonical fixed-width encoding.
@@ -154,6 +191,20 @@ pub enum StoreIntegrityError {
         expected: u64,
         /// Identifier read from the database.
         found: u64,
+    },
+    /// Episode-vector sequences do not form the exact prefix `0..N`.
+    NonContiguousEpisodeVector {
+        /// Episode sequence required at this position.
+        expected: u64,
+        /// Episode sequence read from the database.
+        found: u64,
+    },
+    /// A persisted episode vector is invalid.
+    InvalidEpisodeVector {
+        /// Sequence of the affected episode when it could be decoded.
+        sequence: u64,
+        /// Violated vector invariant.
+        detail: &'static str,
     },
     /// A persisted symbol value is not canonical.
     InvalidSymbol {
@@ -196,6 +247,12 @@ impl fmt::Display for StoreIntegrityError {
             Self::QuickCheckFailed { detail } => {
                 write!(formatter, "SQLite quick check failed: {detail}")
             }
+            Self::IntegrityCheckFailed { detail } => {
+                write!(formatter, "SQLite integrity check failed: {detail}")
+            }
+            Self::ForeignKeyCheckFailed { detail } => {
+                write!(formatter, "SQLite foreign-key check failed: {detail}")
+            }
             Self::InvalidEncoding { table, column } => {
                 write!(formatter, "invalid encoding in {table}.{column}")
             }
@@ -209,6 +266,16 @@ impl fmt::Display for StoreIntegrityError {
                 formatter,
                 "expected symbol identifier {expected}, found {found}",
             ),
+            Self::NonContiguousEpisodeVector { expected, found } => write!(
+                formatter,
+                "expected episode vector sequence {expected}, found {found}",
+            ),
+            Self::InvalidEpisodeVector { sequence, detail } => {
+                write!(
+                    formatter,
+                    "invalid semantic vector for episode {sequence}: {detail}"
+                )
+            }
             Self::InvalidSymbol { id, detail } => {
                 write!(formatter, "invalid symbol {id}: {detail}")
             }

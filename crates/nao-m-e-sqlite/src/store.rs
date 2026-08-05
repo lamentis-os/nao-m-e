@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use nao_m_e::{AtomId, Memory, MemoryId};
+use nao_m_e_semantic::{E5_SMALL_PROFILE, SemanticEncoder};
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior};
 
@@ -8,6 +9,8 @@ use crate::error::{StoreError, StoreIntegrityError};
 use crate::format;
 
 mod feedback;
+mod semantic;
+mod semantic_recall;
 mod symbols;
 
 /// An explicitly saved SQLite database and its owned in-memory state.
@@ -20,6 +23,8 @@ pub struct SqliteStore {
     persisted_episode_count: usize,
     expected_revision: i64,
     symbols: symbols::SymbolState,
+    semantic: semantic::SemanticState,
+    encoder: SemanticEncoder,
 }
 
 impl SqliteStore {
@@ -58,7 +63,34 @@ impl SqliteStore {
             persisted_episode_count: loaded.episode_count,
             expected_revision: loaded.revision,
             symbols: loaded.symbols,
+            semantic: semantic::SemanticState::new(),
+            encoder: SemanticEncoder::new(),
         })
+    }
+
+    /// Performs a complete, physically read-only integrity audit.
+    ///
+    /// Unlike [`Self::open`], this scans the complete SQLite file, all foreign
+    /// keys, and every mandatory episode vector.
+    /// The semantic model is neither resolved nor loaded.
+    pub fn check(path: impl AsRef<Path>) -> Result<(), StoreError> {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY;
+        let mut connection = Connection::open_with_flags(path, flags)?;
+        format::configure_session(&connection)?;
+        verify_application_id(&connection)?;
+        verify_format_version(&connection)?;
+        format::verify_durability(&connection)?;
+        let transaction = connection.transaction()?;
+        verify_application_id(&transaction)?;
+        verify_format_version(&transaction)?;
+        verify_integrity_check(&transaction)?;
+        verify_foreign_keys(&transaction)?;
+        let (memory_id, revision) = read_metadata(&transaction)?;
+        verify_schema(&transaction)?;
+        let loaded = reconstruct_snapshot(&transaction, memory_id, revision)?;
+        semantic::full_audit(&transaction, loaded.episode_count)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Returns the durable identifier of the owned logical memory.
@@ -80,18 +112,57 @@ impl SqliteStore {
         &mut self.memory
     }
 
+    /// Ranks committed episodes against one semantic free-text query.
+    ///
+    /// The query and every episode vector use the fixed local semantic profile.
+    /// Recall streams the committed vectors, keeps positive integer cosine
+    /// scores, and orders ties by atom identifier. It does not change the
+    /// database, snapshot revision, episodes, or feedback. Pending unsaved
+    /// episodes are deliberately absent, and feedback does not affect ranking.
+    /// A zero limit still validates the query but avoids model and vector work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the query cannot be normalized, model inference
+    /// fails, the store changes concurrently, or accessed semantic data is
+    /// invalid.
+    pub fn recall_semantic(
+        &mut self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<nao_m_e::RecallHit>, StoreError> {
+        let mut encoder = std::mem::take(&mut self.encoder);
+        let result = semantic_recall::recall(self, &mut encoder, query, limit);
+        self.encoder = encoder;
+        result
+    }
+
     /// Atomically persists newly appended episodes and feedback changes.
     ///
     /// A stale store session is rejected instead of overwriting a later
     /// snapshot. On every error, the previous database snapshot remains
     /// committed while the in-memory changes remain available to the caller.
     pub fn save(&mut self) -> Result<(), StoreError> {
+        let mut encoder = std::mem::take(&mut self.encoder);
+        let result = self.save_with_encoder(&mut encoder);
+        self.encoder = encoder;
+        result
+    }
+
+    fn save_with_encoder<E: semantic::EpisodeEncoder>(
+        &mut self,
+        encoder: &mut E,
+    ) -> Result<(), StoreError> {
+        semantic::prepare(self, encoder)?;
+
         let Self {
             connection,
             memory,
             persisted_episode_count,
             expected_revision,
             symbols,
+            semantic,
+            encoder: _,
         } = self;
 
         let episode_count = memory.episodes().len();
@@ -124,11 +195,13 @@ impl SqliteStore {
         }
         verify_persisted_tail(&transaction, *persisted_episode_count)?;
         symbols::verify_symbol_tail(&transaction, symbols)?;
-        symbols::validate_new_episode_symbols(memory, *persisted_episode_count, symbols)?;
+        semantic::verify_tail(&transaction, *persisted_episode_count)?;
 
         let next_revision = actual_revision + 1;
         let changed = transaction.execute(
-            "UPDATE memory_meta SET snapshot_revision = ?1 WHERE singleton = 1",
+            "UPDATE memory_meta
+             SET snapshot_revision = ?1
+             WHERE singleton = 1",
             [next_revision],
         )?;
         if changed != 1 {
@@ -140,12 +213,14 @@ impl SqliteStore {
 
         symbols::insert_pending_symbols(&transaction, symbols)?;
         append_episodes(&transaction, memory, *persisted_episode_count)?;
+        semantic::insert_pending_vectors(&transaction, semantic, *persisted_episode_count)?;
         feedback::reconcile(&transaction, memory, *persisted_episode_count)?;
         transaction.commit()?;
 
         *expected_revision = next_revision;
         *persisted_episode_count = episode_count;
         symbols.mark_saved();
+        semantic.mark_saved();
         Ok(())
     }
 }
@@ -177,7 +252,7 @@ fn build_initial_database(
     let mut connection = Connection::open_with_flags(staging.path(), flags)?;
     format::configure_session(&connection)?;
     format::configure_durability(&connection)?;
-    format::create_schema(&mut connection, memory_id)?;
+    format::create_schema(&mut connection, memory_id, &E5_SMALL_PROFILE.fingerprint())?;
     let loaded = load_memory(&mut connection)?;
     if loaded.memory.memory_id() != memory_id
         || loaded.episode_count != 0
@@ -205,15 +280,35 @@ struct LoadedStore {
 
 fn load_memory(connection: &mut Connection) -> Result<LoadedStore, StoreError> {
     let transaction = connection.transaction()?;
-    verify_application_id(&transaction)?;
-    let (memory_id, revision) = read_metadata(&transaction)?;
-    verify_schema(&transaction)?;
-    verify_quick_check(&transaction)?;
-    let symbols = symbols::validate_symbol_catalog(&transaction)?;
-    let mut memory = reconstruct_memory(&transaction, memory_id, &symbols)?;
-    feedback::restore(&transaction, &mut memory)?;
-    let episode_count = memory.episodes().len();
+    let loaded = load_snapshot(&transaction)?;
     transaction.commit()?;
+    Ok(loaded)
+}
+
+fn load_snapshot(connection: &Connection) -> Result<LoadedStore, StoreError> {
+    let (memory_id, revision) = validate_snapshot_header(connection)?;
+    verify_quick_check(connection)?;
+    let loaded = reconstruct_snapshot(connection, memory_id, revision)?;
+    semantic::verify_tail(connection, loaded.episode_count)?;
+    Ok(loaded)
+}
+
+fn validate_snapshot_header(connection: &Connection) -> Result<(MemoryId, i64), StoreError> {
+    verify_application_id(connection)?;
+    let (memory_id, revision) = read_metadata(connection)?;
+    verify_schema(connection)?;
+    Ok((memory_id, revision))
+}
+
+fn reconstruct_snapshot(
+    connection: &Connection,
+    memory_id: MemoryId,
+    revision: i64,
+) -> Result<LoadedStore, StoreError> {
+    let symbols = symbols::validate_symbol_catalog(connection)?;
+    let mut memory = reconstruct_memory(connection, memory_id, &symbols)?;
+    feedback::restore(connection, &mut memory)?;
+    let episode_count = memory.episodes().len();
     Ok(LoadedStore {
         memory,
         episode_count,
@@ -262,13 +357,18 @@ fn verify_schema(connection: &Connection) -> Result<(), StoreError> {
 }
 
 fn verify_quick_check(connection: &Connection) -> Result<(), StoreError> {
-    let mut statement = connection.prepare("PRAGMA quick_check")?;
-    let mut rows = statement.query([])?;
     let mut diagnostics = Vec::new();
-    while let Some(row) = rows.next()? {
-        diagnostics.push(row.get::<_, String>(0)?);
+    for table in ["memory_meta", "symbols", "episodes", "feedback_edges"] {
+        let mut statement = connection.prepare(&format!("PRAGMA quick_check({table})"))?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let diagnostic = row.get::<_, String>(0)?;
+            if diagnostic != "ok" {
+                diagnostics.push(format!("{table}: {diagnostic}"));
+            }
+        }
     }
-    if diagnostics.len() == 1 && diagnostics[0] == "ok" {
+    if diagnostics.is_empty() {
         return Ok(());
     }
     Err(StoreIntegrityError::QuickCheckFailed {
@@ -277,9 +377,45 @@ fn verify_quick_check(connection: &Connection) -> Result<(), StoreError> {
     .into())
 }
 
+fn verify_integrity_check(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection.prepare("PRAGMA integrity_check")?;
+    let mut rows = statement.query([])?;
+    let mut diagnostics = Vec::new();
+    while let Some(row) = rows.next()? {
+        diagnostics.push(row.get::<_, String>(0)?);
+    }
+    if diagnostics.len() == 1 && diagnostics[0] == "ok" {
+        Ok(())
+    } else {
+        Err(StoreIntegrityError::IntegrityCheckFailed {
+            detail: diagnostics.join("; "),
+        }
+        .into())
+    }
+}
+
+fn verify_foreign_keys(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
+    let mut rows = statement.query([])?;
+    if let Some(row) = rows.next()? {
+        return Err(StoreIntegrityError::ForeignKeyCheckFailed {
+            detail: format!(
+                "{} row {} references {}",
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?
+                    .map_or_else(|| "without rowid".to_owned(), |value| value.to_string()),
+                row.get::<_, String>(2)?,
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn read_metadata(connection: &Connection) -> Result<(MemoryId, i64), StoreError> {
     let mut statement = connection.prepare(
-        "SELECT singleton, format_version, memory_id, snapshot_revision
+        "SELECT singleton, format_version, memory_id, snapshot_revision,
+                semantic_profile_fingerprint
          FROM memory_meta",
     )?;
     let mut rows = statement.query([])?;
@@ -302,6 +438,19 @@ fn read_metadata(connection: &Connection) -> Result<(MemoryId, i64), StoreError>
     }
     let memory_id = read_memory_id(row, 2, "memory_meta", "memory_id")?;
     let revision = read_integer(row, 3, "memory_meta", "snapshot_revision")?;
+    let ValueRef::Blob(fingerprint) = row.get_ref(4)? else {
+        return Err(StoreIntegrityError::InvalidEncoding {
+            table: "memory_meta",
+            column: "semantic_profile_fingerprint",
+        }
+        .into());
+    };
+    if fingerprint != E5_SMALL_PROFILE.fingerprint() {
+        return Err(StoreIntegrityError::InvalidMetadata {
+            detail: "semantic profile fingerprint differs from SQLite format V8",
+        }
+        .into());
+    }
     if rows.next()?.is_some() {
         return Err(StoreIntegrityError::InvalidMetadata {
             detail: "multiple metadata rows",

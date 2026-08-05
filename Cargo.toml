@@ -15,7 +15,11 @@ path = "src/lib.rs"
 [dependencies]
 
 [workspace]
-members = ["crates/nao-m-e-cli", "crates/nao-m-e-sqlite"]
+members = [
+    "crates/nao-m-e-cli",
+    "crates/nao-m-e-semantic",
+    "crates/nao-m-e-sqlite",
+]
 resolver = "3"
 
 [workspace.package]

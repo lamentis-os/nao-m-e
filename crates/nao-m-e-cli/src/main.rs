@@ -16,27 +16,42 @@ const ROOT_HELP: &str = "NAO-M-E symbolic memory command-line interface
 
 Usage:
   nao-m-e init <DATABASE>
+  nao-m-e check <DATABASE>
   nao-m-e add <DATABASE> [--quiet] [--timestamp <UNIX_MS>] --attribute <TEXT> --value <TEXT>... [ATTRIBUTE OPTIONS]
   nao-m-e add <DATABASE> --many [--quiet]
-  nao-m-e recall <DATABASE> --from <SEQUENCE> [--limit <N>]
+  nao-m-e recall <DATABASE> --query <TEXT> [--limit <N>]
   nao-m-e feedback <DATABASE> --from <SEQUENCE> --helpful <SEQUENCE,...>
   nao-m-e feedback <DATABASE> --from <SEQUENCE> --unhelpful <SEQUENCE,...>
 
 Commands:
   init      Create a new SQLite memory store without replacing an existing file
+  check     Validate an existing SQLite memory store read-only
   add       Append one episode, or atomic line-delimited episodes with --many
-  recall    Rank cue-derived and learned source-conditioned episodes read-only
+  recall    Rank episodes for one semantic free-text query read-only
   feedback  Learn from one explicit helpful or unhelpful target set
 
 Options:
   -h, --help     Show help
   --version      Show the CLI version
+
+Pinned semantic model assets are an installation prerequisite. Commands that
+perform semantic encoding verify and use the local artifacts but never download
+them.
 ";
 
 const INIT_HELP: &str = "Create a new SQLite memory store.
 
 Usage:
   nao-m-e init <DATABASE>
+";
+
+const CHECK_HELP: &str = "Validate an existing SQLite memory store read-only.
+
+Usage:
+  nao-m-e check <DATABASE>
+
+Successful validation produces no standard output and never loads the embedding
+model. Invalid stores fail without changing the database.
 ";
 
 const FEEDBACK_HELP: &str = "Learn from one explicit binary assessment and save atomically.
@@ -83,6 +98,9 @@ enum Command {
     Init {
         database: PathBuf,
     },
+    Check {
+        database: PathBuf,
+    },
     Add {
         database: PathBuf,
         draft: Box<add::TextEpisodeDraft>,
@@ -94,7 +112,7 @@ enum Command {
     },
     Recall {
         database: PathBuf,
-        source_sequence: u64,
+        query: String,
         limit: usize,
     },
     Feedback {
@@ -117,6 +135,7 @@ fn parse_args(args: Vec<OsString>) -> Result<ParsedArgs, String> {
             env!("CARGO_PKG_VERSION")
         ))),
         "init" => parse_init_args(&args[1..]),
+        "check" => parse_check_args(&args[1..]),
         "add" => add::parse_args(&args[1..]),
         "recall" => recall::parse_args(&args[1..]),
         "feedback" => parse_feedback_args(&args[1..]),
@@ -133,6 +152,19 @@ fn parse_init_args(args: &[OsString]) -> Result<ParsedArgs, String> {
     }
 
     Ok(ParsedArgs::Execute(Command::Init {
+        database: PathBuf::from(&args[0]),
+    }))
+}
+
+fn parse_check_args(args: &[OsString]) -> Result<ParsedArgs, String> {
+    if is_help_request(args) {
+        return Ok(ParsedArgs::Print(CHECK_HELP.to_owned()));
+    }
+    if args.len() != 1 {
+        return Err("`check` requires exactly one database path".to_owned());
+    }
+
+    Ok(ParsedArgs::Execute(Command::Check {
         database: PathBuf::from(&args[0]),
     }))
 }
@@ -200,6 +232,7 @@ where
 fn execute(command: Command) -> CliResult<Vec<u8>> {
     match command {
         Command::Init { database } => execute_init(&database),
+        Command::Check { database } => execute_check(&database),
         Command::Add {
             database,
             draft,
@@ -211,9 +244,9 @@ fn execute(command: Command) -> CliResult<Vec<u8>> {
         }
         Command::Recall {
             database,
-            source_sequence,
+            query,
             limit,
-        } => recall::execute(&database, source_sequence, limit),
+        } => recall::execute(&database, &query, limit),
         Command::Feedback {
             database,
             source_sequence,
@@ -226,6 +259,12 @@ fn execute(command: Command) -> CliResult<Vec<u8>> {
 fn execute_init(database: &Path) -> CliResult<Vec<u8>> {
     SqliteStore::create(database)
         .map_err(|error| format!("could not create `{}`: {error}", database.display()))?;
+    Ok(Vec::new())
+}
+
+fn execute_check(database: &Path) -> CliResult<Vec<u8>> {
+    SqliteStore::check(database)
+        .map_err(|error| format!("could not check `{}`: {error}", database.display()))?;
     Ok(Vec::new())
 }
 

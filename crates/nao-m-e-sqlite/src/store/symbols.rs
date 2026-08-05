@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use nao_m_e::{EpisodeDraft, Memory, SymbolId};
+use nao_m_e::{EpisodeDraft, SymbolId};
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params_from_iter};
 use unicode_normalization::UnicodeNormalization;
@@ -77,11 +77,11 @@ impl SymbolState {
         }
     }
 
-    fn contains_persisted(&self, id: u64) -> bool {
+    pub(super) fn contains_persisted(&self, id: u64) -> bool {
         self.persisted_tail.is_some_and(|tail| id <= tail)
     }
 
-    const fn contains_current(&self, id: u64) -> bool {
+    pub(super) const fn contains_current(&self, id: u64) -> bool {
         self.next_id.contains(id)
     }
 
@@ -299,6 +299,12 @@ fn normalize_symbol(value: &str) -> Result<String, SymbolValueError> {
         return Err(SymbolValueError::Empty);
     }
     Ok(normalized)
+}
+
+pub(super) fn normalize_query(value: &str) -> Result<String, StoreError> {
+    normalize_symbol(value).map_err(|error| StoreError::InvalidSemanticQuery {
+        detail: error.detail(),
+    })
 }
 
 fn unicode_lowercase(character: char) -> impl Iterator<Item = char> {
@@ -607,30 +613,6 @@ pub(super) fn validate_persisted_episode_symbols(
                 detail: "attribute value identifier is absent from the symbol catalog",
             }
             .into());
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn validate_new_episode_symbols(
-    memory: &Memory,
-    start: usize,
-    symbols: &SymbolState,
-) -> Result<(), StoreError> {
-    for atom in memory.episodes().skip(start) {
-        for attribute in atom.attributes() {
-            let key = attribute.key().get();
-            if !symbols.contains_current(key) {
-                return Err(StoreError::UnknownSymbolId { id: key });
-            }
-            if let Some(value) = attribute
-                .values()
-                .iter()
-                .map(|value| value.get())
-                .find(|&value| !symbols.contains_current(value))
-            {
-                return Err(StoreError::UnknownSymbolId { id: value });
-            }
         }
     }
     Ok(())
