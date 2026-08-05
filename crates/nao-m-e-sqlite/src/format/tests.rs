@@ -1,5 +1,7 @@
 use super::*;
 
+const TEST_PROFILE: [u8; 32] = [7; 32];
+
 fn open_temporary_database() -> (tempfile::TempDir, Connection) {
     let directory = tempfile::tempdir().expect("temporary directory is available");
     let connection =
@@ -42,7 +44,7 @@ fn schema_creation_commits_current_format_identity_and_closed_shape() {
     let memory_id = MemoryId::new(7).unwrap();
     configure(&connection);
 
-    create_schema(&mut connection, memory_id).unwrap();
+    create_schema(&mut connection, memory_id, &TEST_PROFILE).unwrap();
 
     assert_eq!(read_application_id(&connection).unwrap(), APPLICATION_ID);
     assert!(validate_schema(&connection).unwrap());
@@ -65,7 +67,14 @@ fn schema_creation_commits_current_format_identity_and_closed_shape() {
         .unwrap();
     assert_eq!(
         tables,
-        ["episodes", "feedback_edges", "memory_meta", "symbols"]
+        [
+            "episode_cues",
+            "episodes",
+            "feedback_edges",
+            "memory_meta",
+            "semantic_cues",
+            "symbols"
+        ]
     );
     let indexes: Vec<String> = connection
         .prepare(
@@ -78,7 +87,14 @@ fn schema_creation_commits_current_format_identity_and_closed_shape() {
         .unwrap()
         .collect::<Result<_>>()
         .unwrap();
-    assert_eq!(indexes, ["symbols_value_unique"]);
+    assert_eq!(
+        indexes,
+        [
+            "episode_cues_by_cue",
+            "semantic_cues_pair_unique",
+            "symbols_value_unique"
+        ]
+    );
 }
 
 #[test]
@@ -89,7 +105,7 @@ fn failed_schema_creation_rolls_back_identity_and_ddl() {
         .unwrap();
     configure(&connection);
 
-    assert!(create_schema(&mut connection, MemoryId::new(1).unwrap()).is_err());
+    assert!(create_schema(&mut connection, MemoryId::new(1).unwrap(), &TEST_PROFILE).is_err());
 
     assert_eq!(read_application_id(&connection).unwrap(), 0);
     assert!(
@@ -156,7 +172,7 @@ fn validation_rejects_additional_persistent_objects() {
 fn constraints_enforce_canonical_keys_and_edges() {
     let (_directory, mut connection) = open_temporary_database();
     configure(&connection);
-    create_schema(&mut connection, MemoryId::new(1).unwrap()).unwrap();
+    create_schema(&mut connection, MemoryId::new(1).unwrap(), &TEST_PROFILE).unwrap();
     let zero = [0_u8; 8];
     let one = [0_u8, 0, 0, 0, 0, 0, 0, 1];
 
@@ -192,6 +208,46 @@ fn constraints_enforce_canonical_keys_and_edges() {
             )
             .is_err()
     );
+    connection
+        .execute(
+            "INSERT INTO symbols (id, value) VALUES (?1, 'other')",
+            [one.as_slice()],
+        )
+        .unwrap();
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO semantic_cues (cue_id, key_id, value_id, vector)
+                 VALUES (?1, ?1, ?2, ?3)",
+                params![zero.as_slice(), one.as_slice(), [1_u8; 767].as_slice()],
+            )
+            .is_err()
+    );
+    connection
+        .execute(
+            "INSERT INTO semantic_cues (cue_id, key_id, value_id, vector)
+             VALUES (?1, ?1, ?2, ?3)",
+            params![
+                zero.as_slice(),
+                one.as_slice(),
+                [1_u8; SEMANTIC_VECTOR_BYTES].as_slice()
+            ],
+        )
+        .unwrap();
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO semantic_cues (cue_id, key_id, value_id, vector)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    one.as_slice(),
+                    zero.as_slice(),
+                    one.as_slice(),
+                    [1_u8; SEMANTIC_VECTOR_BYTES].as_slice()
+                ],
+            )
+            .is_err()
+    );
 
     assert!(
         connection
@@ -215,6 +271,20 @@ fn constraints_enforce_canonical_keys_and_edges() {
             params![zero.as_slice(), [1_u8; 26].as_slice()],
         )
         .unwrap();
+    connection
+        .execute(
+            "INSERT INTO episode_cues (sequence, cue_id) VALUES (?1, ?1)",
+            [zero.as_slice()],
+        )
+        .unwrap();
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO episode_cues (sequence, cue_id) VALUES (?1, ?2)",
+                params![one.as_slice(), one.as_slice()],
+            )
+            .is_err()
+    );
     connection
         .execute(
             "INSERT INTO episodes (sequence, payload) VALUES (?1, ?2)",

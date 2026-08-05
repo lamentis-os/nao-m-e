@@ -13,20 +13,32 @@ use nao_m_e::MemoryId;
 use rusqlite::{Connection, Error, Result, TransactionBehavior, params};
 
 pub(crate) const APPLICATION_ID: i64 = 0x4E41_4F4D;
-pub(crate) const FORMAT_VERSION: i64 = 6;
+pub(crate) const FORMAT_VERSION: i64 = 7;
 pub(crate) const MAX_SYMBOL_BYTES: usize = 4_096;
+pub(crate) const SEMANTIC_VECTOR_BYTES: usize = 384 * size_of::<i16>();
 
 const SCHEMA: &str = r#"
 CREATE TABLE memory_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    format_version INTEGER NOT NULL CHECK (format_version = 6),
+    format_version INTEGER NOT NULL CHECK (format_version = 7),
     memory_id BLOB NOT NULL
         CHECK (
             typeof(memory_id) = 'blob'
             AND length(memory_id) = 16
             AND memory_id != zeroblob(16)
         ),
-    snapshot_revision INTEGER NOT NULL CHECK (snapshot_revision >= 0)
+    snapshot_revision INTEGER NOT NULL CHECK (snapshot_revision >= 0),
+    semantic_profile_fingerprint BLOB NOT NULL
+        CHECK (
+            typeof(semantic_profile_fingerprint) = 'blob'
+            AND length(semantic_profile_fingerprint) = 32
+            AND semantic_profile_fingerprint != zeroblob(32)
+        ),
+    semantic_cue_count BLOB NOT NULL
+        CHECK (
+            typeof(semantic_cue_count) = 'blob'
+            AND length(semantic_cue_count) = 8
+        )
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE symbols (
@@ -70,15 +82,52 @@ CREATE TABLE feedback_edges (
     CHECK (from_sequence != to_sequence),
     CHECK (history_bits < (1 << sample_count))
 ) STRICT, WITHOUT ROWID;
+
+CREATE TABLE semantic_cues (
+    cue_id BLOB PRIMARY KEY
+        CHECK (typeof(cue_id) = 'blob' AND length(cue_id) = 8),
+    key_id BLOB NOT NULL
+        CHECK (typeof(key_id) = 'blob' AND length(key_id) = 8),
+    value_id BLOB NOT NULL
+        CHECK (typeof(value_id) = 'blob' AND length(value_id) = 8),
+    vector BLOB NOT NULL
+        CHECK (typeof(vector) = 'blob' AND length(vector) = 768),
+    FOREIGN KEY (key_id) REFERENCES symbols(id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (value_id) REFERENCES symbols(id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+) STRICT, WITHOUT ROWID;
+
+CREATE UNIQUE INDEX semantic_cues_pair_unique
+    ON semantic_cues(key_id, value_id);
+
+CREATE TABLE episode_cues (
+    sequence BLOB NOT NULL
+        CHECK (typeof(sequence) = 'blob' AND length(sequence) = 8),
+    cue_id BLOB NOT NULL
+        CHECK (typeof(cue_id) = 'blob' AND length(cue_id) = 8),
+    PRIMARY KEY (sequence, cue_id),
+    FOREIGN KEY (sequence) REFERENCES episodes(sequence)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (cue_id) REFERENCES semantic_cues(cue_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX episode_cues_by_cue
+    ON episode_cues(cue_id, sequence);
 "#;
 
 static CANONICAL_SCHEMA: OnceLock<Vec<SchemaObject>> = OnceLock::new();
-const SCHEMA_OBJECTS: [(&str, &str, &str); 5] = [
+const SCHEMA_OBJECTS: [(&str, &str, &str); 9] = [
     ("table", "memory_meta", "memory_meta"),
     ("table", "symbols", "symbols"),
     ("index", "symbols_value_unique", "symbols"),
     ("table", "episodes", "episodes"),
     ("table", "feedback_edges", "feedback_edges"),
+    ("table", "semantic_cues", "semantic_cues"),
+    ("index", "semantic_cues_pair_unique", "semantic_cues"),
+    ("table", "episode_cues", "episode_cues"),
+    ("index", "episode_cues_by_cue", "episode_cues"),
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -134,7 +183,11 @@ pub(crate) fn read_application_id(connection: &Connection) -> Result<i64> {
     connection.pragma_query_value(None, "application_id", |row| row.get(0))
 }
 
-pub(crate) fn create_schema(connection: &mut Connection, memory_id: MemoryId) -> Result<()> {
+pub(crate) fn create_schema(
+    connection: &mut Connection,
+    memory_id: MemoryId,
+    semantic_profile_fingerprint: &[u8; 32],
+) -> Result<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
     transaction.execute_batch(SCHEMA)?;
@@ -143,9 +196,16 @@ pub(crate) fn create_schema(connection: &mut Connection, memory_id: MemoryId) ->
             singleton,
             format_version,
             memory_id,
-            snapshot_revision
-        ) VALUES (1, ?1, ?2, 0)",
-        params![FORMAT_VERSION, encode_memory_id(memory_id).as_slice()],
+            snapshot_revision,
+            semantic_profile_fingerprint,
+            semantic_cue_count
+        ) VALUES (1, ?1, ?2, 0, ?3, ?4)",
+        params![
+            FORMAT_VERSION,
+            encode_memory_id(memory_id).as_slice(),
+            semantic_profile_fingerprint.as_slice(),
+            encode_u64(0).as_slice(),
+        ],
     )?;
     transaction.commit()?;
     verify_integer_pragma(connection, "application_id", APPLICATION_ID)
