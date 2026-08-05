@@ -19,7 +19,7 @@ Usage:
   nao-m-e check <DATABASE>
   nao-m-e add <DATABASE> [--quiet] [--timestamp <UNIX_MS>] --attribute <TEXT> --value <TEXT>... [ATTRIBUTE OPTIONS]
   nao-m-e add <DATABASE> --many [--quiet]
-  nao-m-e recall <DATABASE> --from <SEQUENCE> [--limit <N>]
+  nao-m-e recall <DATABASE> --query <TEXT> [--limit <N>]
   nao-m-e feedback <DATABASE> --from <SEQUENCE> --helpful <SEQUENCE,...>
   nao-m-e feedback <DATABASE> --from <SEQUENCE> --unhelpful <SEQUENCE,...>
 
@@ -27,12 +27,16 @@ Commands:
   init      Create a new SQLite memory store without replacing an existing file
   check     Validate an existing SQLite memory store read-only
   add       Append one episode, or atomic line-delimited episodes with --many
-  recall    Rank cue-derived and learned source-conditioned episodes read-only
+  recall    Rank episodes for one semantic free-text query read-only
   feedback  Learn from one explicit helpful or unhelpful target set
 
 Options:
   -h, --help     Show help
   --version      Show the CLI version
+
+Pinned semantic model assets are an installation prerequisite. Commands that
+perform semantic encoding verify and use the local artifacts but never download
+them.
 ";
 
 const INIT_HELP: &str = "Create a new SQLite memory store.
@@ -108,7 +112,7 @@ enum Command {
     },
     Recall {
         database: PathBuf,
-        source_sequence: u64,
+        query: String,
         limit: usize,
     },
     Feedback {
@@ -240,9 +244,9 @@ fn execute(command: Command) -> CliResult<Vec<u8>> {
         }
         Command::Recall {
             database,
-            source_sequence,
+            query,
             limit,
-        } => recall::execute(&database, source_sequence, limit),
+        } => recall::execute(&database, &query, limit),
         Command::Feedback {
             database,
             source_sequence,
