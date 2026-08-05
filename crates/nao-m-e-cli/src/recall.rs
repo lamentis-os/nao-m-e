@@ -3,23 +3,24 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 
-use nao_m_e::{AtomId, EpisodeAtom, SymbolId};
+use nao_m_e::{EpisodeAtom, SymbolId};
 use nao_m_e_sqlite::SqliteStore;
 
 use super::{CliResult, Command, ParsedArgs, is_help_request, open_store, parse_number};
 
 const DEFAULT_RECALL_LIMIT: usize = 10;
 
-const RECALL_HELP: &str = "Rank source-conditioned episodes without changing state.
+const RECALL_HELP: &str = "Rank episodes for one semantic free-text query without changing state.
 
 Usage:
-  nao-m-e recall <DATABASE> --from <SEQUENCE>
-  nao-m-e recall <DATABASE> --from <SEQUENCE> --limit <N>
+  nao-m-e recall <DATABASE> --query <TEXT>
+  nao-m-e recall <DATABASE> --query <TEXT> --limit <N>
 
-Symbolic cue overlap provides cold candidates. Direct learned feedback can add
-candidates, boost their score, or suppress structural matches. The default
-recall limit is 10. Hits are separated by one blank line. No hits produce no
-standard output.
+One fixed language-agnostic local model path compares the query with each
+committed episode vector. Its pinned assets must be provisioned during product
+installation and are never downloaded by recall. Existing episode-to-episode
+feedback does not affect this query. The default recall limit is 10. Hits are
+separated by one blank line. No hits produce no standard output.
 ";
 
 pub(super) fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
@@ -30,38 +31,36 @@ pub(super) fn parse_args(args: &[OsString]) -> Result<ParsedArgs, String> {
         return Err("`recall` requires a database path".to_owned());
     };
 
-    let (source_sequence, limit) = match &args[1..] {
-        [option, source] if option.as_os_str() == OsStr::new("--from") => (
-            parse_number(source, "source sequence")?,
-            DEFAULT_RECALL_LIMIT,
-        ),
-        [source_option, source, limit_option, limit]
-            if source_option.as_os_str() == OsStr::new("--from")
+    let (query, limit) = match &args[1..] {
+        [option, query] if option.as_os_str() == OsStr::new("--query") => {
+            (query, DEFAULT_RECALL_LIMIT)
+        }
+        [query_option, query, limit_option, limit]
+            if query_option.as_os_str() == OsStr::new("--query")
                 && limit_option.as_os_str() == OsStr::new("--limit") =>
         {
-            (
-                parse_number(source, "source sequence")?,
-                parse_number(limit, "recall limit")?,
-            )
+            (query, parse_number(limit, "recall limit")?)
         }
         _ => {
-            return Err("`recall` requires <DATABASE> --from <SEQUENCE> [--limit <N>]".to_owned());
+            return Err("`recall` requires <DATABASE> --query <TEXT> [--limit <N>]".to_owned());
         }
     };
+    let query = query
+        .to_str()
+        .ok_or_else(|| "semantic query must be valid UTF-8".to_owned())?
+        .to_owned();
 
     Ok(ParsedArgs::Execute(Command::Recall {
         database: PathBuf::from(database),
-        source_sequence,
+        query,
         limit,
     }))
 }
 
-pub(super) fn execute(database: &Path, source_sequence: u64, limit: usize) -> CliResult<Vec<u8>> {
-    let store = open_store(database)?;
-    let source = AtomId::from_parts(store.memory_id(), source_sequence);
+pub(super) fn execute(database: &Path, query: &str, limit: usize) -> CliResult<Vec<u8>> {
+    let mut store = open_store(database)?;
     let hits = store
-        .memory()
-        .recall_from(source, limit)
+        .recall_semantic(query, limit)
         .map_err(|error| error.to_string())?;
     format_recall(&store, &hits)
 }
@@ -96,13 +95,13 @@ fn format_recall(store: &SqliteStore, hits: &[nao_m_e::RecallHit]) -> CliResult<
 
 struct ResolvedSymbols {
     ids: Vec<SymbolId>,
-    values: Vec<Option<String>>,
+    values: Vec<String>,
 }
 
 impl ResolvedSymbols {
     fn get(&self, id: &SymbolId) -> Option<&str> {
         let index = self.ids.binary_search(id).ok()?;
-        self.values[index].as_deref()
+        Some(self.values[index].as_str())
     }
 }
 
@@ -117,6 +116,10 @@ fn resolve_symbols(ids: Vec<SymbolId>, values: Vec<Option<String>>) -> CliResult
             ids[index].get()
         ));
     }
+    let values = values
+        .into_iter()
+        .map(|value| value.expect("missing symbol values were rejected"))
+        .collect();
     Ok(ResolvedSymbols { ids, values })
 }
 

@@ -14,7 +14,7 @@ mod recall;
 mod support;
 
 use support::{
-    add_minimal, assert_silent_success, check, cli, failure, feedback, init, invoke, recall,
+    assert_silent_success, check, cli, failure, feedback, init, invoke, semantic_recall,
     success_text,
 };
 
@@ -59,9 +59,11 @@ fn help_version_and_top_level_syntax_have_stable_exit_categories() {
     let mut recall_help = cli();
     recall_help.args(["recall", "--help"]);
     let recall_help = success_text(invoke(recall_help, None));
-    assert!(recall_help.contains("Symbolic cue overlap provides cold candidates"));
-    assert!(recall_help.contains("Direct learned feedback"));
-    assert!(recall_help.contains("suppress structural matches"));
+    assert!(recall_help.contains("--query <TEXT>"));
+    assert!(recall_help.contains("language-agnostic local model"));
+    assert!(recall_help.contains("never downloaded by recall"));
+    assert!(recall_help.contains("feedback does not affect this query"));
+    assert!(!recall_help.contains("--from"));
 
     let mut add_help = cli();
     add_help.args(["add", "--help"]);
@@ -141,15 +143,15 @@ fn commands_reject_unsupported_format_before_execution_without_changing_it() {
     let store = SqliteStore::open(&database).expect("created SQLite store opens");
     let memory_id = store.memory_id().to_be_bytes();
     drop(store);
-    rewrite_format_version(&database, memory_id, 7, 6);
+    rewrite_format_version(&database, memory_id, 8, 7);
     let before = fs::read(&database).expect("unsupported-format store is readable");
 
     let stderr = failure(check(&database), 1);
-    assert!(stderr.contains("unsupported SQLite memory format version 6"));
+    assert!(stderr.contains("unsupported SQLite memory format version 7"));
     assert_eq!(fs::read(&database).unwrap(), before);
 
-    let stderr = failure(recall(&database, 0, None), 1);
-    assert!(stderr.contains("unsupported SQLite memory format version 6"));
+    let stderr = failure(semantic_recall(&database, "query", Some(0)), 1);
+    assert!(stderr.contains("unsupported SQLite memory format version 7"));
     assert_eq!(fs::read(&database).unwrap(), before);
 }
 
@@ -163,7 +165,6 @@ fn malformed_direct_arguments_are_syntax_errors_but_store_errors_are_runtime_err
         vec!["check"],
         vec!["check", database.to_str().unwrap(), "unexpected"],
         vec!["add", database.to_str().unwrap()],
-        vec!["recall", database.to_str().unwrap(), "--limit", "1"],
         vec![
             "feedback",
             database.to_str().unwrap(),
@@ -217,12 +218,18 @@ fn malformed_direct_arguments_are_syntax_errors_but_store_errors_are_runtime_err
         failure(invoke(command, None), 2);
     }
 
-    let stderr = failure(recall(&database, 99, None), 1);
-    assert!(stderr.contains("unknown atom"));
-
     let missing = directory.path().join("missing.sqlite3");
-    let add_error = failure(add_minimal(&missing, 1, false), 1);
-    let recall_error = failure(recall(&missing, 0, None), 1);
+    let mut add = cli();
+    add.arg("add").arg(&missing).args([
+        "--timestamp",
+        "1",
+        "--attribute",
+        "attribute",
+        "--value",
+        "value",
+    ]);
+    let add_error = failure(invoke(add, None), 1);
+    let recall_error = failure(semantic_recall(&missing, "query", Some(0)), 1);
     let feedback_error = failure(feedback(&missing, 0, true, "1"), 1);
     assert!(add_error.contains("could not open"));
     assert_eq!(recall_error, add_error);

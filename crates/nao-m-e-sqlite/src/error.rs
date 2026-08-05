@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-/// Failure while creating, opening, or saving a SQLite memory store.
+/// Failure while operating on a SQLite memory store.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum StoreError {
@@ -29,16 +29,21 @@ pub enum StoreError {
         /// Violated value invariant.
         detail: &'static str,
     },
+    /// A caller-supplied semantic query cannot be normalized.
+    InvalidSemanticQuery {
+        /// Violated query invariant.
+        detail: &'static str,
+    },
     /// The symbol catalog has assigned every unsigned 64-bit identifier.
     SymbolIdExhausted,
-    /// The semantic cue catalog reached V7's unsigned 64-bit count capacity.
-    ///
-    /// Because metadata stores the next prefix length, the largest assignable
-    /// cue identifier is `u64::MAX - 1`.
-    SemanticCueIdExhausted,
-    /// The configured semantic encoder could not produce canonical vectors.
+    /// The configured semantic encoder could not produce a canonical episode vector.
     SemanticEncoding {
         /// Encoder or vector validation diagnostic.
+        detail: String,
+    },
+    /// The configured semantic encoder could not encode a retrieval query.
+    SemanticQueryEncoding {
+        /// Encoder diagnostic.
         detail: String,
     },
     /// A caller referred to an identifier absent from the symbol catalog.
@@ -68,12 +73,15 @@ impl fmt::Display for StoreError {
             Self::InvalidSymbolValue { index, detail } => {
                 write!(formatter, "invalid symbol at batch index {index}: {detail}")
             }
-            Self::SymbolIdExhausted => formatter.write_str("symbol identifier space is exhausted"),
-            Self::SemanticCueIdExhausted => {
-                formatter.write_str("semantic cue identifier space is exhausted")
+            Self::InvalidSemanticQuery { detail } => {
+                write!(formatter, "invalid semantic query: {detail}")
             }
+            Self::SymbolIdExhausted => formatter.write_str("symbol identifier space is exhausted"),
             Self::SemanticEncoding { detail } => {
-                write!(formatter, "semantic cue encoding failed: {detail}")
+                write!(formatter, "semantic episode encoding failed: {detail}")
+            }
+            Self::SemanticQueryEncoding { detail } => {
+                write!(formatter, "semantic query encoding failed: {detail}")
             }
             Self::UnknownSymbolId { id } => {
                 write!(formatter, "unknown symbol identifier {id}")
@@ -92,9 +100,10 @@ impl Error for StoreError {
             Self::ConcurrentModification { .. }
             | Self::RevisionExhausted
             | Self::InvalidSymbolValue { .. }
+            | Self::InvalidSemanticQuery { .. }
             | Self::SymbolIdExhausted
-            | Self::SemanticCueIdExhausted
             | Self::SemanticEncoding { .. }
+            | Self::SemanticQueryEncoding { .. }
             | Self::UnknownSymbolId { .. } => None,
         }
     }
@@ -124,7 +133,7 @@ impl From<StoreIntegrityError> for StoreError {
     }
 }
 
-/// Persisted-data violation detected while opening or saving a store.
+/// Persisted-data violation detected while operating on a store.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum StoreIntegrityError {
@@ -183,25 +192,18 @@ pub enum StoreIntegrityError {
         /// Identifier read from the database.
         found: u64,
     },
-    /// Semantic cue identifiers do not form the exact prefix `0..N`.
-    NonContiguousSemanticCueId {
-        /// Identifier required at this position.
+    /// Episode-vector sequences do not form the exact prefix `0..N`.
+    NonContiguousEpisodeVector {
+        /// Episode sequence required at this position.
         expected: u64,
-        /// Identifier read from the database.
+        /// Episode sequence read from the database.
         found: u64,
     },
-    /// A semantic cue, vector, or its symbol binding is invalid.
-    InvalidSemanticCue {
-        /// Identifier of the affected cue when it could be decoded.
-        cue_id: u64,
-        /// Violated semantic invariant.
-        detail: &'static str,
-    },
-    /// Persisted episode-to-cue postings differ from episode attributes.
-    InvalidSemanticPostings {
-        /// Sequence of the affected episode.
+    /// A persisted episode vector is invalid.
+    InvalidEpisodeVector {
+        /// Sequence of the affected episode when it could be decoded.
         sequence: u64,
-        /// Violated posting invariant.
+        /// Violated vector invariant.
         detail: &'static str,
     },
     /// A persisted symbol value is not canonical.
@@ -264,17 +266,14 @@ impl fmt::Display for StoreIntegrityError {
                 formatter,
                 "expected symbol identifier {expected}, found {found}",
             ),
-            Self::NonContiguousSemanticCueId { expected, found } => write!(
+            Self::NonContiguousEpisodeVector { expected, found } => write!(
                 formatter,
-                "expected semantic cue identifier {expected}, found {found}",
+                "expected episode vector sequence {expected}, found {found}",
             ),
-            Self::InvalidSemanticCue { cue_id, detail } => {
-                write!(formatter, "invalid semantic cue {cue_id}: {detail}")
-            }
-            Self::InvalidSemanticPostings { sequence, detail } => {
+            Self::InvalidEpisodeVector { sequence, detail } => {
                 write!(
                     formatter,
-                    "invalid semantic postings for episode {sequence}: {detail}"
+                    "invalid semantic vector for episode {sequence}: {detail}"
                 )
             }
             Self::InvalidSymbol { id, detail } => {

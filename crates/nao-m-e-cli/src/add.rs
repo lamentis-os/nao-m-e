@@ -24,6 +24,11 @@ per episode. Blank lines and shell comments are ignored. The command parses and
 saves all rows once or saves none. Successful add writes the assigned sequence
 per episode unless --quiet is present. Missing timestamps share one current-time
 default per invocation.
+
+Every new episode must be encoded before it can commit. The pinned model assets
+are an installation prerequisite and are never downloaded by this command.
+Missing, invalid, or unusable assets reject the complete add without publishing
+symbols, an episode, its semantic vector, or a revision.
 ";
 
 struct TextAttribute {

@@ -1,14 +1,12 @@
 /// Number of signed components in every semantic embedding.
 pub const EMBEDDING_DIMENSIONS: usize = 384;
 
-/// Maximum number of cues accepted by one encoder call.
-pub const MAX_EMBEDDING_BATCH_SIZE: usize = 32;
-
 pub(crate) const MODEL_OWNER: &str = "intfloat";
 pub(crate) const MODEL_NAME: &str = "multilingual-e5-small";
 pub(crate) const MODEL_REVISION: &str = "0e60b8d9d2166d80387f86e3b48ec9ced55f4d15";
 pub(crate) const MODEL_FILE: &str = "onnx/model.onnx";
 pub(crate) const TOKENIZER_FILE: &str = "onnx/tokenizer.json";
+pub(crate) const MAX_TOKEN_COUNT: usize = 512;
 pub(crate) const MODEL_SHA256: [u8; 32] = [
     0xca, 0x45, 0x6c, 0x06, 0xb3, 0xa9, 0x50, 0x5d, 0xdf, 0xd9, 0x13, 0x14, 0x08, 0x91, 0x6d, 0xd7,
     0x92, 0x90, 0x36, 0x83, 0x31, 0xe7, 0xd7, 0x6b, 0xb6, 0x21, 0xf1, 0xcb, 0xa6, 0xbc, 0x86, 0x65,
@@ -19,7 +17,7 @@ pub(crate) const TOKENIZER_SHA256: [u8; 32] = [
 ];
 
 const PROFILE_MANIFEST: &str = concat!(
-    "nao-m-e-semantic-profile-v1\n",
+    "nao-m-e-semantic-profile-v2\n",
     "model.repository=intfloat/multilingual-e5-small\n",
     "model.revision=0e60b8d9d2166d80387f86e3b48ec9ced55f4d15\n",
     "model.artifact=onnx/model.onnx\n",
@@ -31,11 +29,13 @@ const PROFILE_MANIFEST: &str = concat!(
     "tokenizer.add-special-tokens=true\n",
     "tokenizer.truncation=longest-first-right\n",
     "tokenizer.truncation-stride=0\n",
-    "tokenizer.padding=batch-longest-right\n",
-    "tokenizer.padding-token=<pad>:1\n",
-    "tokenizer.padding-type-id=0\n",
-    "tokenizer.padding-multiple=none\n",
-    "projection=passage: {key}: {value}\n",
+    "tokenizer.padding=none\n",
+    "projection.query=query: {normalized-query}\n",
+    "projection.episode=passage: sorted-distinct-lines({normalized-key}: {normalized-value})\n",
+    "projection.episode.separator=lf\n",
+    "projection.episode.empty=rejected\n",
+    "tokenizer.query-overflow=right-truncated\n",
+    "tokenizer.episode-overflow=rejected\n",
     "runtime=onnxruntime-1.28.0/ort-2.0.0-rc.13\n",
     "runtime.execution-provider=CPUExecutionProvider\n",
     "runtime.execution-device=unique-cpu-provider-device\n",
@@ -58,11 +58,11 @@ const PROFILE_MANIFEST: &str = concat!(
 );
 
 const PROFILE_FINGERPRINT: [u8; 32] = [
-    0x12, 0x97, 0xd8, 0xd2, 0x8c, 0x7d, 0xbe, 0x9c, 0x62, 0x4a, 0x13, 0xa0, 0xaf, 0xa6, 0xbf, 0x8a,
-    0xa6, 0xeb, 0x7a, 0x43, 0xc3, 0x23, 0x53, 0x59, 0x08, 0x9c, 0xee, 0xd7, 0xdf, 0x1f, 0x5b, 0x25,
+    0x79, 0xa5, 0x43, 0x7c, 0x9d, 0x41, 0xcb, 0x70, 0x22, 0x45, 0x1c, 0x2c, 0x3b, 0xc4, 0x70, 0x8c,
+    0x76, 0x9e, 0x7a, 0x07, 0x35, 0x06, 0xc5, 0xd3, 0x68, 0xc2, 0xf2, 0x7e, 0x25, 0x8f, 0xe1, 0x8b,
 ];
 
-/// Stable identity of the fixed multilingual E5 Small encoding contract.
+/// Stable identity of the fixed E5 Small encoding contract.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct EmbeddingProfile {
     fingerprint: [u8; 32],
@@ -88,14 +88,17 @@ impl EmbeddingProfile {
     }
 }
 
-/// Fixed multilingual E5 Small FP32 profile used by this crate.
+/// Fixed E5 Small FP32 profile used by this crate.
 pub const E5_SMALL_PROFILE: EmbeddingProfile = EmbeddingProfile {
     fingerprint: PROFILE_FINGERPRINT,
 };
 
 #[cfg(test)]
 mod tests {
-    use super::{E5_SMALL_PROFILE, EMBEDDING_DIMENSIONS};
+    use super::{
+        E5_SMALL_PROFILE, EMBEDDING_DIMENSIONS, MAX_TOKEN_COUNT, MODEL_FILE, MODEL_NAME,
+        MODEL_OWNER, MODEL_REVISION, MODEL_SHA256, TOKENIZER_FILE, TOKENIZER_SHA256,
+    };
     use sha2::{Digest, Sha256};
 
     #[test]
@@ -103,5 +106,28 @@ mod tests {
         let digest: [u8; 32] = Sha256::digest(E5_SMALL_PROFILE.manifest().as_bytes()).into();
         assert_eq!(digest, E5_SMALL_PROFILE.fingerprint());
         assert_eq!(E5_SMALL_PROFILE.dimensions(), EMBEDDING_DIMENSIONS);
+    }
+
+    #[test]
+    fn manifest_identity_matches_runtime_artifacts_and_token_bound() {
+        let manifest = E5_SMALL_PROFILE.manifest();
+        for field in [
+            format!("model.repository={MODEL_OWNER}/{MODEL_NAME}\n"),
+            format!("model.revision={MODEL_REVISION}\n"),
+            format!("model.artifact={MODEL_FILE}\n"),
+            format!("model.sha256={}\n", hex(MODEL_SHA256)),
+            format!("tokenizer.artifact={TOKENIZER_FILE}\n"),
+            format!("tokenizer.sha256={}\n", hex(TOKENIZER_SHA256)),
+            format!("tokenizer.max_tokens={MAX_TOKEN_COUNT}\n"),
+        ] {
+            assert!(
+                manifest.contains(&field),
+                "profile manifest lacks {field:?}"
+            );
+        }
+    }
+
+    fn hex(bytes: [u8; 32]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 }

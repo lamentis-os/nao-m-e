@@ -5,9 +5,9 @@
 //!
 //! A [`SqliteStore`] owns one [`nao_m_e::Memory`]. Mutations remain in
 //! memory until an explicit [`SqliteStore::save`] atomically commits staged
-//! symbols, semantic cue embeddings, newly appended episodes, and feedback
-//! changes. [`SqliteStore::check`] performs the deliberately separate complete
-//! file and semantic-projection audit.
+//! symbols, mandatory semantic episode vectors, newly appended episodes, and
+//! feedback changes. [`SqliteStore::check`] performs the deliberately separate
+//! complete file and semantic-vector audit.
 
 mod error;
 mod format;

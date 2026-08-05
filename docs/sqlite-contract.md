@@ -1,19 +1,18 @@
 # SQLite contract
 
 This document defines the durable format and observable lifecycle of the
-`nao-m-e-sqlite` adapter. The logical state being stored and reconstructed is
-defined by the [core contract](core-contract.md). Integrated semantic cue
-projection is defined by the [semantic cue contract](semantic-contract.md).
-The current persisted format version is `7`.
+`nao-m-e-sqlite` adapter. Logical kernel state is defined by the
+[core contract](core-contract.md); the fixed episode-vector and free-text
+retrieval rules are defined by the
+[semantic episode contract](semantic-contract.md). The current format is V8.
 
 ## Adapter boundary
 
-One database represents exactly one logical memory. `SqliteStore` owns both its
-SQLite connection and the completely reconstructed `Memory`:
+One database represents one logical memory. `SqliteStore` owns its SQLite
+connection, a completely reconstructed numeric `Memory`, staged symbols and
+episode vectors, and one lazy semantic encoder:
 
 ```rust
-pub struct SqliteStore { /* private fields */ }
-
 impl SqliteStore {
     pub fn create(path: impl AsRef<Path>) -> Result<Self, StoreError>;
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError>;
@@ -29,42 +28,42 @@ impl SqliteStore {
         &self,
         ids: &[SymbolId],
     ) -> Result<Vec<Option<String>>, StoreError>;
+    pub fn recall_semantic(
+        &mut self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<RecallHit>, StoreError>;
     pub fn save(&mut self) -> Result<(), StoreError>;
 }
 ```
 
-Mutating the returned memory or interning symbols changes only process state.
-`save()` is the sole persistence boundary. There is no automatic save on
-mutation or drop. A failed save leaves all in-memory episode, symbol, and
-feedback changes available for an explicit retry.
+Mutation and interning change process state only. `save()` is the sole
+persistence boundary; there is no save on mutation or drop. A failed save keeps
+caller mutations and any completely prepared episode-vector suffix available
+for explicit retry.
 
-Batch interning returns one ID per input value in the same order. It fully
-normalizes and validates the batch before staging any new assignment. Resolution
-returns one optional value per input ID in the same order and can see both
-persisted and locally staged values. Interned but unreferenced values are valid
-snapshot state and are never garbage-collected.
+Batch interning returns one ID per input value in input order. It validates the
+complete normalized batch before staging assignments. Resolution returns one
+optional value per input ID and sees persisted and locally staged symbols.
+Interned but unreferenced symbols remain valid append-only state.
 
-An episode inserted directly through `memory_mut()` may refer only to persisted
-or staged `SymbolId` values. `save()` rejects every new episode containing an
-unknown key or value ID.
+Episodes inserted directly through `memory_mut()` may use only persisted or
+staged symbols. `save()` rejects unknown references and automatically creates
+the required semantic vector; there is no separate prepare API. Feedback remains
+directed mutable core state and has no receipt, timestamp, provenance, query
+binding, or idempotency key.
 
-Feedback remains separate mutable core state. A save persists each directed,
-bounded trace but no receipt, timestamp, provenance record, query binding, or
-idempotency key. Repeating feedback after a successful save appends another
-sample.
-
-The adapter does not expose its connection and cannot save an independently
-constructed memory. Database copies with the same `MemoryId` must not be
-modified independently and later merged.
+The adapter does not expose its connection, accept independently constructed
+memories, migrate files, or merge independently modified copies.
 
 ## Identity and connection settings
 
-The SQLite application ID is `0x4E414F4D` (`NAOM`, decimal `1312902989`) and the
-only accepted `format_version` is `7`. Every other version is rejected with
-`StoreIntegrityError::UnsupportedFormatVersion`. There is no migrator.
+The SQLite application ID is `0x4E414F4D` (`NAOM`, decimal `1312902989`). The
+only accepted `format_version` is `8`; every other value fails with
+`StoreIntegrityError::UnsupportedFormatVersion`.
 
-Immediately after connecting, before schema or memory access, the adapter
-applies and verifies these connection-local settings:
+Immediately after connecting, before schema or memory access, the adapter sets
+and verifies:
 
 ```text
 busy_timeout = 0
@@ -73,31 +72,30 @@ trusted_schema = OFF
 ignore_check_constraints = OFF
 ```
 
-For an existing file it then verifies the application ID and reads the metadata
-format version. Only after accepting V7 does it verify rollback-journal mode and
-apply synchronization policy:
+For an existing file it next verifies the application ID and format. Only after
+accepting V8 does it verify rollback-journal durability:
 
 ```text
 journal_mode = DELETE
 synchronous = EXTRA
 ```
 
-An unsupported file is therefore rejected before persistent journal settings
-can be changed. A zero busy timeout means SQLite lock failures are returned
-immediately; the adapter neither waits nor retries.
+Unsupported files are therefore rejected before persistent journal settings
+can change. Lock failures return immediately; the adapter neither waits nor
+retries.
 
-Creation uses a private file-backed staging database. It applies the same
-settings, writes and validates a complete initial store, closes and synchronizes
-the staging file, and publishes it without replacing an existing target.
+Creation builds a complete private file-backed staging database, closes and
+synchronizes it, and publishes without replacing an existing destination. An
+empty database requires no semantic model assets.
 
-## Closed V7 schema
+## Closed V8 schema
 
-Only these six tables and three explicit indexes may exist:
+Exactly five tables and one explicit index may exist:
 
 ```sql
 CREATE TABLE memory_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    format_version INTEGER NOT NULL CHECK (format_version = 7),
+    format_version INTEGER NOT NULL CHECK (format_version = 8),
     memory_id BLOB NOT NULL
         CHECK (
             typeof(memory_id) = 'blob'
@@ -110,11 +108,6 @@ CREATE TABLE memory_meta (
             typeof(semantic_profile_fingerprint) = 'blob'
             AND length(semantic_profile_fingerprint) = 32
             AND semantic_profile_fingerprint != zeroblob(32)
-        ),
-    semantic_cue_count BLOB NOT NULL
-        CHECK (
-            typeof(semantic_cue_count) = 'blob'
-            AND length(semantic_cue_count) = 8
         )
 ) STRICT, WITHOUT ROWID;
 
@@ -140,15 +133,9 @@ CREATE TABLE episodes (
 
 CREATE TABLE feedback_edges (
     from_sequence BLOB NOT NULL
-        CHECK (
-            typeof(from_sequence) = 'blob'
-            AND length(from_sequence) = 8
-        ),
+        CHECK (typeof(from_sequence) = 'blob' AND length(from_sequence) = 8),
     to_sequence BLOB NOT NULL
-        CHECK (
-            typeof(to_sequence) = 'blob'
-            AND length(to_sequence) = 8
-        ),
+        CHECK (typeof(to_sequence) = 'blob' AND length(to_sequence) = 8),
     history_bits INTEGER NOT NULL CHECK (history_bits BETWEEN 0 AND 65535),
     sample_count INTEGER NOT NULL CHECK (sample_count BETWEEN 1 AND 16),
     PRIMARY KEY (from_sequence, to_sequence),
@@ -160,103 +147,72 @@ CREATE TABLE feedback_edges (
     CHECK (history_bits < (1 << sample_count))
 ) STRICT, WITHOUT ROWID;
 
-CREATE TABLE semantic_cues (
-    cue_id BLOB PRIMARY KEY
-        CHECK (typeof(cue_id) = 'blob' AND length(cue_id) = 8),
-    key_id BLOB NOT NULL
-        CHECK (typeof(key_id) = 'blob' AND length(key_id) = 8),
-    value_id BLOB NOT NULL
-        CHECK (typeof(value_id) = 'blob' AND length(value_id) = 8),
+CREATE TABLE episode_vectors (
+    sequence BLOB PRIMARY KEY
+        CHECK (typeof(sequence) = 'blob' AND length(sequence) = 8),
     vector BLOB NOT NULL
         CHECK (typeof(vector) = 'blob' AND length(vector) = 768),
-    FOREIGN KEY (key_id) REFERENCES symbols(id)
-        ON UPDATE RESTRICT ON DELETE RESTRICT,
-    FOREIGN KEY (value_id) REFERENCES symbols(id)
-        ON UPDATE RESTRICT ON DELETE RESTRICT
-) STRICT, WITHOUT ROWID;
-
-CREATE UNIQUE INDEX semantic_cues_pair_unique
-    ON semantic_cues(key_id, value_id);
-
-CREATE TABLE episode_cues (
-    sequence BLOB NOT NULL
-        CHECK (typeof(sequence) = 'blob' AND length(sequence) = 8),
-    cue_id BLOB NOT NULL
-        CHECK (typeof(cue_id) = 'blob' AND length(cue_id) = 8),
-    PRIMARY KEY (sequence, cue_id),
     FOREIGN KEY (sequence) REFERENCES episodes(sequence)
-        ON UPDATE RESTRICT ON DELETE RESTRICT,
-    FOREIGN KEY (cue_id) REFERENCES semantic_cues(cue_id)
         ON UPDATE RESTRICT ON DELETE RESTRICT
 ) STRICT, WITHOUT ROWID;
-
-CREATE INDEX episode_cues_by_cue
-    ON episode_cues(cue_id, sequence);
 ```
 
-SQLite's primary-key autoindexes are expected. Any additional table, index,
-view, trigger, virtual table, or altered schema definition makes the store
-invalid. `memory_meta` contains exactly one singleton row with version `7`, the
-memory identity, snapshot revision, fixed semantic profile fingerprint, and
-canonical semantic cue count.
+SQLite primary-key autoindexes are expected. Any extra table, index, view,
+trigger, virtual table, or altered definition makes the store invalid.
+`memory_meta` has exactly one singleton row containing V8, the non-zero memory
+identity, non-negative revision, and fixed non-zero semantic-profile fingerprint.
 
 ## Canonical scalar encoding
 
 - `MemoryId` is its 16-byte big-endian representation.
-- Episode sequences, `SymbolId` values, semantic cue IDs, and the semantic cue
-  count are fixed-width 8-byte big-endian unsigned integers.
-- Timestamps are fixed-width 8-byte big-endian two's-complement signed Unix
-  milliseconds. The complete `i64` range is preserved.
+- Episode sequences and `SymbolId` values are fixed 8-byte big-endian unsigned
+  integers.
+- Timestamps are fixed 8-byte big-endian two's-complement signed Unix
+  milliseconds; the full `i64` range is preserved.
 - Feedback history is an unsigned 16-bit bitset stored as a SQLite integer.
 - Feedback sample count is an integer in `1..=16`.
-- A semantic vector is exactly 384 consecutive signed two's-complement `i16`
-  coordinates in little-endian order, for a total of 768 bytes.
+- One semantic vector is 384 little-endian two's-complement `i16` components,
+  exactly 768 bytes.
 
-Fixed-width big-endian BLOBs preserve the complete unsigned ranges and numeric
-lexicographic ordering. Native-endian, decimal-text, and variable-width
-identifier encodings are not accepted.
+Fixed-width big-endian identifiers preserve the complete unsigned ranges and
+numeric lexicographic order. Native-endian, decimal-text, and variable-width
+identifier representations are invalid.
 
 Payload counts use canonical unsigned LEB128. Each byte contributes its low
-seven bits, least-significant group first; the high bit denotes continuation.
-Zero is exactly `00`, and a multi-byte encoding may not end in a zero seven-bit
-group. Truncation, `u64` overflow, overlong encoding, impossible remaining-byte
-counts, and counts that do not fit `usize` are rejected before allocation.
+seven bits, least-significant group first, and the high bit denotes
+continuation. Zero is exactly `00`; multi-byte values may not end with a zero
+group. Truncation, overflow, overlong encoding, impossible remaining lengths,
+and counts not fitting `usize` fail before allocation.
 
-## Symbol identity
+## Symbols and normalization
 
-There is one shared append-only symbol namespace for attribute keys and values.
-IDs begin at zero and always form the exact prefix `0..N`. A new normalized
-value receives the next ID according to its first occurrence in the input batch.
-IDs are never renamed, deleted, reused, or rebound. After assigning `u64::MAX`,
-the namespace is exhausted.
+Attribute keys and values share one append-only symbol namespace. IDs start at
+zero, form the exact prefix `0..N`, and are assigned by first normalized
+occurrence. They are never renamed, deleted, reused, rebound, or portable across
+independently created databases. After `u64::MAX`, the namespace is exhausted.
 
-Symbol IDs are stable only within a logical database and its continued copies;
-independently created stores need not assign the same ID to equal text.
-
-The normalization algorithm is part of format V7 and is fixed to Unicode 16.0:
+Normalization is part of V8 and fixed to Unicode 16.0:
 
 1. Apply NFKC.
 2. Apply locale-independent Unicode lowercase mapping to every scalar.
 3. Apply NFKC again.
-4. Split on Unicode whitespace, remove empty outer components, and join the
-   remaining components with one ASCII space.
+4. Collapse Unicode whitespace runs to one ASCII space and trim the ends.
 5. Reject every remaining Unicode control scalar.
 6. Reject an empty result or normalized UTF-8 longer than 4,096 bytes.
 
-Lowercasing includes unconditional multi-scalar expansions and is neither
-context-sensitive conversion nor full case folding. Punctuation, accents, and
-all other surviving scalars remain unchanged. The normalized value is the only
-stored text and uses SQLite binary collation. There is no display spelling,
-alias, stemming, fuzzy matching, accent removal, or synonym mapping. Semantic
-projection consumes this normalized text but does not change symbol identity.
+The lowercase mapping includes unconditional multi-scalar expansions and is
+neither context-sensitive conversion nor full case folding. Punctuation,
+accents, and other surviving scalars remain. Only normalized text is stored
+with binary collation. There is no display spelling, alias, stemming, fuzzy
+matching, accent removal, or synonym mapping.
 
-Equal normalized key and value text receives the same ID. Persisted lookup and
-resolution use indexed queries with at most 900 parameters and do not load the
-full text catalog into the core.
+Equal normalized key and value text receives one ID. Indexed lookup and
+resolution use bounded batches of at most 900 SQL parameters and do not retain
+the complete text catalog in core memory.
 
 ## Episode payload
 
-Each `episodes.payload` contains exactly one episode:
+Every `episodes.payload` is exactly:
 
 ```text
 EpisodePayload =
@@ -270,186 +226,164 @@ Attribute =
     values                u64be * value_count
 ```
 
-The minimum is 26 bytes: an 8-byte timestamp, a 1-byte attribute count, an
-8-byte key, a 1-byte value count, and one 8-byte value.
+The minimum is 26 bytes. Attribute count and every value count are positive;
+keys and each value set are strictly increasing and duplicate-free; every ID
+resolves in `symbols`; and the decoder must consume the full payload. Stored
+order is validated rather than repaired through core canonicalization.
 
-Persisted payloads obey all of these invariants:
-
-- `attribute_count >= 1`;
-- every `value_count >= 1`;
-- keys are strictly ascending and occur once;
-- values within an attribute are strictly ascending and duplicate-free;
-- every key and value resolves in `symbols`;
-- the decoder consumes every byte and rejects trailing data.
-
-The encoder receives already canonical core atoms. The decoder checks ordering
-before constructing a core draft; it never uses core canonicalization to repair
-corrupt stored data. The payload has no local magic or version field because
-`memory_meta.format_version` selects its codec.
+The timestamp is signed Unix milliseconds. It is content, not recall score or
+insertion identity. The episode sequence remains canonical append order.
 
 ## Feedback rows
 
-`feedback_edges` stores sparse directed traces between existing episode
-sequences. Self-edges are invalid. `sample_count` is `1..=16`; bit zero is the
-newest assessment, `1` means helpful, and all bits above `sample_count` must be
-zero. Neutral traces remain stored state. The SQLite adapter reconstructs every
-row through the validated core setter and exposes no partial graph.
+`feedback_edges` stores sparse directed traces between existing episodes.
+Self-edges are invalid. `sample_count` is `1..=16`; bit zero is the newest
+assessment, `1` means helpful, and bits above the count are zero. Neutral traces
+remain persisted. Every row is reconstructed through the validated core setter.
 
-## Semantic rows
+Feedback affects only the programmatic source-conditioned core recall. It is
+stored unchanged by V8 and does not enter semantic query scoring.
 
-`semantic_cues` stores one fixed-profile vector for every distinct key/value
-binding used by a committed episode. Cue IDs form the exact append-only prefix
-selected by `memory_meta.semantic_cue_count`; key/value pairs are unique and
-reference the shared symbol catalog. `episode_cues` is the exact posting
-projection from each episode to all of its bound cues. Its reverse index does
-not change the posting identity or ordering contract.
+## Episode vectors
 
-The count is itself an unsigned 64-bit prefix length. It can therefore reach
-`u64::MAX`, making `u64::MAX - 1` the largest assignable cue ID; a further cue
-fails before text resolution or model inference.
+`episode_vectors` owns exactly one fixed-profile vector for every committed
+episode, keyed by the same sequence. Its rows must form the exact episode prefix
+and can neither outlive nor precede an episode. Identical episode text still has
+one row per episode; there is no cue catalog, posting table, shared-vector key,
+persisted norm, or approximate-search index.
 
-The exact text projection, model artifacts, profile fingerprint, quantization,
-lazy acquisition, and validation tiers are defined by the
-[semantic cue contract](semantic-contract.md).
+The vector projection, model, fingerprint, codec, validation, and scoring rules
+are defined by the [semantic episode contract](semantic-contract.md).
 
 ## Open lifecycle
 
 Opening an existing store performs, in order:
 
 1. Apply and verify session settings.
-2. Verify the SQLite application ID.
-3. Read metadata and require format V7.
-4. Verify durability settings without changing persistent journal mode.
-5. Begin one consistent read transaction.
-6. Validate memory identity, revision, the fixed semantic profile, exact schema,
-   targeted SQLite quick checks, and agreement between the semantic cue count
-   and cue-catalog tail.
-7. Stream `symbols` in ID order and require fixed-width contiguous IDs,
-   canonical normalized text, length bounds, and unique values.
-8. Stream `episodes` in sequence order and require the exact prefix `0..N`.
-9. Strictly decode every payload, validate every symbol reference, and rebuild
-   the corresponding immutable core atom.
-10. Validate and restore the complete feedback graph.
-11. Commit the read transaction and only then expose the store.
+2. Verify the application ID and require V8.
+3. Verify durability without changing journal mode.
+4. Begin one consistent read transaction.
+5. Validate metadata, fixed profile, closed schema, and targeted SQLite quick
+   checks for `memory_meta`, `symbols`, `episodes`, and `feedback_edges`.
+6. Stream `symbols` by ID and require contiguous IDs, canonical text, bounds,
+   and unique values.
+7. Stream `episodes` by sequence, require the exact prefix, strictly decode each
+   payload, resolve every symbol, and rebuild immutable core atoms.
+8. Validate and restore the complete feedback graph.
+9. Compare the indexed last episode-vector sequence with the episode tail.
+10. Commit the read transaction and expose the store.
 
-Operational open does not scan every semantic vector or posting. Persisted cue
-rows reached while preparing a later save are validated before use. The adapter
-keeps only catalog boundaries, the semantic cue count, and locally pending
-assignments in long-lived state, not full text, cue, or posting maps. The
-reconstructed memory stores only numeric symbols. Symbolic recall indexes remain
-private core caches rebuilt from immutable episodes.
+Operational open intentionally does not scan vector bodies or the entire vector
+key set. A missing or extra tail fails immediately; an interior gap or malformed
+body can remain dormant until recall or full check. This tier keeps ordinary
+process startup independent of semantic payload bytes.
+
+The adapter retains numeric memory, symbol boundaries, locally staged symbol
+assignments, and prepared vectors. It does not retain complete text or persisted
+vector maps. Core symbolic indexes are private caches rebuilt from episodes.
 
 ## Full check lifecycle
 
-`SqliteStore::check(path)` opens the database with SQLite's read-only flag. It
-performs the same identity, version, settings, metadata, schema, snapshot, and
-operational reconstruction checks, plus whole-file `integrity_check`,
-`foreign_key_check`, and a complete semantic audit. The semantic audit requires
-gapless cue IDs, canonical vectors, unique and resolvable pairs, exact postings
-for every episode, and neither unused nor missing cue pairs.
+`SqliteStore::check(path)` opens with SQLite's physical read-only flag. It runs
+the same identity, format, schema, snapshot, and reconstruction checks plus
+whole-file `integrity_check`, `foreign_key_check`, and a complete ordered vector
+scan. Vector sequences must equal `0..episode_count`; every vector must have the
+canonical width, component range, and non-zero content.
 
-The full check never constructs the semantic encoder or resolves model assets.
-It neither saves nor changes the revision, rows, journal mode, or file contents.
-It is intentionally more expensive than operational open.
+The check never constructs the semantic encoder, resolves model assets,
+re-encodes text, saves, or changes revision, rows, journal mode, or file bytes.
 
 ## Save lifecycle
 
 Each store remembers its opened revision, persisted episode count, symbol tail,
-and persisted semantic cue count. Before taking a write transaction, save:
+pending symbol assignments, and completely prepared vector suffix. Before a
+write transaction, `save()`:
 
-1. Validates every new episode key and value against the
-   persisted-or-staged symbol prefix.
-2. Derives new episode bindings in deterministic order and resolves existing
-   cue pairs through bounded indexed queries.
-3. Resolves normalized text and encodes only missing cues through the fixed
-   profile, outside the SQLite write lock.
-4. Validates the complete encoder result and stages new cue IDs, vectors, and
-   episode postings in process memory.
+1. validates every new episode symbol reference;
+2. rejects an already stale writer before model work;
+3. resolves normalized texts for only the unprepared episode suffix;
+4. creates one canonical episode passage and vector per new episode; and
+5. adds those vectors to retry state only after the complete preparation batch
+   succeeds.
 
-It then verifies durability and runs one `BEGIN IMMEDIATE` transaction:
+It then verifies durability and starts one `BEGIN IMMEDIATE` transaction:
 
-1. Recheck application ID, memory ID, expected revision, persisted semantic cue
-   count, and the closed schema.
-2. Reject revision exhaustion before any mutation.
-3. Verify the remembered episode, symbol, and semantic cue tails against indexed
-   last-row queries.
-4. Increment the singleton revision exactly once, publish the next semantic cue
-   count, and require one changed metadata row.
-5. Insert staged symbols and semantic cues in ascending ID order.
-6. Append only episodes at or beyond the remembered episode count and insert
-   their exact semantic postings.
+1. Recheck application ID, memory ID, expected revision, V8 profile, and closed
+   schema.
+2. Reject revision exhaustion.
+3. Verify remembered episode, symbol, and vector tails with indexed last-row
+   queries.
+4. Advance the singleton revision exactly once.
+5. Insert staged symbols in ID order.
+6. Append episodes and their same-sequence vectors.
 7. Reconcile feedback in deterministic source/target order.
-8. Commit.
-9. Only after commit update remembered boundaries and clear staged symbols and
-   cues.
+8. Commit, then update local persisted boundaries and clear pending state.
 
 Every successful save increments the revision, including a logical no-op.
-Interning never starts an independent transaction. Two sessions may locally
-stage different text under the same next ID; the first save advances the shared
-revision, and the stale session fails before publishing any symbol, semantic
-cue, episode, posting, or feedback state. Semantic inference can already have
-completed before that compare-and-swap rejection; it never runs while the write
-transaction is held.
+Inference never runs while the write transaction is held. A transactional
+failure rolls back all database changes but retains prepared vectors for retry;
+newly appended episodes after such a failure encode only their unprepared
+suffix. A stale writer is never merged or overwritten.
 
-Feedback reconciliation performs an ordered full comparison because callers
-can mutate the graph through `memory_mut()` and the adapter does not duplicate a
-persisted graph or introduce persistence dirty tracking into the core. Small
-deltas perform only planned insert, update, and delete statements after the read
-cursor closes. A bounded bulk fallback replaces the table for very large
-changes. Every encountered persisted row is validated before any feedback DML.
+Feedback reconciliation compares the ordered persisted and in-memory graphs
+because callers can mutate through `memory_mut()` and the core has no persistence
+dirty tracking. Small deltas issue planned insert/update/delete statements after
+the read cursor closes; a bounded bulk fallback replaces the table for very
+large changes. Every observed persisted row is validated before DML.
 
-Any failure before commit rolls back the database while retaining the local
-pending state for retry. The adapter does not automatically retry, merge
-divergent histories, or use last-writer-wins behavior.
+## Semantic recall lifecycle
 
-## Fail-closed behavior
+Semantic recall first normalizes the query. Limit zero returns no hits after
+query validation without loading the model, rereading the revision, or scanning
+vectors. For positive limits it verifies memory identity and revision, returns
+offline when the committed store is empty, and encodes the query outside a
+transaction. It then starts a read transaction, repeats the identity/revision
+check, and streams every vector in primary-key order.
 
-`StoreError` distinguishes I/O, SQLite, entropy, invalid persisted state,
-concurrent modification, revision exhaustion, invalid symbol input, symbol-ID
-or semantic cue-ID exhaustion, unknown symbol references, and semantic encoding
-failure. `StoreIntegrityError` reports file identity, metadata, schema,
-encoding, symbol, episode, feedback, semantic cue, posting, SQLite integrity,
-and foreign-key violations. Both enums are non-exhaustive.
+The scan requires the exact vector prefix, validates all accessed bytes, computes
+fixed-point cosine scores, and keeps a bounded deterministic ranking. Pending
+unsaved episodes are excluded. A concurrent commit during query encoding fails
+the second revision check rather than combining different snapshots. The read
+transaction and database are not mutated.
 
-The adapter never migrates unsupported formats, accepts a partially valid
-snapshot, renumbers identifiers, repairs references, canonicalizes stored
-payloads or symbols, drops invalid rows, clamps feedback, or exposes state
-before complete validation. Direct SQL modification is outside the supported
-API.
+## Fail-closed behavior and compatibility
 
-V1-V3 lack source text. V4 and V5 have incompatible symbol namespaces and
-episode semantics. Converting their role-specific statements to unordered open
-attributes would be a potentially lossy semantic transformation, not a safe
-format migration. V6 contains the current text and episode semantics but lacks
-the fixed integrated semantic profile, cue vectors, postings, and metadata.
-Creating those rows would require a model-backed mutating migration, which this
-adapter does not perform. V1-V6 are therefore rejected.
+`StoreError` distinguishes I/O, SQLite, entropy, invalid stores, concurrent
+modification, revision or symbol-ID exhaustion, invalid symbols or semantic
+queries, unknown symbol references, and episode/query encoding failure.
+`StoreIntegrityError` distinguishes file identity, metadata, schema, encodings,
+symbol, episode, feedback, episode-vector, SQLite-integrity, and foreign-key
+violations. Both enums are non-exhaustive.
+
+The adapter never accepts a partial snapshot, renumbers IDs, repairs references,
+canonicalizes stored data, drops invalid rows, clamps feedback, or mutates an
+unsupported file. V1-V3 lack source text; V4-V5 have incompatible symbol and
+episode contracts; V6 lacks mandatory integrated vectors; V7 stores per-cue
+vectors and postings under a different profile. Constructing V8 episode vectors
+requires model-backed re-encoding, so V1-V7 are rejected without migration.
 
 ## CLI boundary
 
-The CLI creates and accepts only format V7. `add`, `recall`, and `feedback`
-require an existing database and reconstruct it fully. Singular and batch add
-intern keys and values through the shared catalog, encode previously unseen
-bound cues, and publish symbols, cues, vectors, episodes, and postings using
-exactly one save. Feedback also uses exactly one save.
+The CLI creates and accepts V8 only. `add` and `feedback` require an existing
+database and call exactly one save. Singular and batch add intern symbols,
+encode every new episode, and atomically publish symbols, episodes, and vectors.
+If the installed model prerequisite is missing or invalid, add fails with empty
+standard output and no committed state.
 
-Recall performs no interning and no save. It resolves only distinct symbols in
-the returned hits through bounded indexed batches. It emits normalized text and
-does not change the revision or database contents. The current implementation
-uses the same read-write `SqliteStore::open()` path, so logical read-only behavior
-does not imply a read-only SQLite connection. `check` uses the physically
-read-only exhaustive path, is silent on success, and never loads the model.
+CLI recall accepts only a free-text `--query`, performs no interning or save,
+resolves text only for returned hits, and reports the semantic score as
+`activation_ppm`. It uses the read-write operational store connection while
+remaining logically non-mutating. `check` uses the physically read-only full
+audit and is silent on success.
 
 ## Durability boundary
 
-A save is one rollback-journal transaction with `synchronous=EXTRA`. This
-targets SQLite's strongest applicable rollback-journal synchronization behavior,
-including additional directory synchronization after journal removal. It does
-not make unsaved mutations durable and is not evidence for every storage
-device, filesystem, operating system, or sudden-power-loss scenario.
+A save is one rollback-journal transaction with `synchronous=EXTRA`, SQLite's
+strongest applicable rollback-journal synchronization policy. This does not make
+unsaved mutations durable or prove sudden-power-loss behavior for every device,
+filesystem, or operating system.
 
-Creation synchronizes the complete private staging file before no-clobber
-publication. The adapter does not `fsync` the parent directory. Where the
-platform uses a hard-link publication fallback, a temporary link can remain
-after cleanup failure or process crash. The caller owns the trust and lifecycle
-of the containing directory.
+Creation synchronizes the private staging file before no-clobber publication.
+It does not synchronize the parent directory. A hard-link publication fallback
+can leave a temporary link after cleanup failure or process crash; the caller
+owns the containing directory's trust and lifecycle.

@@ -39,12 +39,12 @@ impl FeedbackEdge {
     }
 }
 
-/// A non-zero query-local activation score returned by source-conditioned recall.
+/// A non-zero query-local activation score returned by a recall operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecallHit {
     /// Identifier of the recalled atom.
     pub atom_id: AtomId,
-    /// Query-local fixed-point activation used for ranking.
+    /// Query-local fixed-point activation or similarity used for ranking.
     pub activation: Activation,
 }
 

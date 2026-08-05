@@ -1,208 +1,167 @@
-# Semantic cue contract
+# Semantic episode contract
 
-This document defines the fixed semantic projection integrated into the SQLite
-V7 database described by the [SQLite contract](sqlite-contract.md). The
-in-memory state and observable recall behavior remain defined by the
+This document defines the fixed semantic projection and free-text retrieval
+integrated into the SQLite V8 database described by the
+[SQLite contract](sqlite-contract.md). The dependency-free kernel and its
+source-conditioned symbolic recall remain defined by the
 [core contract](core-contract.md).
 
-Semantic rows are required persisted V7 state, but normalized symbol text and
-episodes remain authoritative. The core does not ingest vectors or postings,
-and semantic data does not change source-conditioned recall, feedback, scores,
-or ordering in this version.
+Every committed episode has exactly one mandatory semantic vector. An add is
+successful only when its normalized symbols, episode, and vector are published
+by the same SQLite transaction. There is no searchable-later fallback, optional
+semantic cache, sidecar, or independently writable index.
 
-## Bound cue projection
+## Episode and query projection
 
-Every distinct attribute binding with key `k` and value `v` produces exactly
-one semantic cue `(k, v)`. Every episode containing that binding has exactly one
-posting to the cue. Repeated use of the same binding reuses its vector; using
-the same value under a different key produces a different cue.
+For an episode, every bound normalized attribute pair `(key, value)` becomes
+one line:
 
-Timestamps, key-only symbols, feedback traces, and whole episodes do not produce
-semantic vectors. Core canonicalization has already merged repeated attributes
-and removed repeated values, so one episode cannot produce a duplicate posting.
+```text
+passage: key: value
+other key: other value
+```
 
-The encoder receives the normalized key and value text resolved from the V7
-symbol catalog. Text is not copied into semantic rows. Cue identifiers are local
-unsigned 64-bit values beginning at zero and forming a gapless, append-only
-prefix. They are never deleted, reused, renamed, or rebound.
+Pairs are sorted lexically and deduplicated before rendering. Symbol allocation,
+attribute input order, and repeated values therefore cannot change the passage.
+The timestamp and feedback traces are excluded. Equal episode content is encoded
+for every distinct episode because the persisted vector is owned by its episode
+sequence rather than shared by text identity.
+
+A normalized free-text query is rendered as:
+
+```text
+query: normalized query
+```
+
+Both inputs use the SQLite symbol normalizer: Unicode 16 NFKC, locale-independent
+lowercase mapping, NFKC again, Unicode whitespace collapse, control-character
+rejection, and a 4,096-byte normalized UTF-8 limit. The model path is
+language-agnostic: there is no language detection, routing, translation, locale
+selection, or language-specific scoring branch.
 
 ## Fixed embedding profile
 
-V7 has exactly one built-in embedding profile:
+V8 has one built-in profile:
 
 - model: `intfloat/multilingual-e5-small`;
-- model revision: `0e60b8d9d2166d80387f86e3b48ec9ced55f4d15`;
-- ONNX artifact: `onnx/model.onnx`, SHA-256
+- revision: `0e60b8d9d2166d80387f86e3b48ec9ced55f4d15`;
+- FP32 ONNX artifact: `onnx/model.onnx`, SHA-256
   `ca456c06b3a9505ddfd9131408916dd79290368331e7d76bb621f1cba6bc8665`;
 - tokenizer artifact: `onnx/tokenizer.json`, SHA-256
   `0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39`;
-- tokenizer runtime: `tokenizers` 0.23.1;
-- model input: `passage: {normalized key}: {normalized value}`;
-- special tokens enabled; maximum input length 512 tokens, with longest-first
-  right truncation and zero stride, batch-longest right padding with no
-  multiple, `<pad>` token ID `1`, and padding type ID `0`;
-- ONNX Runtime 1.28 through `ort` 2.0.0-rc.13, exclusively bound to the unique
-  CPU device of `CPUExecutionProvider`, level-three graph optimization, sequential
-  execution, one intra-op and one inter-op thread, deterministic compute
-  enabled, memory patterns and the CPU arena disabled, environment execution
-  providers ignored, and one cue per model invocation;
-- `input_ids`, `attention_mask`, and `token_type_ids` as signed 64-bit tensors,
-  with `last_hidden_state` read as 32-bit floating point output;
-- masked token vectors accumulated left-to-right in `f64`, divided by the
-  unmasked token count, then L2-normalized in `f64`; and
+- tokenizer runtime: `tokenizers` 0.23.1, special tokens enabled, maximum
+  length 512, longest-first right truncation with zero stride, and no padding;
+- ONNX Runtime 1.28 through `ort` 2.0.0-rc.13, the unique CPU device from
+  `CPUExecutionProvider`, level-three graph optimization, sequential execution,
+  one intra-op and inter-op thread, deterministic compute enabled, memory
+  patterns and the CPU arena disabled, and environment providers ignored;
+- signed 64-bit `input_ids`, `attention_mask`, and `token_type_ids`, with
+  `last_hidden_state` read as FP32;
+- attention-masked token vectors accumulated left-to-right in `f64`, divided by
+  the unmasked count, then L2-normalized in `f64`; and
 - 384 signed 16-bit coordinates.
 
-There is no locale selection, language detection, translation, or
-language-specific execution path. Every normalized Unicode input passes through
-the same fixed projection, tokenizer, model, pooling, and quantization pipeline.
-Cross-script fixtures only verify that this single path remains stable; they do
-not select localized behavior.
+Queries are right-truncated at the fixed context boundary. Episodes are rejected
+instead of truncated because silently removing attributes would make committed
+semantic state incomplete.
 
-The profile fingerprint stored in `memory_meta` is SHA-256
-`1297d8d28c7dbe9c624a13a0afa6bf8aa6eb7a43c3235359089ceed7df1f5b25`.
-It binds these artifacts and the complete preprocessing, pooling,
-normalization, and quantization pipeline. It is a file-format constant, not
-caller configuration. Opening a database with a different fingerprint fails
-closed.
+The V8 profile fingerprint is SHA-256
+`79a5437c9d41cb7022451c2c3bc4708c769e7a073506c5d368c2f27e258fe18b`.
+It binds the artifacts and complete projection, tokenizer, runtime, pooling,
+normalization, and quantization policy. It is a file-format constant, not caller
+configuration. A different fingerprint is rejected.
 
-The text rendering above is model input, not a stored identifier or reversible
-serialization. Key and value IDs remain structurally separate in
-`semantic_cues`, so punctuation resembling the separator cannot change cue
-identity.
+Each normalized component is multiplied by `32,767`, rounded with halfway
+values away from zero, clamped to `[-32,767, 32,767]`, and persisted as
+little-endian two's-complement `i16`. A vector is exactly 768 bytes, contains no
+`i16::MIN`, and has at least one non-zero component. No floating-point vector,
+tokens, norm, model output, confidence, or semantic label is stored.
 
-Each coordinate is persisted as signed two's-complement `i16` in little-endian
-order. Quantization multiplies each normalized component by `32,767`, applies
-Rust `f64::round()` (halfway values away from zero), clamps to
-`[-32,767, 32,767]`, and converts to `i16`. A vector is therefore exactly 768
-bytes and must contain at least one non-zero coordinate. The database contains
-no floating-point vector, norm, model output, token sequence, confidence value,
-or semantic label.
+For fixed artifacts and runtime on one platform, repeated encoding must produce
+identical quantized bytes. Persisted bytes remain stable
+when a database moves. This contract does not promise byte-identical fresh
+inference across operating systems or CPU architectures; observable recall over
+a particular persisted database is nevertheless integer-only and deterministic.
 
-## Determinism boundary
+## Installation and runtime boundary
 
-For one supported platform, fixed artifacts and profile settings must reproduce
-the exact same quantized vector bytes for the same canonical cue text. Every
-cue uses the same singleton model-input shape, so request grouping, order, and
-outer batches of up to 32 cues cannot change its tensor shape. This is the
-strict repeatability boundary used by same-platform contract tests. The V7
-release targets are Linux x86_64, macOS arm64, and Windows x86_64.
+The pinned model and tokenizer are product installation prerequisites. Runtime
+commands never download or repair them. Cache discovery follows the Hugging Face
+cache rules (`HF_HUB_CACHE`, otherwise `$HF_HOME/hub`, otherwise the default user
+cache), then requires both exact revision paths and SHA-256 values.
 
-ONNX floating-point kernels are not specified to be byte-identical across CPU
-architectures and operating systems. Cross-platform qualification therefore
-accepts independently generated vectors only when every corresponding `i16`
-coordinate differs by at most one quantization bin and their cosine similarity
-is at least `0.999999`. Universal text-to-vector byte equality is not promised.
+Constructing an encoder and running `init` or `check` perform no model I/O. The
+first episode encoding or positive-limit query against a non-empty store in a
+process verifies the cached artifacts, loads one lazy ONNX session, and performs
+inference. Missing, unreadable, hash-mismatched, unusable, or invalid artifacts
+fail clearly. Provisioning belongs to product packaging or release setup; this
+repository does not define an installer.
 
-Persisted vector bytes remain unchanged when a database moves between
-platforms. Core behavior and current recall stay deterministic for that fixed
-database because neither regenerates nor scores semantic vectors. Any future
-semantic score fusion must define its own observable cross-platform ordering
-and near-tie behavior before it can become part of recall.
+## Atomic save lifecycle
 
-## Model acquisition and runtime
+`save()` encodes the complete unprepared episode suffix before its single SQLite
+write transaction. An episode and its vector commit together or neither does;
+model work never holds the write lock. Preparation is batch-atomic, while fully
+prepared vectors survive a later transactional failure for retry. The exact
+validation, CAS, insertion order, and post-commit state transition are defined
+once in the [SQLite save lifecycle](sqlite-contract.md#save-lifecycle).
 
-The encoder and model are initialized lazily. Creating or opening a store,
-running the full integrity check, resolving text, recalling from an episode, and
-applying feedback do not resolve model assets. A save also avoids the runtime
-when every cue needed by its new episodes already exists.
+## Exact semantic recall
 
-When the first missing cue must be encoded, the runtime resolves the pinned
-artifacts through its local Hugging Face cache. Cache discovery uses
-`HF_HUB_CACHE` when set, otherwise `$HF_HOME/hub`, otherwise
-`~/.cache/huggingface/hub`. Missing artifacts trigger a download from the fixed
-model revision. Each artifact is hash-checked before model loading. A hash
-mismatch triggers exactly one forced download and one further check, after which
-the operation fails. There is no unpinned model selection, caller-supplied
-profile, approximate substitute, or silent symbolic fallback.
+`SqliteStore::recall_semantic(query, limit)` operates only on committed episode
+vectors. Pending episodes are invisible. It normalizes the query, rejects
+invalid input even when `limit == 0`, and returns immediately for zero limit.
+For a positive limit it verifies the opened revision, avoids model work for an
+empty store, encodes the query outside a transaction, then opens a read
+transaction and rechecks the revision before scanning.
 
-Consequently, the first addition of a new cue can require network access and a
-large download. Offline operation succeeds only when the verified artifacts are
-already cached. Runtime, network, tokenizer, model, non-finite output, wrong
-dimension, all-zero vector, and quantization failures reject the save before
-any database transaction begins.
+For query vector `q` and episode vector `e`, with 384 signed components:
 
-Encoding preserves input order and accepts at most 32 cues per call. An empty
-call remains offline and does not load the runtime. The encoder returns exactly
-one canonical vector per requested cue. A missing, extra, wrongly profiled,
-wrongly dimensioned, or all-zero result rejects the complete operation. The
-store splits larger missing-cue sets into ordered calls of at most 32 and
-validates every result before adding any cue to its pending state.
+```text
+dot = sum(q[i] * e[i])
+denominator = isqrt(sum(q[i]^2) * sum(e[i]^2))
+score = 0                                      when dot <= 0
+score = min(1_000_000,
+            floor(dot * 1_000_000 / denominator)) otherwise
+```
 
-## Integrated persistence
+All accumulation and ranking are integer-only. Zero scores are omitted. Positive
+hits sort by score descending, then complete `AtomId` ascending. A bounded heap
+retains at most `limit` results without changing the final order. The scan still
+validates every row, including candidates that would score zero.
 
-`memory_meta` stores the fixed non-zero profile fingerprint and the canonical
-big-endian semantic cue count. `semantic_cues` stores the gapless cue ID, bound
-key and value IDs, and one fixed-width vector. `(key_id, value_id)` is unique and
-both IDs reference the shared symbol catalog. `episode_cues` stores the exact
-many-to-many posting relation and references existing episodes and cues. The
-reverse `(cue_id, sequence)` index is persisted for future candidate traversal.
+Recall is an exact `O(E * 384)` scan over `E` committed episodes with
+`O(min(E, limit))` ranking memory. There is no ANN index, score threshold,
+field weighting, cue pooling, symbolic fusion, or feedback contribution.
+The reported `activation_ppm` is the query-local cosine projection, not stored
+core activation, confidence, or truth.
 
-The complete DDL and scalar encodings are part of the closed SQLite V7 schema.
-There is no second database, synchronization watermark, independent format
-version, cross-file identity, or separately writable semantic state.
+## Validation tiers
 
-## Save lifecycle and atomicity
+Operational `open`, exhaustive `check`, and recall-time validation are specified
+in the [SQLite contract](sqlite-contract.md#open-lifecycle). In particular,
+`open` avoids vector-body scans, while `check` and semantic recall validate the
+exact vector prefix and every accessed component without loading the model.
 
-Before beginning its SQLite write transaction, `save()` validates all new
-episode symbol references and derives their bound pairs in deterministic order.
-It resolves existing cues with bounded indexed queries and embeds only missing
-pairs. New normalized symbol text staged in the same store is eligible for this
-projection.
-
-Only after every required vector has been produced and validated does the store
-begin its existing immediate transaction. It rechecks memory identity, expected
-revision, episode and symbol tails, semantic cue count and tail, and the closed
-schema. The transaction then advances the revision and cue count, inserts staged
-symbols and new cues, appends episodes and exact postings, reconciles feedback,
-and commits them together.
-
-No network or model inference occurs while the SQLite write transaction is
-held. Any error before commit leaves the previous database byte state committed;
-no symbol, cue, vector, episode, posting, feedback change, count, or revision is
-partially published. A stale writer is rejected rather than merging its locally
-prepared semantic state.
-
-## Two validation tiers
-
-`SqliteStore::open()` is the operational path. It checks file identity, V7
-metadata and fixed profile, durability policy, exact schema, targeted SQLite
-quick checks for the authoritative tables, symbol and episode reconstruction,
-feedback restoration, and agreement between the semantic cue count and catalog
-tail. Semantic cue rows returned by an operational lookup are validated before
-use. This path deliberately does not scan every vector and posting.
-
-`SqliteStore::check()` is the exhaustive audit path. It opens the file
-physically read-only, performs SQLite `integrity_check` and `foreign_key_check`,
-reconstructs the same authoritative state, then scans the complete semantic
-catalog and postings. It requires:
-
-- cue IDs to be the exact prefix `0..semantic_cue_count`;
-- every bound key and value to resolve and every pair to be unique;
-- every vector to have the canonical width and a non-zero coordinate;
-- every episode's postings to equal its attribute bindings exactly; and
-- the global cue catalog to contain neither an unused nor a missing bound pair.
-
-The exhaustive audit never resolves, downloads, or loads the model and never
-changes connection-persistent settings, revision, rows, or file contents. No
-partially validated store is returned by either tier.
+The audit can prove structural and codec integrity, not that valid-looking bytes
+were originally produced from the corresponding text. Proving that would require
+model-backed re-encoding, which is outside this offline integrity contract.
 
 ## CLI boundary and non-goals
 
-`nao-m-e check <DATABASE>` exposes the exhaustive tier. Success is silent;
-invalid data is a runtime failure with empty standard output. The existing
-`init`, `add`, `recall --from`, and `feedback` grammar and successful output stay
-unchanged. New cues are embedded as part of the existing atomic add save.
+The only CLI recall form is:
 
-V7 deliberately does not provide:
+```text
+nao-m-e recall <DATABASE> --query <TEXT> [--limit <N>]
+```
 
-- `recall <TEXT>` or any other semantic-text query;
-- vector similarity search, approximate nearest neighbors, or score fusion;
-- whole-episode, timestamp, key-only, or feedback embeddings;
-- multiple models, profiles, dimensions, or caller-provided vectors;
-- background indexing, automatic repair, migration, or garbage collection; or
-- evidence that the fixed model improves retrieval quality or is semantically
-  correct for a particular language, domain, or task.
+It is logically read-only and renders normalized episode text for ranked hits.
+Source-conditioned retrieval is a separate programmatic core API,
+`Memory::recall_from`. Existing episode-to-episode helpful/unhelpful feedback
+remains persisted and affects that core API, but not semantic query ranking.
 
-Those retrieval and evaluation questions require separate contracts and
-evidence. Persisting vectors now establishes the atomic, deduplicated cue
-foundation without changing current recall behavior.
+V8 deliberately provides no approximate search, model selection, quantization
+alternative, caller-supplied vector, score fusion, learned semantic ranking,
+background indexing, migration, automatic repair, or general retrieval-quality
+claim. Curated retrieval fixtures are regression evidence for declared cases,
+not proof of production or domain-wide quality.

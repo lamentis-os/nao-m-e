@@ -5,11 +5,12 @@
 These instructions apply to the entire repository. The workspace contains a
 deterministic, in-memory Rust 2024 kernel for symbolic episode memory, an
 optional SQLite snapshot adapter, and a user- and agent-facing command-line
-adapter. SQLite V7 atomically stores a fixed multilingual-E5 projection for
-bound attribute cues, while a dedicated semantic crate owns lazy local model
-inference. Core behavior is defined in `docs/core-contract.md`; authoritative
-persistence is defined in `docs/sqlite-contract.md`; the fixed model and cue
-projection are defined in `docs/semantic-contract.md`.
+adapter. SQLite V8 atomically stores one fixed multilingual-E5 vector for every
+episode, while a dedicated semantic crate owns lazy cache-only local model
+inference for episode projection and free-text retrieval. Core behavior is
+defined in `docs/core-contract.md`; authoritative persistence is defined in
+`docs/sqlite-contract.md`; the fixed model, projections, and semantic recall are
+defined in `docs/semantic-contract.md`.
 
 ## Source layout
 
@@ -32,21 +33,22 @@ projection are defined in `docs/semantic-contract.md`.
   revision validation, and atomic save orchestration.
 - `crates/nao-m-e-sqlite/src/store/symbols.rs` owns text-symbol normalization,
   allocation, staging, validation, and resolution.
-- `crates/nao-m-e-sqlite/src/store/semantic.rs` owns integrated cue allocation,
-  embedding preparation, transactional cue/posting publication, and exhaustive
-  semantic audit.
+- `crates/nao-m-e-sqlite/src/store/semantic.rs` owns episode-vector preparation,
+  transactional publication, tail validation, and exhaustive semantic audit.
+- `crates/nao-m-e-sqlite/src/store/semantic_recall.rs` owns committed-vector
+  scanning, integer cosine scoring, and deterministic semantic ranking.
 - `crates/nao-m-e-sqlite/src/store/feedback.rs` owns feedback restoration and
   transactional reconciliation.
 - `crates/nao-m-e-sqlite/src/store/tests.rs` exercises private lifecycle,
   revision, corruption, and transaction invariants.
 - `crates/nao-m-e-sqlite/tests` exercises the public adapter contract.
-- `crates/nao-m-e-semantic/src/profile.rs` owns the fixed model artifact,
-  tokenizer, projection, runtime, pooling, normalization, quantization, and
-  fingerprint contract.
-- `crates/nao-m-e-semantic/src/model.rs` owns bound cue text and fixed-width
-  embedding values.
-- `crates/nao-m-e-semantic/src/encoder.rs` owns lazy verified asset resolution,
-  tokenization, ONNX inference, and canonical vector production.
+- `crates/nao-m-e-semantic/src/profile.rs` owns fixed model, tokenizer, profile
+  manifest, and fingerprint constants.
+- `crates/nao-m-e-semantic/src/model.rs` owns episode and query text projections
+  and fixed-width embedding values.
+- `crates/nao-m-e-semantic/src/encoder.rs` owns lazy verified cache-only asset
+  resolution, tokenization, ONNX inference, pooling, normalization,
+  quantization, and canonical vector production.
 - `crates/nao-m-e-semantic/src/error.rs` owns semantic runtime failures.
 - `crates/nao-m-e-semantic/tests` exercises the public fixed-profile runtime
   boundary without requiring the production model in ordinary test runs.
@@ -54,8 +56,8 @@ projection are defined in `docs/semantic-contract.md`.
   initialization, exhaustive check, feedback, and shared save/output handling.
 - `crates/nao-m-e-cli/src/add.rs` owns Add grammar, text-episode parsing,
   symbol interning, and atomic Add execution.
-- `crates/nao-m-e-cli/src/recall.rs` owns Recall grammar, symbol resolution, and
-  deterministic text output.
+- `crates/nao-m-e-cli/src/recall.rs` owns free-text Recall grammar, semantic
+  dispatch, symbol resolution, and deterministic text output.
 - `crates/nao-m-e-cli/tests/cli.rs` and `tests/cli` form one cross-process CLI
   contract target.
 
@@ -81,17 +83,20 @@ repository-level guardrails when changing the implementation:
 - Keep attribute-key and value text in one append-only SQLite symbol catalog.
   The core and episode payloads remain numeric; every persisted symbol
   reference must resolve to that catalog before a snapshot is exposed.
-- Keep the fixed semantic profile and its cue vectors outside the dependency-free
-  core. SQLite V7 publishes symbols, vectors, episodes, and postings atomically;
-  normalized text and episodes remain authoritative, and vectors must not change
-  current core scoring.
+- Keep the fixed semantic profile and episode vectors outside the dependency-free
+  core. SQLite V8 publishes staged symbols, episodes, and their mandatory
+  same-sequence vectors atomically; normalized text and episodes remain
+  authoritative, and vectors must not change programmatic core scoring.
 - Keep text processing locale-free: do not add locale selection, language
   detection, translation, localized profiles, or language-specific execution
   branches. Unicode and cross-script text are data for one fixed pipeline, not
   product localization.
-- Resolve and encode only missing cues before taking the SQLite write
-  transaction. Model download or inference failure must fail closed without a
-  partially published database state or silent symbolic fallback.
+- Resolve and encode every missing episode vector before taking the SQLite write
+  transaction. Runtime model access is cache-only: missing or invalid installed
+  assets and inference failures must fail closed without a partially published
+  database state, runtime download, or silent symbolic fallback.
+- Keep CLI recall free-text-only. Programmatic source-conditioned core recall and
+  feedback remain available, while semantic query ranking ignores feedback.
 - Preserve canonical fixed-width identifier encodings and reject stale writers
   rather than silently merging or overwriting their snapshots.
 
@@ -114,8 +119,8 @@ repository-level guardrails when changing the implementation:
 - `docs/core-contract.md` is the single cross-cutting core specification.
 - `docs/sqlite-contract.md` is the single SQLite format and lifecycle
   specification.
-- `docs/semantic-contract.md` is the single fixed-profile semantic cue,
-  runtime, projection, and validation specification integrated with SQLite V7.
+- `docs/semantic-contract.md` is the single fixed-profile episode/query runtime,
+  projection, recall, and validation specification integrated with SQLite V8.
 - Rustdoc describes symbol-local semantics, errors, and non-obvious behavior.
   Public items remain documented under `#![deny(missing_docs)]`.
 - Ordinary comments explain only non-obvious reasons or invariants, not control
