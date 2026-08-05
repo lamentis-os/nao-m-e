@@ -1,7 +1,8 @@
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use nao_m_e::{Attribute, EpisodeDraft, FeedbackTrace, SymbolId, TimestampMs};
-use nao_m_e_semantic::{CueText, EMBEDDING_DIMENSIONS, Embedding};
+use nao_m_e_semantic::{EMBEDDING_DIMENSIONS, Embedding, EpisodeText};
 use rusqlite::{Connection, params};
 use tempfile::{TempDir, tempdir};
 
@@ -11,17 +12,9 @@ mod contract;
 
 struct FakeEncoder;
 
-impl semantic::CueEncoder for FakeEncoder {
-    fn encode(&mut self, cues: &[CueText<'_>]) -> Result<Vec<Embedding>, StoreError> {
-        Ok(cues
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                let mut values = vec![0; EMBEDDING_DIMENSIONS];
-                values[index % EMBEDDING_DIMENSIONS] = 1;
-                Embedding::new(values).unwrap()
-            })
-            .collect())
+impl semantic::EpisodeEncoder for FakeEncoder {
+    fn encode_episode(&mut self, _episode: EpisodeText<'_>) -> Result<Embedding, StoreError> {
+        Ok(one_hot_embedding(0))
     }
 }
 
@@ -79,38 +72,6 @@ fn saved_store(directory: &TempDir, episode_count: u64) -> PathBuf {
     path
 }
 
-fn saved_distinct_semantic_store(directory: &TempDir) -> PathBuf {
-    let path = directory.path().join("memory.sqlite3");
-    let mut store = SqliteStore::create(&path).unwrap();
-    let symbols = store
-        .intern_symbols(&[
-            "first-key".to_owned(),
-            "first-value".to_owned(),
-            "second-key".to_owned(),
-            "second-value".to_owned(),
-        ])
-        .unwrap();
-    for (timestamp, key, value) in [
-        (0, symbols[0], symbols[1]),
-        (1, symbols[2], symbols[3]),
-        (2, symbols[0], symbols[1]),
-    ] {
-        store
-            .memory_mut()
-            .insert_episode(
-                EpisodeDraft::new(
-                    TimestampMs::new(timestamp),
-                    vec![Attribute::new(key, vec![value]).unwrap()],
-                )
-                .unwrap(),
-            )
-            .unwrap();
-    }
-    save_for_test(&mut store).unwrap();
-    drop(store);
-    path
-}
-
 fn check_without_file_mutation(path: &Path) -> Result<(), StoreError> {
     let before = std::fs::read(path).unwrap();
     let result = SqliteStore::check(path);
@@ -127,430 +88,235 @@ fn check_integrity_error(path: &Path) -> StoreIntegrityError {
 }
 
 #[test]
-fn semantic_cues_follow_first_episode_occurrence_and_roundtrip() {
-    struct CueRow {
-        cue_id: Vec<u8>,
-        key_id: Vec<u8>,
-        value_id: Vec<u8>,
-        vector_bytes: i64,
-    }
-
+fn episode_vectors_follow_episode_sequences_and_roundtrip() {
     let directory = tempdir().unwrap();
-    let path = directory.path().join("memory.sqlite3");
-    let mut store = SqliteStore::create(&path).unwrap();
-    let symbols = store
-        .intern_symbols(&[
-            "old-key".to_owned(),
-            "old-value".to_owned(),
-            "new-key".to_owned(),
-            "new-value".to_owned(),
-        ])
-        .unwrap();
-    store
-        .memory_mut()
-        .insert_episode(
-            EpisodeDraft::new(
-                TimestampMs::new(1),
-                vec![Attribute::new(symbols[2], vec![symbols[3]]).unwrap()],
-            )
-            .unwrap(),
-        )
-        .unwrap();
-    store
-        .memory_mut()
-        .insert_episode(
-            EpisodeDraft::new(
-                TimestampMs::new(2),
-                vec![Attribute::new(symbols[0], vec![symbols[1]]).unwrap()],
-            )
-            .unwrap(),
-        )
-        .unwrap();
-
-    save_for_test(&mut store).unwrap();
-    let cues: Vec<CueRow> = store
-        .connection
-        .prepare(
-            "SELECT cue_id, key_id, value_id, length(vector) FROM semantic_cues ORDER BY cue_id",
-        )
+    let path = saved_store(&directory, 2);
+    let rows: Vec<(Vec<u8>, i64)> = Connection::open(&path)
         .unwrap()
-        .query_map([], |row| {
-            Ok(CueRow {
-                cue_id: row.get(0)?,
-                key_id: row.get(1)?,
-                value_id: row.get(2)?,
-                vector_bytes: row.get(3)?,
-            })
-        })
+        .prepare("SELECT sequence, length(vector) FROM episode_vectors ORDER BY sequence")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(cues.len(), 2);
-    assert_eq!(format::decode_u64(&cues[0].cue_id), Some(0));
-    assert_eq!(format::decode_u64(&cues[0].key_id), Some(2));
-    assert_eq!(format::decode_u64(&cues[0].value_id), Some(3));
-    assert_eq!(
-        cues[0].vector_bytes,
-        i64::try_from(format::SEMANTIC_VECTOR_BYTES).unwrap()
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(format::decode_u64(&rows[0].0), Some(0));
+    assert_eq!(format::decode_u64(&rows[1].0), Some(1));
+    assert!(
+        rows.iter()
+            .all(|(_, bytes)| { *bytes == i64::try_from(format::SEMANTIC_VECTOR_BYTES).unwrap() })
     );
-    assert_eq!(format::decode_u64(&cues[1].cue_id), Some(1));
-    assert_eq!(format::decode_u64(&cues[1].key_id), Some(0));
-    assert_eq!(format::decode_u64(&cues[1].value_id), Some(1));
-    drop(store);
     check_without_file_mutation(&path).unwrap();
 }
 
 #[test]
-fn known_cues_save_without_loading_the_production_encoder() {
-    let directory = tempdir().unwrap();
-    let path = directory.path().join("memory.sqlite3");
-    let mut store = SqliteStore::create(&path).unwrap();
-    let symbols = store
-        .intern_symbols(&["key".to_owned(), "value".to_owned()])
-        .unwrap();
-    let episode = |timestamp| {
-        EpisodeDraft::new(
-            TimestampMs::new(timestamp),
-            vec![Attribute::new(symbols[0], vec![symbols[1]]).unwrap()],
-        )
-        .unwrap()
-    };
-    store.memory_mut().insert_episode(episode(1)).unwrap();
-    save_for_test(&mut store).unwrap();
-    assert!(!store.encoder.is_loaded());
+fn stale_writer_fails_before_episode_encoding() {
+    struct RejectEncoder(Cell<usize>);
 
-    store.memory_mut().insert_episode(episode(2)).unwrap();
-    store.save().unwrap();
-    assert!(!store.encoder.is_loaded());
-    drop(store);
-    check_without_file_mutation(&path).unwrap();
-}
+    impl semantic::EpisodeEncoder for RejectEncoder {
+        fn encode_episode(&mut self, _: EpisodeText<'_>) -> Result<Embedding, StoreError> {
+            self.0.set(self.0.get() + 1);
+            panic!("stale writer must fail before semantic encoding")
+        }
+    }
 
-#[test]
-fn stale_writer_with_a_new_cue_reports_concurrent_modification() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("memory.sqlite3");
     drop(SqliteStore::create(&path).unwrap());
     let mut first = SqliteStore::open(&path).unwrap();
     let mut stale = SqliteStore::open(&path).unwrap();
-
-    for store in [&mut first, &mut stale] {
-        let symbols = store
-            .intern_symbols(&["key".to_owned(), "value".to_owned()])
-            .unwrap();
-        store
-            .memory_mut()
-            .insert_episode(
-                EpisodeDraft::new(
-                    TimestampMs::new(0),
-                    vec![Attribute::new(symbols[0], vec![symbols[1]]).unwrap()],
-                )
-                .unwrap(),
-            )
-            .unwrap();
-    }
+    insert(&mut first, draft(0));
+    insert(&mut stale, draft(1));
 
     save_for_test(&mut first).unwrap();
     let committed = std::fs::read(&path).unwrap();
+    let mut encoder = RejectEncoder(Cell::new(0));
     assert!(matches!(
-        save_for_test(&mut stale),
+        stale.save_with_encoder(&mut encoder),
         Err(StoreError::ConcurrentModification {
             expected_revision: 0,
             actual_revision: 1
         })
     ));
-    assert_eq!(std::fs::read(&path).unwrap(), committed);
+    assert_eq!(encoder.0.get(), 0);
     assert_eq!(stale.semantic.pending_len(), 0);
+    assert_eq!(std::fs::read(path).unwrap(), committed);
 }
 
 #[test]
-fn persisted_cue_cannot_be_repaired_by_interning_its_missing_endpoint() {
-    let directory = tempdir().unwrap();
-    let path = directory.path().join("memory.sqlite3");
-    let mut store = SqliteStore::create(&path).unwrap();
-    let symbols = store
-        .intern_symbols(&["key".to_owned(), "value".to_owned()])
-        .unwrap();
-    store
-        .memory_mut()
-        .insert_episode(
-            EpisodeDraft::new(
-                TimestampMs::new(0),
-                vec![Attribute::new(symbols[0], vec![symbols[1]]).unwrap()],
-            )
-            .unwrap(),
-        )
-        .unwrap();
-    save_for_test(&mut store).unwrap();
-    drop(store);
-
-    let raw = Connection::open(&path).unwrap();
-    raw.pragma_update(None, "foreign_keys", false).unwrap();
-    raw.execute(
-        "UPDATE semantic_cues SET value_id = ?1 WHERE cue_id = ?2",
-        params![
-            format::encode_u64(2).as_slice(),
-            format::encode_u64(0).as_slice()
-        ],
-    )
-    .unwrap();
-    drop(raw);
-
-    let mut reopened = SqliteStore::open(&path).unwrap();
-    let future = reopened.intern_symbols(&["future".to_owned()]).unwrap()[0];
-    assert_eq!(future, SymbolId::new(2));
-    reopened
-        .memory_mut()
-        .insert_episode(
-            EpisodeDraft::new(
-                TimestampMs::new(1),
-                vec![Attribute::new(SymbolId::new(0), vec![future]).unwrap()],
-            )
-            .unwrap(),
-        )
-        .unwrap();
-    let before = std::fs::read(&path).unwrap();
-
-    assert!(matches!(
-        save_for_test(&mut reopened),
-        Err(StoreError::InvalidStore(
-            StoreIntegrityError::InvalidSemanticCue { cue_id: 0, .. }
-        ))
-    ));
-    assert_eq!(std::fs::read(&path).unwrap(), before);
-    assert_eq!(reopened.semantic.pending_len(), 0);
-}
-
-#[test]
-fn semantic_preparation_batches_at_32_and_is_atomic_on_later_failure() {
-    struct FailingSecondBatch {
-        batch_sizes: Vec<usize>,
+fn later_episode_encoding_failure_stages_nothing_and_changes_no_database_bytes() {
+    struct FailSecond {
+        calls: usize,
     }
-    impl semantic::CueEncoder for FailingSecondBatch {
-        fn encode(&mut self, cues: &[CueText<'_>]) -> Result<Vec<Embedding>, StoreError> {
-            self.batch_sizes.push(cues.len());
-            if self.batch_sizes.len() == 2 {
-                return Err(StoreError::SemanticEncoding {
+
+    impl semantic::EpisodeEncoder for FailSecond {
+        fn encode_episode(&mut self, _: EpisodeText<'_>) -> Result<Embedding, StoreError> {
+            self.calls += 1;
+            if self.calls == 2 {
+                Err(StoreError::SemanticEncoding {
                     detail: "test failure".to_owned(),
-                });
+                })
+            } else {
+                Ok(one_hot_embedding(self.calls))
             }
-            Ok((0..cues.len()).map(one_hot_embedding).collect())
         }
     }
 
     let directory = tempdir().unwrap();
     let path = directory.path().join("memory.sqlite3");
     let mut store = SqliteStore::create(&path).unwrap();
-    let mut names = vec!["key".to_owned()];
-    names.extend((0..33).map(|index| format!("value-{index}")));
-    let symbols = store.intern_symbols(&names).unwrap();
-    store
-        .memory_mut()
-        .insert_episode(
-            EpisodeDraft::new(
-                TimestampMs::new(0),
-                vec![Attribute::new(symbols[0], symbols[1..].to_vec()).unwrap()],
-            )
-            .unwrap(),
-        )
-        .unwrap();
-    let mut encoder = FailingSecondBatch {
-        batch_sizes: Vec::new(),
-    };
+    insert(&mut store, draft(0));
+    insert(&mut store, draft(1));
+    let before = std::fs::read(&path).unwrap();
+    let mut encoder = FailSecond { calls: 0 };
 
-    assert!(store.save_with_encoder(&mut encoder).is_err());
-    assert_eq!(encoder.batch_sizes, [32, 1]);
+    assert!(matches!(
+        store.save_with_encoder(&mut encoder),
+        Err(StoreError::SemanticEncoding { .. })
+    ));
+    assert_eq!(encoder.calls, 2);
     assert_eq!(store.semantic.pending_len(), 0);
-    let counts: (i64, i64, Vec<u8>) = store
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    save_for_test(&mut store).unwrap();
+    let counts: (i64, i64, i64) = store
         .connection
         .query_row(
-            "SELECT (SELECT count(*) FROM semantic_cues),
-                    (SELECT count(*) FROM episode_cues), semantic_cue_count
+            "SELECT snapshot_revision,
+                    (SELECT count(*) FROM episodes),
+                    (SELECT count(*) FROM episode_vectors)
              FROM memory_meta",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(counts.0, 0);
-    assert_eq!(counts.1, 0);
-    assert_eq!(format::decode_u64(&counts.2), Some(0));
+    assert_eq!(counts, (1, 2, 2));
 }
 
 #[test]
-fn full_check_rejects_an_orphan_semantic_cue() {
+fn failed_vector_insert_retains_preparation_and_retry_does_not_reencode() {
+    struct RecordingEncoder {
+        calls: usize,
+    }
+
+    impl semantic::EpisodeEncoder for RecordingEncoder {
+        fn encode_episode(&mut self, _: EpisodeText<'_>) -> Result<Embedding, StoreError> {
+            self.calls += 1;
+            Ok(one_hot_embedding(self.calls))
+        }
+    }
+
+    struct RejectEncoder;
+
+    impl semantic::EpisodeEncoder for RejectEncoder {
+        fn encode_episode(&mut self, _: EpisodeText<'_>) -> Result<Embedding, StoreError> {
+            panic!("retry must reuse prepared episode vectors")
+        }
+    }
+
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("memory.sqlite3");
+    let mut store = SqliteStore::create(&path).unwrap();
+    insert(&mut store, draft(0));
+    store
+        .connection
+        .execute_batch(
+            "CREATE TEMP TRIGGER abort_vector_insert
+             BEFORE INSERT ON main.episode_vectors
+             BEGIN SELECT RAISE(ABORT, 'test abort'); END;",
+        )
+        .unwrap();
+    let mut encoder = RecordingEncoder { calls: 0 };
+
+    assert!(store.save_with_encoder(&mut encoder).is_err());
+    assert_eq!(encoder.calls, 1);
+    assert_eq!(store.semantic.pending_len(), 1);
+    let counts: (i64, i64, i64, i64) = store
+        .connection
+        .query_row(
+            "SELECT snapshot_revision,
+                    (SELECT count(*) FROM symbols),
+                    (SELECT count(*) FROM episodes),
+                    (SELECT count(*) FROM episode_vectors)
+             FROM memory_meta",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(counts, (0, 0, 0, 0));
+
+    store
+        .connection
+        .execute_batch("DROP TRIGGER abort_vector_insert")
+        .unwrap();
+    store.save_with_encoder(&mut RejectEncoder).unwrap();
+    assert_eq!(store.semantic.pending_len(), 0);
+}
+
+#[test]
+fn fast_open_skips_vector_bodies_but_full_check_validates_them() {
     let directory = tempdir().unwrap();
     let path = saved_store(&directory, 1);
-    let raw = Connection::open(&path).unwrap();
-    let vector = vec![1_u8; format::SEMANTIC_VECTOR_BYTES];
-    raw.execute(
-        "INSERT INTO semantic_cues (cue_id, key_id, value_id, vector)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![
-            format::encode_u64(3).as_slice(),
-            format::encode_u64(0).as_slice(),
-            format::encode_u64(4).as_slice(),
-            vector,
-        ],
-    )
-    .unwrap();
-    raw.execute(
-        "UPDATE memory_meta SET semantic_cue_count = ?1",
-        [format::encode_u64(4).as_slice()],
-    )
-    .unwrap();
-    drop(raw);
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE episode_vectors SET vector = zeroblob(768) WHERE sequence = ?1",
+            [format::encode_u64(0).as_slice()],
+        )
+        .unwrap();
 
+    drop(SqliteStore::open(&path).unwrap());
     assert!(matches!(
         check_integrity_error(&path),
-        StoreIntegrityError::InvalidSemanticCue { cue_id: 3, .. }
+        StoreIntegrityError::InvalidEpisodeVector { sequence: 0, .. }
     ));
 }
 
 #[test]
-fn semantic_posting_corruptions_are_deferred_to_full_check() {
-    #[derive(Clone, Copy)]
-    enum Corruption {
-        Missing,
-        Additional,
-        WrongCue,
-        ForeignKey,
-    }
+fn interior_vector_gap_is_deferred_to_full_check() {
+    let directory = tempdir().unwrap();
+    let path = saved_store(&directory, 3);
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "DELETE FROM episode_vectors WHERE sequence = ?1",
+            [format::encode_u64(1).as_slice()],
+        )
+        .unwrap();
 
-    for (name, corruption) in [
-        ("missing", Corruption::Missing),
-        ("additional", Corruption::Additional),
-        ("wrong-cue", Corruption::WrongCue),
-        ("foreign-key", Corruption::ForeignKey),
-    ] {
-        let directory = tempdir().unwrap();
-        let path = saved_distinct_semantic_store(&directory);
-        let raw = Connection::open(&path).unwrap();
-        raw.pragma_update(None, "foreign_keys", false).unwrap();
-        match corruption {
-            Corruption::Missing => {
-                raw.execute(
-                    "DELETE FROM episode_cues WHERE sequence = ?1 AND cue_id = ?2",
-                    params![
-                        format::encode_u64(0).as_slice(),
-                        format::encode_u64(0).as_slice()
-                    ],
-                )
-                .unwrap();
-            }
-            Corruption::Additional => {
-                raw.execute(
-                    "INSERT INTO episode_cues (sequence, cue_id) VALUES (?1, ?2)",
-                    params![
-                        format::encode_u64(0).as_slice(),
-                        format::encode_u64(1).as_slice()
-                    ],
-                )
-                .unwrap();
-            }
-            Corruption::WrongCue => {
-                raw.execute(
-                    "UPDATE episode_cues SET cue_id = ?1
-                     WHERE sequence = ?2 AND cue_id = ?3",
-                    params![
-                        format::encode_u64(1).as_slice(),
-                        format::encode_u64(0).as_slice(),
-                        format::encode_u64(0).as_slice()
-                    ],
-                )
-                .unwrap();
-                raw.execute(
-                    "UPDATE episode_cues SET cue_id = ?1
-                     WHERE sequence = ?2 AND cue_id = ?3",
-                    params![
-                        format::encode_u64(0).as_slice(),
-                        format::encode_u64(1).as_slice(),
-                        format::encode_u64(1).as_slice()
-                    ],
-                )
-                .unwrap();
-            }
-            Corruption::ForeignKey => {
-                raw.execute(
-                    "INSERT INTO episode_cues (sequence, cue_id) VALUES (?1, ?2)",
-                    params![
-                        format::encode_u64(0).as_slice(),
-                        format::encode_u64(2).as_slice()
-                    ],
-                )
-                .unwrap();
-            }
+    drop(SqliteStore::open(&path).unwrap());
+    assert!(matches!(
+        check_integrity_error(&path),
+        StoreIntegrityError::NonContiguousEpisodeVector {
+            expected: 1,
+            found: 2
         }
-        drop(raw);
-
-        let opened = SqliteStore::open(&path).unwrap_or_else(|error| {
-            panic!("operational open rejected deferred {name} corruption: {error}")
-        });
-        drop(opened);
-        let error = check_integrity_error(&path);
-        match corruption {
-            Corruption::ForeignKey => assert!(
-                matches!(error, StoreIntegrityError::ForeignKeyCheckFailed { .. }),
-                "unexpected {name} error: {error}"
-            ),
-            _ => assert!(
-                matches!(error, StoreIntegrityError::InvalidSemanticPostings { .. }),
-                "unexpected {name} error: {error}"
-            ),
-        }
-    }
+    ));
 }
 
 #[test]
-fn semantic_metadata_and_tail_corruptions_fail_operational_open() {
-    #[derive(Clone, Copy)]
-    enum Corruption {
-        Profile,
-        CueCount,
-        CueTail,
-    }
-
-    for (name, corruption) in [
-        ("profile", Corruption::Profile),
-        ("cue-count", Corruption::CueCount),
-        ("cue-tail", Corruption::CueTail),
-    ] {
+fn profile_and_vector_tail_corruptions_fail_operational_open() {
+    for corruption in ["profile", "tail"] {
         let directory = tempdir().unwrap();
-        let path = saved_distinct_semantic_store(&directory);
+        let path = saved_store(&directory, 2);
         let raw = Connection::open(&path).unwrap();
-        raw.pragma_update(None, "foreign_keys", false).unwrap();
         match corruption {
-            Corruption::Profile => {
+            "profile" => {
                 raw.execute(
                     "UPDATE memory_meta SET semantic_profile_fingerprint = ?1",
                     [[0xa5_u8; 32].as_slice()],
                 )
                 .unwrap();
             }
-            Corruption::CueCount => {
+            "tail" => {
                 raw.execute(
-                    "UPDATE memory_meta SET semantic_cue_count = ?1",
-                    [format::encode_u64(3).as_slice()],
+                    "DELETE FROM episode_vectors WHERE sequence = ?1",
+                    [format::encode_u64(1).as_slice()],
                 )
                 .unwrap();
             }
-            Corruption::CueTail => {
-                raw.execute(
-                    "UPDATE semantic_cues SET cue_id = ?1 WHERE cue_id = ?2",
-                    params![
-                        format::encode_u64(2).as_slice(),
-                        format::encode_u64(1).as_slice()
-                    ],
-                )
-                .unwrap();
-                raw.execute(
-                    "UPDATE episode_cues SET cue_id = ?1 WHERE cue_id = ?2",
-                    params![
-                        format::encode_u64(2).as_slice(),
-                        format::encode_u64(1).as_slice()
-                    ],
-                )
-                .unwrap();
-            }
+            _ => unreachable!(),
         }
         drop(raw);
 
@@ -561,14 +327,7 @@ fn semantic_metadata_and_tail_corruptions_fail_operational_open() {
                     StoreIntegrityError::InvalidMetadata { .. }
                 ))
             ),
-            "operational open accepted {name} corruption"
-        );
-        assert!(
-            matches!(
-                check_integrity_error(&path),
-                StoreIntegrityError::InvalidMetadata { .. }
-            ),
-            "full check returned the wrong {name} error"
+            "operational open accepted {corruption} corruption"
         );
     }
 }
@@ -651,7 +410,7 @@ fn non_contiguous_symbol_identifiers_are_rejected() {
 
 #[test]
 fn metadata_and_unsupported_formats_fail_closed_with_specific_errors() {
-    for unsupported in [1, 2, 3, 4, 5, 6, format::FORMAT_VERSION + 1] {
+    for unsupported in [1, 2, 3, 4, 5, 6, 7, format::FORMAT_VERSION + 1] {
         let directory = tempdir().unwrap();
         let path = saved_store(&directory, 0);
         let raw = Connection::open(&path).unwrap();
@@ -685,118 +444,6 @@ fn metadata_and_unsupported_formats_fail_closed_with_specific_errors() {
 }
 
 #[test]
-fn former_semantic_sidecar_identity_is_rejected_without_mutation() {
-    const SIDECAR_APPLICATION_ID: i64 = 0x4E41_4F53;
-
-    let directory = tempdir().unwrap();
-    let path = saved_store(&directory, 0);
-    let raw = Connection::open(&path).unwrap();
-    raw.pragma_update(None, "application_id", SIDECAR_APPLICATION_ID)
-        .unwrap();
-    drop(raw);
-    let before = std::fs::read(&path).unwrap();
-
-    assert!(matches!(
-        SqliteStore::open(&path),
-        Err(StoreError::InvalidStore(
-            StoreIntegrityError::ApplicationMismatch {
-                found: SIDECAR_APPLICATION_ID
-            }
-        ))
-    ));
-    assert!(matches!(
-        check_integrity_error(&path),
-        StoreIntegrityError::ApplicationMismatch {
-            found: SIDECAR_APPLICATION_ID
-        }
-    ));
-    assert_eq!(std::fs::read(&path).unwrap(), before);
-}
-
-#[test]
-fn fast_open_skips_vectors_but_reuse_and_full_check_validate_them() {
-    let directory = tempdir().unwrap();
-    let path = directory.path().join("memory.sqlite3");
-    let mut store = SqliteStore::create(&path).unwrap();
-    let symbols = store
-        .intern_symbols(&["key".to_owned(), "value".to_owned()])
-        .unwrap();
-    let first = store
-        .memory_mut()
-        .insert_episode(
-            EpisodeDraft::new(
-                TimestampMs::new(1),
-                vec![Attribute::new(symbols[0], vec![symbols[1]]).unwrap()],
-            )
-            .unwrap(),
-        )
-        .unwrap();
-    save_for_test(&mut store).unwrap();
-    drop(store);
-
-    let raw = Connection::open(&path).unwrap();
-    raw.execute(
-        "UPDATE semantic_cues SET vector = zeroblob(768) WHERE cue_id = ?1",
-        [format::encode_u64(0).as_slice()],
-    )
-    .unwrap();
-    drop(raw);
-
-    let mut reopened = SqliteStore::open(&path).unwrap();
-    assert!(reopened.memory().recall_from(first, 10).unwrap().is_empty());
-    reopened
-        .memory_mut()
-        .insert_episode(
-            EpisodeDraft::new(
-                TimestampMs::new(2),
-                vec![Attribute::new(symbols[0], vec![symbols[1]]).unwrap()],
-            )
-            .unwrap(),
-        )
-        .unwrap();
-    let before = std::fs::read(&path).unwrap();
-    assert!(matches!(
-        save_for_test(&mut reopened),
-        Err(StoreError::InvalidStore(
-            StoreIntegrityError::InvalidSemanticCue { cue_id: 0, .. }
-        ))
-    ));
-    assert_eq!(std::fs::read(&path).unwrap(), before);
-    drop(reopened);
-    assert!(matches!(
-        check_integrity_error(&path),
-        StoreIntegrityError::InvalidSemanticCue { cue_id: 0, .. }
-    ));
-}
-
-#[test]
-fn exhausted_semantic_count_fails_before_encoder_work() {
-    struct RecordingEncoder {
-        called: bool,
-    }
-    impl semantic::CueEncoder for RecordingEncoder {
-        fn encode(&mut self, _cues: &[CueText<'_>]) -> Result<Vec<Embedding>, StoreError> {
-            self.called = true;
-            Ok(Vec::new())
-        }
-    }
-
-    let directory = tempdir().unwrap();
-    let path = directory.path().join("memory.sqlite3");
-    let mut store = SqliteStore::create(&path).unwrap();
-    insert(&mut store, draft(0));
-    store.semantic.persisted_count = u64::MAX;
-    let mut encoder = RecordingEncoder { called: false };
-
-    assert!(matches!(
-        store.save_with_encoder(&mut encoder),
-        Err(StoreError::SemanticCueIdExhausted)
-    ));
-    assert!(!encoder.called);
-    assert_eq!(store.semantic.pending_len(), 0);
-}
-
-#[test]
 fn rejected_identity_format_or_journal_mode_never_rewrites_the_file_mode() {
     for unsupported_format in [
         None,
@@ -805,6 +452,8 @@ fn rejected_identity_format_or_journal_mode_never_rewrites_the_file_mode() {
         Some(3),
         Some(4),
         Some(5),
+        Some(6),
+        Some(7),
         Some(format::FORMAT_VERSION),
         Some(format::FORMAT_VERSION + 1),
     ] {

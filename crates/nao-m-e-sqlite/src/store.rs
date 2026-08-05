@@ -10,6 +10,7 @@ use crate::format;
 
 mod feedback;
 mod semantic;
+mod semantic_recall;
 mod symbols;
 
 /// An explicitly saved SQLite database and its owned in-memory state.
@@ -62,7 +63,7 @@ impl SqliteStore {
             persisted_episode_count: loaded.episode_count,
             expected_revision: loaded.revision,
             symbols: loaded.symbols,
-            semantic: semantic::SemanticState::new(loaded.semantic_cue_count),
+            semantic: semantic::SemanticState::new(),
             encoder: SemanticEncoder::new(),
         })
     }
@@ -70,7 +71,7 @@ impl SqliteStore {
     /// Performs a complete, physically read-only integrity audit.
     ///
     /// Unlike [`Self::open`], this scans the complete SQLite file, all foreign
-    /// keys, every semantic vector, and the exact episode-to-cue projection.
+    /// keys, and every mandatory episode vector.
     /// The semantic model is neither resolved nor loaded.
     pub fn check(path: impl AsRef<Path>) -> Result<(), StoreError> {
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY;
@@ -84,8 +85,10 @@ impl SqliteStore {
         verify_format_version(&transaction)?;
         verify_integrity_check(&transaction)?;
         verify_foreign_keys(&transaction)?;
-        let loaded = load_snapshot(&transaction)?;
-        semantic::full_audit(&transaction, &loaded.memory, loaded.semantic_cue_count)?;
+        let (memory_id, revision) = read_metadata(&transaction)?;
+        verify_schema(&transaction)?;
+        let loaded = reconstruct_snapshot(&transaction, memory_id, revision)?;
+        semantic::full_audit(&transaction, loaded.episode_count)?;
         transaction.commit()?;
         Ok(())
     }
@@ -109,6 +112,31 @@ impl SqliteStore {
         &mut self.memory
     }
 
+    /// Ranks committed episodes against one semantic free-text query.
+    ///
+    /// The query and every episode vector use the fixed local semantic profile.
+    /// Recall streams the committed vectors, keeps positive integer cosine
+    /// scores, and orders ties by atom identifier. It does not change the
+    /// database, snapshot revision, episodes, or feedback. Pending unsaved
+    /// episodes are deliberately absent, and feedback does not affect ranking.
+    /// A zero limit still validates the query but avoids model and vector work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the query cannot be normalized, model inference
+    /// fails, the store changes concurrently, or accessed semantic data is
+    /// invalid.
+    pub fn recall_semantic(
+        &mut self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<nao_m_e::RecallHit>, StoreError> {
+        let mut encoder = std::mem::take(&mut self.encoder);
+        let result = semantic_recall::recall(self, &mut encoder, query, limit);
+        self.encoder = encoder;
+        result
+    }
+
     /// Atomically persists newly appended episodes and feedback changes.
     ///
     /// A stale store session is rejected instead of overwriting a later
@@ -121,16 +149,11 @@ impl SqliteStore {
         result
     }
 
-    fn save_with_encoder<E: semantic::CueEncoder>(
+    fn save_with_encoder<E: semantic::EpisodeEncoder>(
         &mut self,
         encoder: &mut E,
     ) -> Result<(), StoreError> {
-        symbols::validate_new_episode_symbols(
-            &self.memory,
-            self.persisted_episode_count,
-            &self.symbols,
-        )?;
-        let prepared_semantic = semantic::prepare(self, encoder)?;
+        semantic::prepare(self, encoder)?;
 
         let Self {
             connection,
@@ -153,8 +176,7 @@ impl SqliteStore {
         format::verify_durability(connection)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         verify_application_id(&transaction)?;
-        let (actual_memory_id, actual_revision, actual_semantic_cue_count) =
-            read_metadata(&transaction)?;
+        let (actual_memory_id, actual_revision) = read_metadata(&transaction)?;
         verify_schema(&transaction)?;
         if actual_memory_id != memory.memory_id() {
             return Err(StoreIntegrityError::InvalidMetadata {
@@ -168,29 +190,19 @@ impl SqliteStore {
                 actual_revision,
             });
         }
-        if actual_semantic_cue_count != semantic.persisted_count {
-            return Err(StoreIntegrityError::InvalidMetadata {
-                detail: "persisted semantic cue count changed outside this store session",
-            }
-            .into());
-        }
         if actual_revision == i64::MAX {
             return Err(StoreError::RevisionExhausted);
         }
         verify_persisted_tail(&transaction, *persisted_episode_count)?;
         symbols::verify_symbol_tail(&transaction, symbols)?;
-        semantic::verify_tail(&transaction, semantic)?;
+        semantic::verify_tail(&transaction, *persisted_episode_count)?;
 
         let next_revision = actual_revision + 1;
-        let next_semantic_cue_count = semantic.current_count()?;
         let changed = transaction.execute(
             "UPDATE memory_meta
-             SET snapshot_revision = ?1, semantic_cue_count = ?2
+             SET snapshot_revision = ?1
              WHERE singleton = 1",
-            rusqlite::params![
-                next_revision,
-                format::encode_u64(next_semantic_cue_count).as_slice()
-            ],
+            [next_revision],
         )?;
         if changed != 1 {
             return Err(StoreIntegrityError::InvalidMetadata {
@@ -200,10 +212,8 @@ impl SqliteStore {
         }
 
         symbols::insert_pending_symbols(&transaction, symbols)?;
-        let committed_semantic_count = semantic::insert_pending_cues(&transaction, semantic)?;
-        debug_assert_eq!(committed_semantic_count, next_semantic_cue_count);
         append_episodes(&transaction, memory, *persisted_episode_count)?;
-        semantic::insert_postings(&transaction, &prepared_semantic, memory)?;
+        semantic::insert_pending_vectors(&transaction, semantic, *persisted_episode_count)?;
         feedback::reconcile(&transaction, memory, *persisted_episode_count)?;
         transaction.commit()?;
 
@@ -247,7 +257,6 @@ fn build_initial_database(
     if loaded.memory.memory_id() != memory_id
         || loaded.episode_count != 0
         || loaded.revision != 0
-        || loaded.semantic_cue_count != 0
         || !loaded.symbols.is_persisted_empty()
     {
         return Err(StoreIntegrityError::InvalidMetadata {
@@ -267,7 +276,6 @@ struct LoadedStore {
     episode_count: usize,
     revision: i64,
     symbols: symbols::SymbolState,
-    semantic_cue_count: u64,
 }
 
 fn load_memory(connection: &mut Connection) -> Result<LoadedStore, StoreError> {
@@ -278,14 +286,25 @@ fn load_memory(connection: &mut Connection) -> Result<LoadedStore, StoreError> {
 }
 
 fn load_snapshot(connection: &Connection) -> Result<LoadedStore, StoreError> {
-    verify_application_id(connection)?;
-    let (memory_id, revision, semantic_cue_count) = read_metadata(connection)?;
-    verify_schema(connection)?;
+    let (memory_id, revision) = validate_snapshot_header(connection)?;
     verify_quick_check(connection)?;
-    semantic::verify_tail(
-        connection,
-        &semantic::SemanticState::new(semantic_cue_count),
-    )?;
+    let loaded = reconstruct_snapshot(connection, memory_id, revision)?;
+    semantic::verify_tail(connection, loaded.episode_count)?;
+    Ok(loaded)
+}
+
+fn validate_snapshot_header(connection: &Connection) -> Result<(MemoryId, i64), StoreError> {
+    verify_application_id(connection)?;
+    let (memory_id, revision) = read_metadata(connection)?;
+    verify_schema(connection)?;
+    Ok((memory_id, revision))
+}
+
+fn reconstruct_snapshot(
+    connection: &Connection,
+    memory_id: MemoryId,
+    revision: i64,
+) -> Result<LoadedStore, StoreError> {
     let symbols = symbols::validate_symbol_catalog(connection)?;
     let mut memory = reconstruct_memory(connection, memory_id, &symbols)?;
     feedback::restore(connection, &mut memory)?;
@@ -295,7 +314,6 @@ fn load_snapshot(connection: &Connection) -> Result<LoadedStore, StoreError> {
         episode_count,
         revision,
         symbols,
-        semantic_cue_count,
     })
 }
 
@@ -394,10 +412,10 @@ fn verify_foreign_keys(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn read_metadata(connection: &Connection) -> Result<(MemoryId, i64, u64), StoreError> {
+fn read_metadata(connection: &Connection) -> Result<(MemoryId, i64), StoreError> {
     let mut statement = connection.prepare(
         "SELECT singleton, format_version, memory_id, snapshot_revision,
-                semantic_profile_fingerprint, semantic_cue_count
+                semantic_profile_fingerprint
          FROM memory_meta",
     )?;
     let mut rows = statement.query([])?;
@@ -429,11 +447,10 @@ fn read_metadata(connection: &Connection) -> Result<(MemoryId, i64, u64), StoreE
     };
     if fingerprint != E5_SMALL_PROFILE.fingerprint() {
         return Err(StoreIntegrityError::InvalidMetadata {
-            detail: "semantic profile fingerprint differs from SQLite format V7",
+            detail: "semantic profile fingerprint differs from SQLite format V8",
         }
         .into());
     }
-    let semantic_cue_count = read_u64(row, 5, "memory_meta", "semantic_cue_count")?;
     if rows.next()?.is_some() {
         return Err(StoreIntegrityError::InvalidMetadata {
             detail: "multiple metadata rows",
@@ -446,7 +463,7 @@ fn read_metadata(connection: &Connection) -> Result<(MemoryId, i64, u64), StoreE
         }
         .into());
     }
-    Ok((memory_id, revision, semantic_cue_count))
+    Ok((memory_id, revision))
 }
 
 fn reconstruct_memory(

@@ -9,17 +9,13 @@ use ort::session::Session;
 use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 use ort::value::TensorRef;
 use sha2::{Digest, Sha256};
-use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
+use tokenizers::{Tokenizer, TruncationParams};
 
 use crate::profile::{
-    MODEL_FILE, MODEL_NAME, MODEL_OWNER, MODEL_REVISION, MODEL_SHA256, TOKENIZER_FILE,
-    TOKENIZER_SHA256,
+    MAX_TOKEN_COUNT, MODEL_FILE, MODEL_NAME, MODEL_OWNER, MODEL_REVISION, MODEL_SHA256,
+    TOKENIZER_FILE, TOKENIZER_SHA256,
 };
-use crate::{
-    CueText, EMBEDDING_DIMENSIONS, Embedding, MAX_EMBEDDING_BATCH_SIZE, QueryText, SemanticError,
-};
-
-const MAX_TOKEN_COUNT: usize = 512;
+use crate::{EMBEDDING_DIMENSIONS, Embedding, EpisodeText, QueryText, SemanticError};
 
 #[derive(Clone, Copy)]
 struct ArtifactSpec {
@@ -86,11 +82,20 @@ impl EncoderRuntime {
         Ok(Self { tokenizer, session })
     }
 
-    fn encode_projected(&mut self, projected: String) -> Result<Embedding, SemanticError> {
+    fn encode_projected(
+        &mut self,
+        projected: String,
+        reject_overflow: bool,
+    ) -> Result<Embedding, SemanticError> {
         let encoding = self
             .tokenizer
             .encode(projected, true)
             .map_err(tokenizer_error)?;
+        if reject_overflow && !encoding.get_overflowing().is_empty() {
+            return Err(SemanticError::EpisodeTooLong {
+                maximum: MAX_TOKEN_COUNT,
+            });
+        }
         let sequence_length = encoding.len();
         if sequence_length == 0 {
             return Err(SemanticError::InvalidModelOutput {
@@ -177,7 +182,7 @@ fn cached_artifact(
 ///
 /// Construction performs no filesystem or network I/O. The pinned model and
 /// tokenizer must already be provisioned in the local Hugging Face cache. The
-/// first non-empty request verifies and loads them without network fallback.
+/// first encoding request verifies and loads them without network fallback.
 pub struct SemanticEncoder {
     runtime: Option<EncoderRuntime>,
 }
@@ -189,39 +194,21 @@ impl SemanticEncoder {
         Self { runtime: None }
     }
 
-    /// Returns whether the model and tokenizer are loaded in this process.
-    #[must_use]
-    pub const fn is_loaded(&self) -> bool {
-        self.runtime.is_some()
-    }
-
-    /// Encodes one ordered batch of bound key/value cues.
+    /// Encodes one canonical non-empty episode passage.
     ///
-    /// Empty input returns an empty vector without loading artifacts. Inputs
-    /// larger than [`MAX_EMBEDDING_BATCH_SIZE`] fail before any model work.
-    pub fn encode(&mut self, cues: &[CueText<'_>]) -> Result<Vec<Embedding>, SemanticError> {
-        if cues.len() > MAX_EMBEDDING_BATCH_SIZE {
-            return Err(SemanticError::BatchTooLarge {
-                maximum: MAX_EMBEDDING_BATCH_SIZE,
-                found: cues.len(),
-            });
-        }
-        if cues.is_empty() {
-            return Ok(Vec::new());
-        }
-        let runtime = self.runtime()?;
-        cues.iter()
-            .map(|cue| runtime.encode_projected(cue.project()))
-            .collect()
+    /// Episode passages are rejected rather than truncated when their tokenized
+    /// projection exceeds the fixed 512-token model context.
+    pub fn encode_episode(&mut self, episode: EpisodeText<'_>) -> Result<Embedding, SemanticError> {
+        self.runtime()?.encode_projected(episode.project(), true)
     }
 
     /// Encodes one normalized free-text retrieval query.
     ///
     /// The query is projected with the fixed E5 `query:` prefix and uses the
     /// same lazy model, tokenizer, pooling, normalization, and quantization as
-    /// bound cue encoding.
+    /// episode encoding. Queries are right-truncated to the fixed model context.
     pub fn encode_query(&mut self, query: QueryText<'_>) -> Result<Embedding, SemanticError> {
-        self.runtime()?.encode_projected(query.project())
+        self.runtime()?.encode_projected(query.project(), false)
     }
 
     fn runtime(&mut self) -> Result<&mut EncoderRuntime, SemanticError> {
@@ -240,20 +227,10 @@ impl Default for SemanticEncoder {
 
 fn load_tokenizer(path: &Path) -> Result<Tokenizer, SemanticError> {
     let mut tokenizer = Tokenizer::from_file(path).map_err(tokenizer_error)?;
-    let pad_id = tokenizer
-        .token_to_id("<pad>")
-        .ok_or(SemanticError::InvalidModelOutput {
-            detail: "tokenizer has no <pad> token",
-        })?;
-    if pad_id != 1 {
-        return Err(SemanticError::InvalidModelOutput {
-            detail: "tokenizer <pad> identifier is not canonical",
-        });
-    }
     tokenizer
         .with_truncation(Some(truncation_params()))
         .map_err(tokenizer_error)?;
-    tokenizer.with_padding(Some(padding_params(pad_id)));
+    tokenizer.with_padding(None);
     Ok(tokenizer)
 }
 
@@ -261,15 +238,6 @@ fn truncation_params() -> TruncationParams {
     TruncationParams {
         max_length: MAX_TOKEN_COUNT,
         ..TruncationParams::default()
-    }
-}
-
-fn padding_params(pad_id: u32) -> PaddingParams {
-    PaddingParams {
-        strategy: PaddingStrategy::BatchLongest,
-        pad_id,
-        pad_token: "<pad>".to_owned(),
-        ..PaddingParams::default()
     }
 }
 
@@ -396,28 +364,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ArtifactSpec, MODEL, MODEL_REVISION, SemanticEncoder, TOKENIZER, cached_artifact,
-        load_tokenizer, padding_params, pinned_repository, pool_embedding, quantize_component,
-        sha256_file, truncation_params, verified_artifact,
+        ArtifactSpec, MODEL, MODEL_REVISION, TOKENIZER, cached_artifact, load_tokenizer,
+        pinned_repository, pool_embedding, quantize_component, sha256_file, truncation_params,
+        verified_artifact,
     };
-    use crate::{CueText, EMBEDDING_DIMENSIONS, MAX_EMBEDDING_BATCH_SIZE, SemanticError};
-
-    #[test]
-    fn empty_and_oversized_batches_do_not_initialize_the_runtime() {
-        let mut encoder = SemanticEncoder::new();
-        assert!(encoder.encode(&[]).unwrap().is_empty());
-        assert!(!encoder.is_loaded());
-
-        let cues = vec![CueText::new("key", "value"); MAX_EMBEDDING_BATCH_SIZE + 1];
-        assert!(matches!(
-            encoder.encode(&cues),
-            Err(SemanticError::BatchTooLarge {
-                maximum: MAX_EMBEDDING_BATCH_SIZE,
-                found
-            }) if found == MAX_EMBEDDING_BATCH_SIZE + 1
-        ));
-        assert!(!encoder.is_loaded());
-    }
+    use crate::{EMBEDDING_DIMENSIONS, EpisodeText, SemanticError};
 
     #[test]
     fn artifact_hash_mismatch_fails_without_repair_or_retry() {
@@ -483,20 +434,6 @@ mod tests {
             truncation.strategy,
             tokenizers::TruncationStrategy::LongestFirst
         ));
-
-        let padding = padding_params(1);
-        assert!(matches!(
-            padding.strategy,
-            tokenizers::PaddingStrategy::BatchLongest
-        ));
-        assert!(matches!(
-            padding.direction,
-            tokenizers::PaddingDirection::Right
-        ));
-        assert_eq!(padding.pad_id, 1);
-        assert_eq!(padding.pad_type_id, 0);
-        assert_eq!(padding.pad_token, "<pad>");
-        assert_eq!(padding.pad_to_multiple_of, None);
     }
 
     #[test]
@@ -505,24 +442,27 @@ mod tests {
         let repository = pinned_repository(TOKENIZER.file).unwrap();
         let path = cached_artifact(&repository, TOKENIZER).unwrap();
         let tokenizer = load_tokenizer(&path).unwrap();
+        let attributes = [("problem", "login returns http 404")];
         let goldens = [(
-            CueText::new("problem", "login returns http 404"),
+            EpisodeText::new(&attributes).unwrap(),
             &[0, 46692, 12, 2967, 12, 73655, 30646, 7, 1621, 1112, 617, 2][..],
         )];
-        for (cue, expected) in goldens {
-            let encoding = tokenizer.encode(cue.project(), true).unwrap();
+        for (episode, expected) in goldens {
+            let encoding = tokenizer.encode(episode.project(), true).unwrap();
             assert_eq!(encoding.get_ids(), expected);
         }
 
-        let long_value = format!(
-            "start {} end",
-            std::iter::repeat_n("boundary", 700)
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        let projected = CueText::new("truncation", &long_value).project();
+        let mut long_value = String::with_capacity(9 * 700 + 10);
+        long_value.push_str("start");
+        for _ in 0..700 {
+            long_value.push_str(" boundary");
+        }
+        long_value.push_str(" end");
+        let long_attributes = [("truncation", long_value.as_str())];
+        let projected = EpisodeText::new(&long_attributes).unwrap().project();
         let truncated = tokenizer.encode(projected.clone(), true).unwrap();
         assert_eq!(truncated.len(), 512);
+        assert!(!truncated.get_overflowing().is_empty());
 
         let raw_tokenizer = tokenizers::Tokenizer::from_file(path).unwrap();
         let untruncated = raw_tokenizer.encode(projected, true).unwrap();

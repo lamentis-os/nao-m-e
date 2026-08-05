@@ -1,16 +1,14 @@
 use std::error::Error;
 use std::fmt;
 
-/// Failure while loading the fixed model or encoding semantic cues.
+/// Failure while loading the fixed model or encoding semantic text.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum SemanticError {
-    /// One request exceeded the fixed batch bound.
-    BatchTooLarge {
-        /// Maximum number of accepted cues.
+    /// One episode passage exceeds the fixed model context.
+    EpisodeTooLong {
+        /// Maximum number of accepted model tokens, including special tokens.
         maximum: usize,
-        /// Number of supplied cues.
-        found: usize,
     },
     /// A required pinned artifact is absent from or inaccessible in the local cache.
     ArtifactUnavailable {
@@ -57,10 +55,10 @@ pub enum SemanticError {
 impl fmt::Display for SemanticError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::BatchTooLarge { maximum, found } => {
+            Self::EpisodeTooLong { maximum } => {
                 write!(
                     formatter,
-                    "semantic batch contains {found} cues; maximum is {maximum}"
+                    "semantic episode exceeds the fixed {maximum}-token model context"
                 )
             }
             Self::ArtifactUnavailable { file, source } => {
@@ -104,7 +102,7 @@ impl Error for SemanticError {
             Self::ArtifactUnavailable { source, .. } => Some(source),
             Self::ArtifactRead { source, .. } => Some(source),
             Self::Runtime(error) => Some(error),
-            Self::BatchTooLarge { .. }
+            Self::EpisodeTooLong { .. }
             | Self::ArtifactHashMismatch { .. }
             | Self::Tokenizer { .. }
             | Self::RuntimeConfiguration { .. }

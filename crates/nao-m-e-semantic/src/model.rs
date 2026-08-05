@@ -24,37 +24,55 @@ impl<'a> QueryText<'a> {
     }
 }
 
-/// Borrowed normalized text for one bound attribute-key/value cue.
+/// Borrowed normalized attributes for one canonical episode passage.
 ///
-/// The semantic projection keeps the key and value together so identical
-/// values under different attribute keys remain distinguishable.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct CueText<'a> {
-    key: &'a str,
-    value: &'a str,
+/// Attribute pairs are treated as an unordered set. Projection sorts and
+/// deduplicates them lexically, so symbol allocation and caller order cannot
+/// change the encoded passage.
+#[derive(Clone, Copy, Debug)]
+pub struct EpisodeText<'a> {
+    attributes: &'a [(&'a str, &'a str)],
 }
 
-impl<'a> CueText<'a> {
-    /// Creates one borrowed key/value cue.
+impl<'a> EpisodeText<'a> {
+    /// Creates one borrowed non-empty episode attribute set.
+    ///
+    /// Returns `None` when no bound attribute pair is supplied.
     #[must_use]
-    pub const fn new(key: &'a str, value: &'a str) -> Self {
-        Self { key, value }
+    pub const fn new(attributes: &'a [(&'a str, &'a str)]) -> Option<Self> {
+        if attributes.is_empty() {
+            None
+        } else {
+            Some(Self { attributes })
+        }
     }
 
-    /// Returns the normalized attribute-key text.
+    /// Returns the normalized bound attribute pairs.
     #[must_use]
-    pub const fn key(self) -> &'a str {
-        self.key
-    }
-
-    /// Returns the normalized attribute-value text.
-    #[must_use]
-    pub const fn value(self) -> &'a str {
-        self.value
+    pub const fn attributes(self) -> &'a [(&'a str, &'a str)] {
+        self.attributes
     }
 
     pub(crate) fn project(self) -> String {
-        format!("passage: {}: {}", self.key, self.value)
+        let mut attributes = self.attributes.to_vec();
+        attributes.sort_unstable();
+        attributes.dedup();
+
+        let text_bytes = attributes
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum::<usize>();
+        let mut projected = String::with_capacity(9 + text_bytes + attributes.len() * 3);
+        projected.push_str("passage: ");
+        for (index, (key, value)) in attributes.into_iter().enumerate() {
+            if index != 0 {
+                projected.push('\n');
+            }
+            projected.push_str(key);
+            projected.push_str(": ");
+            projected.push_str(value);
+        }
+        projected
     }
 }
 
@@ -97,15 +115,23 @@ impl Embedding {
 
 #[cfg(test)]
 mod tests {
-    use super::{CueText, Embedding, QueryText};
+    use super::{Embedding, EpisodeText, QueryText};
     use crate::{E5_SMALL_PROFILE, EMBEDDING_DIMENSIONS};
 
     #[test]
-    fn cue_projection_binds_key_and_value() {
-        let cue = CueText::new("problem", "http 404");
-        assert_eq!(cue.key(), "problem");
-        assert_eq!(cue.value(), "http 404");
-        assert_eq!(cue.project(), "passage: problem: http 404");
+    fn episode_projection_is_non_empty_ordered_and_duplicate_free() {
+        assert!(EpisodeText::new(&[]).is_none());
+        let attributes = [
+            ("status", "failed"),
+            ("problem", "http 404"),
+            ("status", "failed"),
+        ];
+        let episode = EpisodeText::new(&attributes).unwrap();
+        assert_eq!(episode.attributes(), &attributes);
+        assert_eq!(
+            episode.project(),
+            "passage: problem: http 404\nstatus: failed"
+        );
     }
 
     #[test]
